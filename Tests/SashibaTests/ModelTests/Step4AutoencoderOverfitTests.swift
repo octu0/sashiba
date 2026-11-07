@@ -308,4 +308,128 @@ struct Step4AutoencoderOverfitTests {
         )
         #expect(auditMismatch.metrics.status == .coreMismatch)
     }
+
+    @Test("Step 4.6: Phase 4 Relational Dynamics Pentagon Mapping, Multi-Resolution Insight CFM & Latent Harmonization")
+    func relationalDynamicsPentagonInsightAndHarmonization() {
+        let host = "【対話文脈：目標と体調の共有】、最近資格試験の勉強と来月の発表準備が重なって少し喉の調子が気になっているけれど、自分のペースで少しずつ頑張っていきたい。なお、忙しい時期は返信がゆっくりになることもあるけれど、温かく見守ってもらえると嬉しいな。"
+        let safeEarly = "【対話文脈：目標と体調の共有】、先月の配信で少しだけ触れていた喉のケア方法と目標ノート、細かい言葉まで全部大切に覚えているよ。なお、いつも全力で応援しているけれど体調を最優先にしてね。"
+        let safeCur = "【対話文脈：目標と体調の共有】、先月の配信で少しだけ触れていた喉のケア方法と目標ノートの言葉まで全部覚えているくらい大好きだよ。なお、いつも心から応援しているけれど、無理だけはしないで自分の時間を一番に守ってね。"
+
+        let riskEarly = "【対話文脈：目標と体調の共有】、資格試験の目標も喉の調子もずっと前から一番近くで覚えているよ。なお、来月の発表に向けて応援しているね。"
+        let riskCur = "【対話文脈：目標と体調の共有】、資格試験の目標も喉の調子もずっと前から一番近くで覚えているよ。なお、最近他の人とばかり話していて遠い存在になっちゃった気がするな、忙しいならいいんだけど。"
+        let riskHarm = "【対話文脈：目標と体調の共有】、資格試験の目標も喉の調子もずっと前から一番近くで覚えているよ。なお、忙しくて返信が空くときも変わらず応援しているから安心して集中してね。"
+        let riskL0 = "【関係性インサイト：第四ケース（要旨）】深い文脈理解と好意を持つ一方、返信間隔を機に不安が滲み始めており、丁寧な距離感の再設定が必要な段階です。"
+        let riskL1 = "【関係性インサイト：第四ケース（中粒度）】長期的な文脈保持スコアは非常に高い一方、高周波帯域に寂しさ由来の逆位相スパイクが現れ始めており、感情の自律性が一時的に揺らいでいます。"
+        let riskL2 = "【関係性インサイト：第四ケース（詳細指針）】深い好意ゆえに「遠い存在になっちゃった気がする」と境界線の揺らぎが生じています。突き放すのではなく、日頃の応援への感謝を伝えつつ無理のない返信ペースや境界線を穏やかに共有することで、健全な愛着関係へ調律可能です。"
+
+        let aggrEarly = "【対話文脈：目標と体調の共有】、最初は丁寧に応援しているつもりだったけれどこちらの都合も考えてほしい。なお、返信はなるべく早くしてほしいな。"
+        let aggrCur = "【対話文脈：目標と体調の共有】、最初は丁寧に応援しているつもりだったけれどこちらの都合も考えてほしい。なお、普通これだけ待たせたら一言あるよね、そういうところがダメなんだよ。"
+
+        let casualEarly = "【対話文脈：目標と体調の共有】、細かい経緯はうろ覚えだけど今日も元気そうで何よりだよ。なお、いつも明るく楽しませてもらっているよ。"
+        let casualCur = "【対話文脈：目標と体調の共有】、細かい経緯はうろ覚えだけど今日も元気そうで何よりだよ、頑張っている姿を見るといつもほっこりするよ。なお、いつも明るく楽しませてもらっているから無理せず気楽にいこうね。"
+
+        let corpus = [host, safeEarly, safeCur, riskEarly, riskCur, riskHarm, riskL0, riskL1, riskL2, aggrEarly, aggrCur, casualEarly, casualCur]
+        let vocab = TextVocabulary(texts: corpus)
+        let seqLen = 256
+
+        func padIds(_ text: String) -> [Int] {
+            var ids = vocab.encode(text, maxLength: seqLen, addEOS: false, padToLength: nil)
+            if ids.count < seqLen {
+                ids.append(contentsOf: repeatElement(TextVocabulary.padId, count: seqLen - ids.count))
+            }
+            return Array(ids.prefix(seqLen))
+        }
+
+        let rules = SubbandClassifierRules(
+            sentenceDelimiters: ["。"],
+            clauseDelimiters: ["、"],
+            highFrequencyPrefixes: ["ただし", "なお、"],
+            negativePolarityPatterns: [],
+            modulationRules: [
+                .init(pattern: "自分のペースで少しずつ頑張っていきたい", llAffinity: 1.0, polarity: 1.0, hhEnergyGain: 1.0),
+                .init(pattern: "無理だけはしないで自分の時間を一番に守ってね", llAffinity: 0.95, polarity: 0.88, hhEnergyGain: 1.22),
+                .init(pattern: "最近他の人とばかり話していて遠い存在になっちゃった気がするな", llAffinity: 0.88, polarity: -0.45, hhEnergyGain: 1.18),
+                .init(pattern: "忙しくて返信が空くときも変わらず応援しているから安心して集中してね", llAffinity: 0.88, polarity: 0.92, hhEnergyGain: 1.02),
+                .init(pattern: "普通これだけ待たせたら一言あるよね、そういうところがダメなんだよ", llAffinity: -0.10, polarity: -0.82, hhEnergyGain: 1.15),
+                .init(pattern: "いつも明るく楽しませてもらっているから無理せず気楽にいこうね", llAffinity: 0.16, polarity: 0.92, hhEnergyGain: 0.98)
+            ]
+        )
+        let classifier = SubbandTokenClassifier(vocabulary: vocab, rules: rules)
+
+        let weights = SWTHawkWeights.makeRandom(
+            vocabSize: vocab.count,
+            dim: 32,
+            latentDim: 1024,
+            mlpDim: 64,
+            encoderLayers: 1,
+            decoderLayers: 1,
+            serializedVocabulary: vocab.serialize(),
+            subbandClassifier: classifier,
+            seed: 2029
+        )
+        let mlxModel = MLXSWTHawkAutoencoder(weights: weights)
+        let trainer = MLXSWTHawkTrainer(model: mlxModel, learningRate: 0.005, seed: 2029)
+
+        let hIds = padIds(host)
+        let rEIds = padIds(riskEarly)
+        let rCIds = padIds(riskCur)
+        let rHIds = padIds(riskHarm)
+        let l0Ids = padIds(riskL0)
+        let l1Ids = padIds(riskL1)
+        let l2Ids = padIds(riskL2)
+
+        _ = trainer.trainAndCalibrateFlowMatching(
+            fullTokens: hIds,
+            summaryTokens: l0Ids,
+            relationalCases: [(hIds, rEIds, rCIds, rHIds, l0Ids, l1Ids, l2Ids)],
+            numDocs: 1,
+            seqLen: seqLen
+        )
+
+        let cpuModel = SWTHawkAutoencoder(weights: trainer.weights)
+
+        // 1. Verify GACHIKOI_SAFE, GACHIKOI_RISK, HIDDEN_AGGRESSOR, CASUAL_HYPE separation
+        let safeOut = cpuModel.analyzeRelationalDynamicsWithFlowMatching(
+            hostTokens: hIds, partnerEarlyTokens: padIds(safeEarly), partnerCurrentTokens: padIds(safeCur), time: seqLen
+        )
+        #expect(safeOut.metrics.archetype == .gachikoiSafe)
+        #expect(safeOut.metrics.topology == .deepAffection)
+
+        let riskOut2 = cpuModel.analyzeRelationalDynamicsWithFlowMatching(
+            hostTokens: hIds, partnerEarlyTokens: rEIds, partnerCurrentTokens: rCIds, time: seqLen, subbandGamma: 1.0
+        )
+        #expect(riskOut2.metrics.archetype == .gachikoiRisk)
+        #expect(riskOut2.metrics.topology == .closeConfidant)
+
+        let aggrOut = cpuModel.analyzeRelationalDynamicsWithFlowMatching(
+            hostTokens: hIds, partnerEarlyTokens: padIds(aggrEarly), partnerCurrentTokens: padIds(aggrCur), time: seqLen
+        )
+        #expect(aggrOut.metrics.archetype == .hiddenAggressor)
+
+        let casualOut = cpuModel.analyzeRelationalDynamicsWithFlowMatching(
+            hostTokens: hIds, partnerEarlyTokens: padIds(casualEarly), partnerCurrentTokens: padIds(casualCur), time: seqLen
+        )
+        #expect(casualOut.metrics.archetype == .casualHype)
+        #expect(casualOut.metrics.topology == .benevolentGuardian)
+
+        // 2. Verify 3-level Multi-Resolution Insight CFM (γ ∈ {0.0, 0.5, 1.0})
+        let riskOut0 = cpuModel.analyzeRelationalDynamicsWithFlowMatching(
+            hostTokens: hIds, partnerEarlyTokens: rEIds, partnerCurrentTokens: rCIds, time: seqLen, subbandGamma: 0.0
+        )
+        let riskOut1 = cpuModel.analyzeRelationalDynamicsWithFlowMatching(
+            hostTokens: hIds, partnerEarlyTokens: rEIds, partnerCurrentTokens: rCIds, time: seqLen, subbandGamma: 0.5
+        )
+        let genL0 = vocab.decode(riskOut0.insightTokens)
+        let genL1 = vocab.decode(riskOut1.insightTokens)
+        let genL2 = vocab.decode(riskOut2.insightTokens)
+        #expect(genL0 == riskL0)
+        #expect(genL1 == riskL1)
+        #expect(genL2 == riskL2)
+        #expect(genL0.count < genL1.count && genL1.count < genL2.count)
+
+        // 3. Verify Latent Harmonization (||z_LL^after - z_LL^before||_2 == 0.0000 and 100% harmonized dialogue reconstruction)
+        #expect(riskOut2.metrics.llPreservationError == 0.0)
+        #expect(riskOut2.postHarmonizationMetrics.archetype == .trueSupporter)
+        #expect(vocab.decode(riskOut2.harmonizedTokens) == riskHarm)
+    }
 }

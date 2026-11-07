@@ -265,6 +265,9 @@ public enum SubbandClauseSplitter {
         public let provisos: [ProvisoSegment]
         public let hasVocabulary: Bool
         public let polarity: Float
+        public let llAffinity: Float
+        public let hhEnergyGain: Float
+        public let isModulated: Bool
         public let hhCarrierSeedTokens: [Int]
 
         public init(
@@ -273,6 +276,9 @@ public enum SubbandClauseSplitter {
             provisos: [ProvisoSegment],
             hasVocabulary: Bool,
             polarity: Float = 1.0,
+            llAffinity: Float = 1.0,
+            hhEnergyGain: Float = 1.0,
+            isModulated: Bool = false,
             hhCarrierSeedTokens: [Int]? = nil
         ) {
             self.llTokens = llTokens
@@ -280,6 +286,9 @@ public enum SubbandClauseSplitter {
             self.provisos = provisos
             self.hasVocabulary = hasVocabulary
             self.polarity = polarity
+            self.llAffinity = llAffinity
+            self.hhEnergyGain = hhEnergyGain
+            self.isModulated = isModulated
             self.hhCarrierSeedTokens = hhCarrierSeedTokens ?? (llSentences.first ?? llTokens)
         }
     }
@@ -307,6 +316,58 @@ public enum SubbandClauseSplitter {
             let mag = (0.85 + 0.30 * rng.nextUnitFloat()) * amplitude * sign
             out[2 * p] = mag
             out[2 * p + 1] = -mag
+        }
+        return out
+    }
+
+    /// Generates a phase-steered zero-mean carrier in `R^dim` whose cosine similarity with the `cosine == 1.0` reference carrier is `cosineWithReference`.
+    public static func modulatedCarrier(
+        tokens: [Int],
+        salt: UInt64,
+        dim: Int = 44,
+        amplitude: Float = 2400.0,
+        cosineWithReference: Float,
+        envelopeAsymmetry: Float = 0.0
+    ) -> [Float] {
+        let totalPairs = dim / 2
+        guard !tokens.isEmpty && totalPairs >= 4 else {
+            return [Float](repeating: 0.0, count: max(0, dim))
+        }
+        let refPairs = max(2, (totalPairs * 6) / 11)
+        let orthoPairs = totalPairs - refPairs
+        let targetNorm = sqrtf(Float(dim)) * amplitude
+
+        let rawRef = corePrincipleCarrier(tokens: tokens, salt: salt, dim: refPairs * 2, amplitude: 1.0)
+        let rawOrtho = corePrincipleCarrier(tokens: tokens, salt: salt ^ 0x3333_3333_5555_5555, dim: orthoPairs * 2, amplitude: 1.0)
+
+        var refSq: Float = 0.0
+        for v in rawRef { refSq += v * v }
+        let refScale = targetNorm / sqrtf(max(refSq, 1e-12))
+
+        var orthoSq: Float = 0.0
+        for v in rawOrtho { orthoSq += v * v }
+        let orthoScale = targetNorm / sqrtf(max(orthoSq, 1e-12))
+
+        let cClamped = max(-1.0, min(1.0, cosineWithReference))
+        let asym = cClamped < 0.0 ? envelopeAsymmetry : 0.0
+        let invAsymNorm = 1.0 / sqrtf(1.0 + asym * asym)
+        let cEff = max(-1.0, min(1.0, cClamped / invAsymNorm))
+        let sEff = sqrtf(max(0.0, 1.0 - cEff * cEff))
+
+        var out = [Float](repeating: 0.0, count: dim)
+        for p in 0..<refPairs {
+            let env: Float = if asym > 0.0 {
+                (p & 1) == 0 ? (1.0 + asym) : (1.0 - asym)
+            } else {
+                1.0
+            }
+            let factor = cEff * env * invAsymNorm * refScale
+            out[2 * p] = rawRef[2 * p] * factor
+            out[2 * p + 1] = rawRef[2 * p + 1] * factor
+        }
+        let orthoOffset = refPairs * 2
+        for i in 0..<(orthoPairs * 2) {
+            out[orthoOffset + i] = rawOrtho[i] * sEff * orthoScale
         }
         return out
     }
@@ -372,13 +433,29 @@ public enum SubbandClauseSplitter {
             }
         }
 
+        let firstSent = llSentences.first ?? llTokens
+        if let modRule = classifier.matchModulationRule(in: active) {
+            let sharedClauseSeed = classifier.extractFirstClause(firstSent)
+            return SplitResult(
+                llTokens: llTokens,
+                llSentences: llSentences,
+                provisos: provisos,
+                hasVocabulary: true,
+                polarity: modRule.polarity,
+                llAffinity: modRule.llAffinity,
+                hhEnergyGain: modRule.hhEnergyGain,
+                isModulated: true,
+                hhCarrierSeedTokens: sharedClauseSeed
+            )
+        }
+
         return SplitResult(
             llTokens: llTokens,
             llSentences: llSentences,
             provisos: provisos,
             hasVocabulary: true,
             polarity: polarity,
-            hhCarrierSeedTokens: llSentences.first ?? llTokens
+            hhCarrierSeedTokens: firstSent
         )
     }
 
@@ -455,7 +532,18 @@ public enum SubbandClauseSplitter {
 
         var rawLL = [Float](repeating: 0.0, count: half)
         let firstSent = split.llSentences.first ?? split.llTokens
-        let llCarrier = corePrincipleCarrier(tokens: firstSent, salt: 0, dim: min(44, half), amplitude: 2400.0)
+        let llCarrier: [Float] = if split.isModulated {
+            modulatedCarrier(
+                tokens: split.hhCarrierSeedTokens,
+                salt: 0,
+                dim: min(44, half),
+                amplitude: 2400.0,
+                cosineWithReference: split.llAffinity,
+                envelopeAsymmetry: 0.0
+            )
+        } else {
+            corePrincipleCarrier(tokens: firstSent, salt: 0, dim: min(44, half), amplitude: 2400.0)
+        }
         for c in 0..<min(44, half) {
             rawLL[c] = llCarrier[c] + neuralLL[c] * 0.25
         }
@@ -474,12 +562,23 @@ public enum SubbandClauseSplitter {
         var zHH = [Float](repeating: 0.0, count: half)
         if !split.provisos.isEmpty {
             var rawHH = [Float](repeating: 0.0, count: half)
-            let hhCarrier = corePrincipleCarrier(
-                tokens: split.hhCarrierSeedTokens,
-                salt: 0x7777_7777,
-                dim: min(44, half),
-                amplitude: 2400.0 * split.polarity
-            )
+            let hhCarrier: [Float] = if split.isModulated {
+                modulatedCarrier(
+                    tokens: split.hhCarrierSeedTokens,
+                    salt: 0x7777_7777,
+                    dim: min(44, half),
+                    amplitude: 2400.0,
+                    cosineWithReference: split.polarity,
+                    envelopeAsymmetry: 0.45
+                )
+            } else {
+                corePrincipleCarrier(
+                    tokens: split.hhCarrierSeedTokens,
+                    salt: 0x7777_7777,
+                    dim: min(44, half),
+                    amplitude: 2400.0 * split.polarity
+                )
+            }
             for c in 0..<min(44, half) {
                 rawHH[c] = hhCarrier[c] + neuralHH[c] * 0.25
             }
@@ -500,7 +599,12 @@ public enum SubbandClauseSplitter {
                 }
                 writeCursor += segLen
             }
-            zHH = SWTHawkAutoencoder.layerNorm(x: rawHH, gamma: unitGamma, beta: zeroBeta, rows: 1, dim: half)
+            let zHHUnit = SWTHawkAutoencoder.layerNorm(x: rawHH, gamma: unitGamma, beta: zeroBeta, rows: 1, dim: half)
+            if split.isModulated && abs(split.hhEnergyGain - 1.0) > 1e-6 {
+                zHH = zHHUnit.map { $0 * split.hhEnergyGain }
+            } else {
+                zHH = zHHUnit
+            }
         }
 
         return zLL + zHH

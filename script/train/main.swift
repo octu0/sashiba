@@ -113,6 +113,15 @@ func buildAugmentedCorpus(docs: [TextDocument], config: DatasetConfiguration) ->
         augmented.append(ac.contractText)
         augmented.append(ac.expectedAuditReport)
     }
+    for rc in config.relationalDialogueCases {
+        augmented.append(rc.hostText)
+        augmented.append(rc.partnerEarlyText)
+        augmented.append(rc.partnerCurrentText)
+        augmented.append(rc.harmonizedPartnerText)
+        augmented.append(rc.insightLevel0)
+        augmented.append(rc.insightLevel1)
+        augmented.append(rc.insightLevel2)
+    }
     return augmented
 }
 
@@ -190,7 +199,27 @@ for ac in datasetConfig.contractAuditCases {
     trainingAuditCases.append((sIds, cIds, rIds, ac.expectedStatus == .violation))
 }
 
-let weights: SWTHawkWeights = if let importPath = cli.importWeightsPath {
+var trainingRelationalCases: [(
+    hostTokens: [Int],
+    partnerEarlyTokens: [Int],
+    partnerCurrentTokens: [Int],
+    harmonizedTokens: [Int],
+    insightL0Tokens: [Int],
+    insightL1Tokens: [Int],
+    insightL2Tokens: [Int]
+)] = []
+for rc in datasetConfig.relationalDialogueCases {
+    let hIds = padRow(vocab.encode(rc.hostText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    let p1Ids = padRow(vocab.encode(rc.partnerEarlyText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    let p2Ids = padRow(vocab.encode(rc.partnerCurrentText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    let harmIds = padRow(vocab.encode(rc.harmonizedPartnerText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    let l0Ids = padRow(vocab.encode(rc.insightLevel0, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    let l1Ids = padRow(vocab.encode(rc.insightLevel1, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    let l2Ids = padRow(vocab.encode(rc.insightLevel2, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    trainingRelationalCases.append((hIds, p1Ids, p2Ids, harmIds, l0Ids, l1Ids, l2Ids))
+}
+
+var weights: SWTHawkWeights = if let importPath = cli.importWeightsPath {
     try SWTHawkWeights.load(from: URL(fileURLWithPath: importPath))
 } else {
     SWTHawkWeights.makeRandom(
@@ -205,6 +234,7 @@ let weights: SWTHawkWeights = if let importPath = cli.importWeightsPath {
         seed: cli.seed
     )
 }
+weights.subbandClassifier = subbandClassifier
 
 let model = MLXSWTHawkAutoencoder(weights: weights)
 let trainer = MLXSWTHawkTrainer(model: model, learningRate: cli.lrMax, seed: cli.seed &+ 99)
@@ -292,20 +322,23 @@ if cli.epochs > 0 {
             }
         }
     }
+}
 
-    // Stage 2, Stage 3 & Phase 3: Multi-Resolution CFM (γ ∈ {1.0, 0.5, 0.0}) & Contract Audit CFM
+if cli.epochs > 0 || cli.importWeightsPath != nil {
+    // Stage 2, Stage 3, Phase 3 & Phase 4: Multi-Resolution CFM (γ ∈ {1.0, 0.5, 0.0}), Contract Audit CFM & Relational Dynamics CFM
     let cfmStats = trainer.trainAndCalibrateFlowMatching(
         fullTokens: cfmFullTokens,
         summaryTokens: cfmSummaryTokens,
         summaryLevel1Tokens: cfmSummaryL1Tokens,
         summaryLevel0Tokens: cfmSummaryL0Tokens,
         auditCases: trainingAuditCases,
+        relationalCases: trainingRelationalCases,
         numDocs: cfmDocs.count,
         prototypeCount: numDocs,
         seqLen: seqLen
     )
     print(String(
-        format: "[Stage 2/3 & Phase 3 CFM] Registered %d multi-res & audit pairs | L_align: %.4f | L_CFM: %.6f | L_polarity: %.4f",
+        format: "[Stage 2/3, Phase 3 & Phase 4 CFM] Registered %d multi-res, audit & relational pairs | L_align: %.4f | L_CFM: %.6f | L_polarity: %.4f",
         cfmStats.registeredPairs,
         cfmStats.alignLoss,
         cfmStats.cfmLoss,
@@ -330,7 +363,7 @@ print(String(
     finalEval.exactMatchRate * 100.0
 ))
 
-if cli.epochs > 0 && !cli.exportWeightsPath.isEmpty {
+if (cli.epochs > 0 || cli.importWeightsPath != nil) && !cli.exportWeightsPath.isEmpty {
     let exported = trainer.weights
     let exportURL = URL(fileURLWithPath: cli.exportWeightsPath)
     try FileManager.default.createDirectory(

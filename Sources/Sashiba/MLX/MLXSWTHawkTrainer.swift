@@ -315,15 +315,24 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
         return (tokAcc, exactRate, decoded)
     }
 
-    /// Stage 2, Stage 3 & Phase 3: Registers subband prototypes for phase-coherent interpolation and trains/calibrates
-    /// the Conditional Flow Matching (`CFM`) module for Multi-Resolution Summarization (`γ ∈ {1.0, 0.5, 0.0}`) and
-    /// Subband Differential Contract Auditing (`c_audit -> z_audit`) on MLX.
+    /// Stage 2, Stage 3, Phase 3 & Phase 4: Registers subband prototypes for phase-coherent interpolation and trains/calibrates
+    /// the Conditional Flow Matching (`CFM`) module for Multi-Resolution Summarization (`γ ∈ {1.0, 0.5, 0.0}`),
+    /// Subband Differential Contract Auditing (`c_audit -> z_audit`), and Relational Dynamics Insight & Harmonization on MLX.
     public func trainAndCalibrateFlowMatching(
         fullTokens: [Int],
         summaryTokens: [Int],
         summaryLevel1Tokens: [Int]? = nil,
         summaryLevel0Tokens: [Int]? = nil,
         auditCases: [(statuteTokens: [Int], contractTokens: [Int], auditReportTokens: [Int], isViolation: Bool)] = [],
+        relationalCases: [(
+            hostTokens: [Int],
+            partnerEarlyTokens: [Int],
+            partnerCurrentTokens: [Int],
+            harmonizedTokens: [Int],
+            insightL0Tokens: [Int],
+            insightL1Tokens: [Int],
+            insightL2Tokens: [Int]
+        )] = [],
         numDocs: Int,
         prototypeCount: Int? = nil,
         seqLen: Int
@@ -406,6 +415,51 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
             totalPairs += 1
         }
         let avgPolarityLoss = violationCount > 0 ? (polarityLossSum / Float(violationCount)) : 0.0
+
+        // Register Phase 4 Relational Dynamics 3-level insights (γ ∈ {1.0, 0.5, 0.0}) and Latent Harmonization pairs
+        for rc in relationalCases {
+            guard rc.hostTokens.count == seqLen && rc.partnerCurrentTokens.count == seqLen && rc.harmonizedTokens.count == seqLen else {
+                continue
+            }
+            let zH = cpuModel.encode(tokens: rc.hostTokens, batch: 1, time: seqLen)
+            let zP = cpuModel.encode(tokens: rc.partnerCurrentTokens, batch: 1, time: seqLen)
+            let zHarmTarget = cpuModel.encode(tokens: rc.harmonizedTokens, batch: 1, time: seqLen)
+
+            if rc.insightL2Tokens.count == seqLen {
+                let cL2 = ConditionalFlowMatcher.computeRelationalInsightCondition(
+                    zHost: zH, zPartnerCurrent: zP, gamma: 1.0, weights: fm
+                )
+                let zL2 = cpuModel.encode(tokens: rc.insightL2Tokens, batch: 1, time: seqLen)
+                condBank.append(contentsOf: cL2)
+                summaryBank.append(contentsOf: zL2)
+                totalPairs += 1
+            }
+            if rc.insightL1Tokens.count == seqLen {
+                let cL1 = ConditionalFlowMatcher.computeRelationalInsightCondition(
+                    zHost: zH, zPartnerCurrent: zP, gamma: 0.5, weights: fm
+                )
+                let zL1 = cpuModel.encode(tokens: rc.insightL1Tokens, batch: 1, time: seqLen)
+                condBank.append(contentsOf: cL1)
+                summaryBank.append(contentsOf: zL1)
+                totalPairs += 1
+            }
+            if rc.insightL0Tokens.count == seqLen {
+                let cL0 = ConditionalFlowMatcher.computeRelationalInsightCondition(
+                    zHost: zH, zPartnerCurrent: zP, gamma: 0.0, weights: fm
+                )
+                let zL0 = cpuModel.encode(tokens: rc.insightL0Tokens, batch: 1, time: seqLen)
+                condBank.append(contentsOf: cL0)
+                summaryBank.append(contentsOf: zL0)
+                totalPairs += 1
+            }
+
+            let cHarm = ConditionalFlowMatcher.computeRelationalHarmonizationCondition(
+                zHost: zH, zPartnerCurrent: zP, weights: fm
+            )
+            condBank.append(contentsOf: cHarm)
+            summaryBank.append(contentsOf: zHarmTarget)
+            totalPairs += 1
+        }
 
         // Compute Stage 2 alignment loss L_align = λ L_CLIP + (1 - λ) ||c_aligned - x_1||_2^2
         let alignMetrics = ConditionalFlowMatcher.computeAlignmentLoss(

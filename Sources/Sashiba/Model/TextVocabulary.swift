@@ -218,21 +218,60 @@ public struct TextVocabulary: Sendable, Equatable {
 
 /// String-level subband classification rules loaded from dataset configuration when building model weights.
 public struct SubbandClassifierRules: Codable, Sendable, Equatable {
+    public struct SubbandModulationRule: Codable, Sendable, Equatable {
+        public let pattern: String
+        public let llAffinity: Float
+        public let polarity: Float
+        public let hhEnergyGain: Float
+
+        public init(
+            pattern: String,
+            llAffinity: Float = 1.0,
+            polarity: Float = 1.0,
+            hhEnergyGain: Float = 1.0
+        ) {
+            self.pattern = pattern
+            self.llAffinity = llAffinity
+            self.polarity = polarity
+            self.hhEnergyGain = hhEnergyGain
+        }
+    }
+
     public let sentenceDelimiters: [String]
     public let clauseDelimiters: [String]
     public let highFrequencyPrefixes: [String]
     public let negativePolarityPatterns: [String]
+    public let modulationRules: [SubbandModulationRule]
+
+    private enum CodingKeys: String, CodingKey {
+        case sentenceDelimiters
+        case clauseDelimiters
+        case highFrequencyPrefixes
+        case negativePolarityPatterns
+        case modulationRules
+    }
 
     public init(
         sentenceDelimiters: [String] = [],
         clauseDelimiters: [String] = [],
         highFrequencyPrefixes: [String] = [],
-        negativePolarityPatterns: [String] = []
+        negativePolarityPatterns: [String] = [],
+        modulationRules: [SubbandModulationRule] = []
     ) {
         self.sentenceDelimiters = sentenceDelimiters
         self.clauseDelimiters = clauseDelimiters
         self.highFrequencyPrefixes = highFrequencyPrefixes
         self.negativePolarityPatterns = negativePolarityPatterns
+        self.modulationRules = modulationRules
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.sentenceDelimiters = (try? container.decode([String].self, forKey: .sentenceDelimiters)) ?? []
+        self.clauseDelimiters = (try? container.decode([String].self, forKey: .clauseDelimiters)) ?? []
+        self.highFrequencyPrefixes = (try? container.decode([String].self, forKey: .highFrequencyPrefixes)) ?? []
+        self.negativePolarityPatterns = (try? container.decode([String].self, forKey: .negativePolarityPatterns)) ?? []
+        self.modulationRules = (try? container.decode([SubbandModulationRule].self, forKey: .modulationRules)) ?? []
     }
 
     /// Splits `text` into low-frequency base text and high-frequency clauses using `sentenceDelimiters` and `highFrequencyPrefixes`.
@@ -317,15 +356,28 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
     public let classifierRules: SubbandClassifierRules
     public let unseenDocuments: [TextDocument]
     public let contractAuditCases: [ContractAuditCase]
+    public let relationalDialogueCases: [RelationalDialogueCase]
     public let interpolationPairs: [PairSpec]
     public let crossSynthesisPairs: [PairSpec]
     public let exceptionArithmetic: ExceptionArithmeticSpec?
     public let coreMismatchPair: CoreMismatchSpec?
 
+    private enum CodingKeys: String, CodingKey {
+        case classifierRules
+        case unseenDocuments
+        case contractAuditCases
+        case relationalDialogueCases
+        case interpolationPairs
+        case crossSynthesisPairs
+        case exceptionArithmetic
+        case coreMismatchPair
+    }
+
     public init(
         classifierRules: SubbandClassifierRules = SubbandClassifierRules(),
         unseenDocuments: [TextDocument] = [],
         contractAuditCases: [ContractAuditCase] = [],
+        relationalDialogueCases: [RelationalDialogueCase] = [],
         interpolationPairs: [PairSpec] = [],
         crossSynthesisPairs: [PairSpec] = [],
         exceptionArithmetic: ExceptionArithmeticSpec? = nil,
@@ -334,10 +386,23 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
         self.classifierRules = classifierRules
         self.unseenDocuments = unseenDocuments
         self.contractAuditCases = contractAuditCases
+        self.relationalDialogueCases = relationalDialogueCases
         self.interpolationPairs = interpolationPairs
         self.crossSynthesisPairs = crossSynthesisPairs
         self.exceptionArithmetic = exceptionArithmetic
         self.coreMismatchPair = coreMismatchPair
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.classifierRules = (try? container.decode(SubbandClassifierRules.self, forKey: .classifierRules)) ?? SubbandClassifierRules()
+        self.unseenDocuments = (try? container.decode([TextDocument].self, forKey: .unseenDocuments)) ?? []
+        self.contractAuditCases = (try? container.decode([ContractAuditCase].self, forKey: .contractAuditCases)) ?? []
+        self.relationalDialogueCases = (try? container.decode([RelationalDialogueCase].self, forKey: .relationalDialogueCases)) ?? []
+        self.interpolationPairs = (try? container.decode([PairSpec].self, forKey: .interpolationPairs)) ?? []
+        self.crossSynthesisPairs = (try? container.decode([PairSpec].self, forKey: .crossSynthesisPairs)) ?? []
+        self.exceptionArithmetic = try? container.decode(ExceptionArithmeticSpec.self, forKey: .exceptionArithmetic)
+        self.coreMismatchPair = try? container.decode(CoreMismatchSpec.self, forKey: .coreMismatchPair)
     }
 
     public static func load(from directoryOrFilePath: String) -> DatasetConfiguration {
@@ -360,21 +425,60 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
 /// Separates token sequences into Low-Frequency (`LL`) vs High-Frequency (`HH`) subbands and positive/negative polarity
 /// purely on token IDs without any dataset-dependent strings in the model code.
 public struct SubbandTokenClassifier: Codable, Sendable, Equatable {
+    public struct CompiledModulationRule: Codable, Sendable, Equatable {
+        public let patternTokens: [Int]
+        public let llAffinity: Float
+        public let polarity: Float
+        public let hhEnergyGain: Float
+
+        public init(
+            patternTokens: [Int],
+            llAffinity: Float = 1.0,
+            polarity: Float = 1.0,
+            hhEnergyGain: Float = 1.0
+        ) {
+            self.patternTokens = patternTokens
+            self.llAffinity = llAffinity
+            self.polarity = polarity
+            self.hhEnergyGain = hhEnergyGain
+        }
+    }
+
     public let sentenceDelimiters: [[Int]]
     public let clauseDelimiters: [[Int]]
     public let highFrequencyPrefixes: [[Int]]
     public let negativePolarityPatterns: [[Int]]
+    public let modulationRules: [CompiledModulationRule]
+
+    private enum CodingKeys: String, CodingKey {
+        case sentenceDelimiters
+        case clauseDelimiters
+        case highFrequencyPrefixes
+        case negativePolarityPatterns
+        case modulationRules
+    }
 
     public init(
         sentenceDelimiters: [[Int]] = [],
         clauseDelimiters: [[Int]] = [],
         highFrequencyPrefixes: [[Int]] = [],
-        negativePolarityPatterns: [[Int]] = []
+        negativePolarityPatterns: [[Int]] = [],
+        modulationRules: [CompiledModulationRule] = []
     ) {
         self.sentenceDelimiters = sentenceDelimiters.filter { !$0.isEmpty }
         self.clauseDelimiters = clauseDelimiters.filter { !$0.isEmpty }
         self.highFrequencyPrefixes = highFrequencyPrefixes.filter { !$0.isEmpty }
         self.negativePolarityPatterns = negativePolarityPatterns.filter { !$0.isEmpty }
+        self.modulationRules = modulationRules.filter { !$0.patternTokens.isEmpty }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.sentenceDelimiters = ((try? container.decode([[Int]].self, forKey: .sentenceDelimiters)) ?? []).filter { !$0.isEmpty }
+        self.clauseDelimiters = ((try? container.decode([[Int]].self, forKey: .clauseDelimiters)) ?? []).filter { !$0.isEmpty }
+        self.highFrequencyPrefixes = ((try? container.decode([[Int]].self, forKey: .highFrequencyPrefixes)) ?? []).filter { !$0.isEmpty }
+        self.negativePolarityPatterns = ((try? container.decode([[Int]].self, forKey: .negativePolarityPatterns)) ?? []).filter { !$0.isEmpty }
+        self.modulationRules = ((try? container.decode([CompiledModulationRule].self, forKey: .modulationRules)) ?? []).filter { !$0.patternTokens.isEmpty }
     }
 
     public init(vocabulary: TextVocabulary, rules: SubbandClassifierRules) {
@@ -384,11 +488,22 @@ public struct SubbandTokenClassifier: Codable, Sendable, Equatable {
                 return (!ids.isEmpty && !ids.contains(TextVocabulary.unkId)) ? ids : nil
             }
         }
+        let compiledModulation: [CompiledModulationRule] = rules.modulationRules.compactMap { rule in
+            let ids = vocabulary.encode(rule.pattern)
+            guard !ids.isEmpty && !ids.contains(TextVocabulary.unkId) else { return nil }
+            return CompiledModulationRule(
+                patternTokens: ids,
+                llAffinity: rule.llAffinity,
+                polarity: rule.polarity,
+                hhEnergyGain: rule.hhEnergyGain
+            )
+        }
         self.init(
             sentenceDelimiters: encodeNonEmpty(rules.sentenceDelimiters),
             clauseDelimiters: encodeNonEmpty(rules.clauseDelimiters),
             highFrequencyPrefixes: encodeNonEmpty(rules.highFrequencyPrefixes),
-            negativePolarityPatterns: encodeNonEmpty(rules.negativePolarityPatterns)
+            negativePolarityPatterns: encodeNonEmpty(rules.negativePolarityPatterns),
+            modulationRules: compiledModulation
         )
     }
 
@@ -482,5 +597,33 @@ public struct SubbandTokenClassifier: Codable, Sendable, Equatable {
     /// Returns `true` if `sentence` contains any registered `negativePolarityPatterns`.
     public func isNegativePolaritySentence(_ sentence: [Int]) -> Bool {
         return negativePolarityPatterns.contains { Self.containsSubsequence(sentence, subsequence: $0) }
+    }
+
+    /// Returns the last (most specific) matching `CompiledModulationRule` found in `tokens`, if any.
+    public func matchModulationRule(in tokens: [Int]) -> CompiledModulationRule? {
+        return modulationRules.last { Self.containsSubsequence(tokens, subsequence: $0.patternTokens) }
+    }
+
+    /// Extracts the prefix of `sentence` up to and including the first `clauseDelimiters` token sequence, or the full `sentence` if none occurs.
+    public func extractFirstClause(_ sentence: [Int]) -> [Int] {
+        guard !sentence.isEmpty, let delim = clauseDelimiters.first, !delim.isEmpty else {
+            return sentence
+        }
+        var current: [Int] = []
+        for tok in sentence {
+            current.append(tok)
+            if current.count >= delim.count {
+                let offset = current.count - delim.count
+                var matched = true
+                for i in 0..<delim.count where current[offset + i] != delim[i] {
+                    matched = false
+                    break
+                }
+                if matched {
+                    return current
+                }
+            }
+        }
+        return sentence
     }
 }

@@ -881,6 +881,91 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         return (zStatute, zContract, metrics, cAudit, zAudit, auditDecoded, repairedDecoded, trajNorms)
     }
 
+    /// Phase 4: Relational Dynamics Engine (`Test 8 & Test 9`):
+    /// Encodes `(X^S, X^C(t_1), X^C(t_2))` into subband-split principal component vectors, evaluates the 5-axis
+    /// Relational Pentagon (`Score_ctx, Score_emp, Score_sync, Score_stab, Score_dev`), 5-tier `RelationalTopology`,
+    /// and 6-class `RelationalArchetype`, integrates the 50-Step Midpoint ODE for Multi-Resolution Insight Generation
+    /// (`γ ∈ {0.0, 0.5, 1.0}`), and performs subband-orthogonal Latent Harmonization `z_harmonized = z^C + Δz`.
+    public func analyzeRelationalDynamicsWithFlowMatching(
+        hostTokens: [Int],
+        partnerEarlyTokens: [Int],
+        partnerCurrentTokens: [Int],
+        time: Int,
+        subbandGamma: Float = 1.0,
+        odeSteps: Int = 50,
+        guidanceScale: Float = 1.5
+    ) -> (
+        zHost: [Float],
+        zPartnerEarly: [Float],
+        zPartnerCurrent: [Float],
+        metrics: RelationalDynamicsMetrics,
+        postHarmonizationMetrics: RelationalDynamicsMetrics,
+        cInsight: [Float],
+        zInsight: [Float],
+        insightTokens: [Int],
+        harmonizedTokens: [Int],
+        trajectoryNorms: [Float]
+    ) {
+        precondition(hostTokens.count == time && partnerEarlyTokens.count == time && partnerCurrentTokens.count == time)
+        let zHost = encode(tokens: hostTokens, batch: 1, time: time)
+        let zPartnerEarly = encode(tokens: partnerEarlyTokens, batch: 1, time: time)
+        let zPartnerCurrent = encode(tokens: partnerCurrentTokens, batch: 1, time: time)
+
+        let cHarm = ConditionalFlowMatcher.computeRelationalHarmonizationCondition(
+            zHost: zHost,
+            zPartnerCurrent: zPartnerCurrent,
+            weights: weights.flowMatching
+        )
+        let (zHarmTarget, _) = ConditionalFlowMatcher.sampleMidpointODE(
+            condition: cHarm,
+            weights: weights.flowMatching,
+            batch: 1,
+            steps: odeSteps,
+            guidanceScale: guidanceScale
+        )
+
+        let metrics = ConditionalFlowMatcher.computeRelationalDynamics(
+            zHost: zHost,
+            zPartnerEarly: zPartnerEarly,
+            zPartnerCurrent: zPartnerCurrent,
+            zHarmonizedTarget: zHarmTarget
+        )
+        let postHarmonizationMetrics = ConditionalFlowMatcher.computeRelationalDynamics(
+            zHost: zHost,
+            zPartnerEarly: zPartnerEarly,
+            zPartnerCurrent: metrics.zHarmonized,
+            zHarmonizedTarget: zHarmTarget
+        )
+
+        let cInsight = ConditionalFlowMatcher.computeRelationalInsightCondition(
+            zHost: zHost,
+            zPartnerCurrent: zPartnerCurrent,
+            gamma: subbandGamma,
+            weights: weights.flowMatching
+        )
+        let (zInsight, trajNorms) = ConditionalFlowMatcher.sampleMidpointODE(
+            condition: cInsight,
+            weights: weights.flowMatching,
+            batch: 1,
+            steps: odeSteps,
+            guidanceScale: guidanceScale
+        )
+        let insightDecoded = reconstructGreedy(z: zInsight, batch: 1, length: time)[0]
+        let harmonizedDecoded = reconstructGreedy(z: metrics.zHarmonized, batch: 1, length: time)[0]
+        return (
+            zHost,
+            zPartnerEarly,
+            zPartnerCurrent,
+            metrics,
+            postHarmonizationMetrics,
+            cInsight,
+            zInsight,
+            insightDecoded,
+            harmonizedDecoded,
+            trajNorms
+        )
+    }
+
     // MARK: - CPU Math Primitives
 
     /// `c = a · b (+ beta · c)`, row-major: `a [m, k]`, `b [k, n]`, `c [m, n]`.

@@ -146,10 +146,122 @@ public struct ContractAuditCase: Codable, Sendable, Equatable {
     }
 }
 
+/// 5-tier continuous relational distance gradation (`Phase 4 Section 2.1`).
+public enum RelationalTopology: String, Codable, Sendable, Equatable {
+    case deepAffection = "DEEP_AFFECTION"
+    case closeConfidant = "CLOSE_CONFIDANT"
+    case benevolentGuardian = "BENEVOLENT_GUARDIAN"
+    case acquaintedObserver = "ACQUAINTED_OBSERVER"
+    case unconnectedStranger = "UNCONNECTED_STRANGER"
+}
+
+/// 6-category communication archetype & trajectory classification (`Phase 4 Section 2.2`).
+public enum RelationalArchetype: String, Codable, Sendable, Equatable {
+    case trueSupporter = "TRUE_SUPPORTER"
+    case gachikoiSafe = "GACHIKOI_SAFE"
+    case casualHype = "CASUAL_HYPE"
+    case gachikoiRisk = "GACHIKOI_RISK"
+    case hiddenAggressor = "HIDDEN_AGGRESSOR"
+    case indifferentTroll = "INDIFFERENT_TROLL"
+}
+
+/// 5-axis Relational Pentagon scores in `[0.0, 100.0]` (`Phase 4 Section 3`).
+public struct RelationalPentagonScores: Codable, Sendable, Equatable {
+    public let contextDepth: Float         // Score_ctx: Context Depth & Memory
+    public let empathicResonance: Float    // Score_emp: Empathic Resonance
+    public let communicativeHarmony: Float // Score_sync: Communicative Harmony
+    public let boundaryStability: Float    // Score_stab: Boundary Respect & Stability
+    public let longTermViability: Float    // Score_dev: Long-term Viability
+
+    public init(
+        contextDepth: Float,
+        empathicResonance: Float,
+        communicativeHarmony: Float,
+        boundaryStability: Float,
+        longTermViability: Float
+    ) {
+        self.contextDepth = contextDepth
+        self.empathicResonance = empathicResonance
+        self.communicativeHarmony = communicativeHarmony
+        self.boundaryStability = boundaryStability
+        self.longTermViability = longTermViability
+    }
+}
+
+/// Subband relational dynamics metrics, Pentagon scores, and Latent Harmonization outputs (`Phase 4 Section 2 & 3`).
+public struct RelationalDynamicsMetrics: Sendable, Equatable {
+    public let dLL: Float
+    public let dHH: Float
+    public let rHH: Float
+    public let sHH: Float
+    public let sLL: Float
+    public let temporalConsistencyLL: Float
+    public let pentagon: RelationalPentagonScores
+    public let topology: RelationalTopology
+    public let archetype: RelationalArchetype
+    public let deltaZHarmonize: [Float]
+    public let zHarmonized: [Float]
+    public let llPreservationError: Float
+}
+
+/// Specification for a relational dialogue dynamics case (`Phase 4 Section 4`), loadable from dataset JSON.
+public struct RelationalDialogueCase: Codable, Sendable, Equatable {
+    public let id: String
+    public let title: String
+    public let expectedTopology: RelationalTopology
+    public let expectedArchetype: RelationalArchetype
+    public let hostText: String
+    public let partnerEarlyText: String
+    public let partnerCurrentText: String
+    public let harmonizedPartnerText: String
+    public let insightLevel0: String
+    public let insightLevel1: String
+    public let insightLevel2: String
+    public let isZeroShotUnseen: Bool
+
+    public init(
+        id: String,
+        title: String,
+        expectedTopology: RelationalTopology,
+        expectedArchetype: RelationalArchetype,
+        hostText: String,
+        partnerEarlyText: String,
+        partnerCurrentText: String,
+        harmonizedPartnerText: String,
+        insightLevel0: String,
+        insightLevel1: String,
+        insightLevel2: String,
+        isZeroShotUnseen: Bool = false
+    ) {
+        self.id = id
+        self.title = title
+        self.expectedTopology = expectedTopology
+        self.expectedArchetype = expectedArchetype
+        self.hostText = hostText
+        self.partnerEarlyText = partnerEarlyText
+        self.partnerCurrentText = partnerCurrentText
+        self.harmonizedPartnerText = harmonizedPartnerText
+        self.insightLevel0 = insightLevel0
+        self.insightLevel1 = insightLevel1
+        self.insightLevel2 = insightLevel2
+        self.isZeroShotUnseen = isZeroShotUnseen
+    }
+
+    public func insight(forGamma gamma: Float) -> String {
+        if gamma <= 0.15 {
+            return insightLevel0
+        } else if gamma < 0.85 {
+            return insightLevel1
+        } else {
+            return insightLevel2
+        }
+    }
+}
+
 /// Conditional Flow Matching (`CFM`), Multi-Resolution Subband Scaling & Subband Differential Auditing (`Phase 2 & Phase 3`).
 public enum ConditionalFlowMatcher {
-    /// Default thresholds `τ_LL = 5.0`, `τ_HH = 5.0` for deterministic 4-state subband auditing (`Section 2.2.2`).
-    public static let defaultTauLL: Float = 5.0
+    /// Default thresholds `τ_LL = 6.0`, `τ_HH = 5.0` for deterministic 4-state subband auditing (`Section 2.2.2`).
+    public static let defaultTauLL: Float = 6.0
     public static let defaultTauHH: Float = 5.0
 
     /// Sinusoidal time embedding `τ(t) ∈ R^hiddenDim` for `t ∈ [0, 1]`.
@@ -367,6 +479,231 @@ public enum ConditionalFlowMatcher {
         return SWTHawkAutoencoder.layerNorm(x: preNorm, gamma: unitGamma, beta: zeroBeta, rows: 1, dim: latentDim)
     }
 
+    // MARK: - Phase 4: Relational Dynamics Engine (Pentagon Mapping, Multi-Resolution Insight CFM & Latent Harmonization)
+
+    /// Computes the 5-axis Relational Pentagon (`Section 3`), 5-tier `RelationalTopology` (`Section 2.1`),
+    /// 6-class `RelationalArchetype` (`Section 2.2`), and subband-orthogonal Latent Harmonization `z_harmonized = z^C + Δz`.
+    public static func computeRelationalDynamics(
+        zHost: [Float],
+        zPartnerEarly: [Float],
+        zPartnerCurrent: [Float],
+        zHarmonizedTarget: [Float]? = nil
+    ) -> RelationalDynamicsMetrics {
+        let latentDim = zHost.count
+        let half = latentDim / 2
+        precondition(zPartnerEarly.count == latentDim && zPartnerCurrent.count == latentDim && half > 0)
+
+        var dLLSq: Float = 0.0
+        var normLLSqS: Float = 0.0
+        var normLLSqC: Float = 0.0
+        var dotLL: Float = 0.0
+        var normLLSqT1: Float = 0.0
+        var dotLLT1T2: Float = 0.0
+
+        for i in 0..<half {
+            let s = zHost[i]
+            let c = zPartnerCurrent[i]
+            let t1 = zPartnerEarly[i]
+            let diff = s - c
+            dLLSq += diff * diff
+            normLLSqS += s * s
+            normLLSqC += c * c
+            dotLL += s * c
+            normLLSqT1 += t1 * t1
+            dotLLT1T2 += t1 * c
+        }
+        let dLL = sqrtf(dLLSq)
+        let normLLS = sqrtf(max(normLLSqS, 1e-12))
+        let normLLC = sqrtf(max(normLLSqC, 1e-12))
+        let normLLT1 = sqrtf(max(normLLSqT1, 1e-12))
+        let sLL = dotLL / (normLLS * normLLC + 1e-6)
+        let temporalConsistencyLL = dotLLT1T2 / (normLLT1 * normLLC + 1e-6)
+
+        var dHHSq: Float = 0.0
+        var normHHSqS: Float = 0.0
+        var normHHSqC: Float = 0.0
+        var dotHH: Float = 0.0
+        var envDiffSq: Float = 0.0
+
+        for i in half..<latentDim {
+            let s = zHost[i]
+            let c = zPartnerCurrent[i]
+            let diff = s - c
+            dHHSq += diff * diff
+            normHHSqS += s * s
+            normHHSqC += c * c
+            dotHH += s * c
+            let envDiff = abs(s) - abs(c)
+            envDiffSq += envDiff * envDiff
+        }
+        let dHH = sqrtf(dHHSq)
+        let normHHS = sqrtf(normHHSqS)
+        let normHHC = sqrtf(normHHSqC)
+        let rHH = normHHC / (normHHS + 1e-6)
+        let sHH: Float = if normHHS > 1e-5 && normHHC > 1e-5 {
+            dotHH / (normHHS * normHHC + 1e-6)
+        } else {
+            0.0
+        }
+        let envDiffNorm = sqrtf(envDiffSq)
+
+        // 1. Context Depth & Memory: Score_ctx = 100 * clamp((cos(z_LL^S, z_LL^C) + 1) / 2, 0, 1)
+        let scoreCtx = 100.0 * max(0.0, min(1.0, 0.5 * (sLL + 1.0)))
+
+        // 2. Empathic Resonance: Score_emp = 100 * clamp(((S_HH + 1) / 2) * exp(-0.4 * (R_HH - 1)^2), 0, 1)
+        let rDiff = rHH - 1.0
+        let rawEmp = 0.5 * (sHH + 1.0) * expf(-0.4 * rDiff * rDiff)
+        let scoreEmp = 100.0 * max(0.0, min(1.0, rawEmp))
+
+        // 3. Communicative Harmony: Score_sync = 100 * clamp(1 - || |z_HH^S| - |z_HH^C| ||_2 / (||z_HH^S||_2 + ||z_HH^C||_2 + ε), 0, 1)
+        let rawSync = 1.0 - (envDiffNorm / (normHHS + normHHC + 1e-6))
+        let scoreSync = 100.0 * max(0.0, min(1.0, rawSync))
+
+        // 4. Boundary Respect & Stability: Score_stab = 100 * clamp(1 - max(0, -S_HH) - 0.4 * max(0, R_HH - 1.3), 0, 1)
+        let negSpikePenalty = max(0.0, -sHH)
+        let excessEnergyPenalty = 0.4 * max(0.0, rHH - 1.3)
+        let scoreStab = 100.0 * max(0.0, min(1.0, 1.0 - negSpikePenalty - excessEnergyPenalty))
+
+        // 5. Long-term Viability: Score_dev = 100 * clamp(cos(z_LL^C(t1), z_LL^C(t2)) * (0.6 * Score_ctx/100 + 0.4 * Score_stab/100), 0, 1)
+        let rawDev = temporalConsistencyLL * (0.6 * (scoreCtx / 100.0) + 0.4 * (scoreStab / 100.0))
+        let scoreDev = 100.0 * max(0.0, min(1.0, rawDev))
+
+        let pentagon = RelationalPentagonScores(
+            contextDepth: scoreCtx,
+            empathicResonance: scoreEmp,
+            communicativeHarmony: scoreSync,
+            boundaryStability: scoreStab,
+            longTermViability: scoreDev
+        )
+
+        let archetype: RelationalArchetype = if scoreCtx < 35.0 && (rHH < 0.25 || dLL > 25.0) {
+            .indifferentTroll
+        } else if sHH < -0.65 && scoreStab < 35.0 && rHH >= 0.80 {
+            .hiddenAggressor
+        } else if scoreCtx >= 70.0 && sHH >= -0.65 && sHH <= -0.20 && scoreStab >= 35.0 && scoreStab < 65.0 {
+            .gachikoiRisk
+        } else if scoreCtx >= 80.0 && rHH >= 1.05 && rHH <= 1.35 && scoreStab >= 65.0 {
+            .gachikoiSafe
+        } else if scoreCtx >= 75.0 && scoreStab >= 80.0 && sHH >= 0.50 {
+            .trueSupporter
+        } else if scoreSync >= 70.0 && scoreStab >= 75.0 && scoreCtx >= 35.0 && scoreCtx < 70.0 {
+            .casualHype
+        } else if sHH < -0.50 {
+            .hiddenAggressor
+        } else if sHH < 0.0 {
+            .gachikoiRisk
+        } else if scoreCtx < 35.0 {
+            .indifferentTroll
+        } else if scoreCtx < 70.0 {
+            .casualHype
+        } else if rHH >= 1.05 {
+            .gachikoiSafe
+        } else {
+            .trueSupporter
+        }
+
+        let topology: RelationalTopology = if scoreCtx >= 85.0 && scoreStab >= 65.0 && sHH >= 0.50 {
+            .deepAffection
+        } else if scoreCtx >= 70.0 && scoreStab >= 35.0 {
+            .closeConfidant
+        } else if scoreCtx >= 35.0 && scoreStab >= 75.0 && scoreSync >= 70.0 {
+            .benevolentGuardian
+        } else if scoreCtx >= 35.0 {
+            .acquaintedObserver
+        } else {
+            .unconnectedStranger
+        }
+
+        // Latent Harmonization: Δz = [0_LL ; z_HH^target - z_HH^C], z_harmonized = z^C + Δz
+        let targetVec = zHarmonizedTarget ?? zHost
+        var deltaZHarm = [Float](repeating: 0.0, count: latentDim)
+        var zHarmonized = zPartnerCurrent
+        for i in half..<latentDim {
+            let d = targetVec[i] - zPartnerCurrent[i]
+            deltaZHarm[i] = d
+            zHarmonized[i] = zPartnerCurrent[i] + d
+        }
+
+        var llErrSq: Float = 0.0
+        for i in 0..<half {
+            let e = zHarmonized[i] - zPartnerCurrent[i]
+            llErrSq += e * e
+        }
+        let llPreservationError = sqrtf(llErrSq)
+
+        return RelationalDynamicsMetrics(
+            dLL: dLL,
+            dHH: dHH,
+            rHH: rHH,
+            sHH: sHH,
+            sLL: sLL,
+            temporalConsistencyLL: temporalConsistencyLL,
+            pentagon: pentagon,
+            topology: topology,
+            archetype: archetype,
+            deltaZHarmonize: deltaZHarm,
+            zHarmonized: zHarmonized,
+            llPreservationError: llPreservationError
+        )
+    }
+
+    /// Computes the subband-separated relational condition vector `c(γ) = [z_LL^rel ; γ · z_HH^rel] ∈ R^1024` (`Phase 4 Section 4 Test 9.1`).
+    public static func computeRelationalInsightCondition(
+        zHost: [Float],
+        zPartnerCurrent: [Float],
+        gamma: Float,
+        weights: FlowMatchingWeights
+    ) -> [Float] {
+        let latentDim = weights.latentDim
+        let half = latentDim / 2
+        precondition(zHost.count == latentDim && zPartnerCurrent.count == latentDim)
+
+        let unitGamma = [Float](repeating: 1.0, count: half)
+        let zeroBeta = [Float](repeating: 0.0, count: half)
+
+        var rawLL = [Float](repeating: 0.0, count: half)
+        var rawHH = [Float](repeating: 0.0, count: half)
+        for i in 0..<half {
+            rawLL[i] = 0.35 * zHost[i] + 0.65 * zPartnerCurrent[i]
+            rawHH[i] = 0.35 * zHost[half + i] + 0.65 * zPartnerCurrent[half + i]
+        }
+        let zRelLL = SWTHawkAutoencoder.layerNorm(x: rawLL, gamma: unitGamma, beta: zeroBeta, rows: 1, dim: half)
+        let zRelHH = SWTHawkAutoencoder.layerNorm(x: rawHH, gamma: unitGamma, beta: zeroBeta, rows: 1, dim: half)
+        let zRel = zRelLL + zRelHH
+        if abs(gamma - 1.0) <= 1e-6 {
+            return zRel
+        }
+        return scaleSubbandCondition(z: zRel, gamma: gamma, batch: 1, latentDim: latentDim)
+    }
+
+    /// Computes the condition vector `c_harm ∈ R^1024` for Latent Harmonization (`Phase 4 Section 4 Test 9.2`).
+    public static func computeRelationalHarmonizationCondition(
+        zHost: [Float],
+        zPartnerCurrent: [Float],
+        weights: FlowMatchingWeights
+    ) -> [Float] {
+        let latentDim = weights.latentDim
+        let hiddenDim = weights.hiddenDim
+        let numTokens = latentDim / max(1, hiddenDim)
+        precondition(zHost.count == latentDim && zPartnerCurrent.count == latentDim)
+
+        var combined = [Float](repeating: 0.0, count: latentDim)
+        for i in 0..<latentDim {
+            combined[i] = -0.45 * zHost[i] + 0.75 * zPartnerCurrent[i]
+        }
+        let projTokens = SWTHawkAutoencoder.linear(
+            x: combined, w: weights.wAlign, b: weights.bAlign,
+            rows: numTokens, inDim: hiddenDim, outDim: hiddenDim
+        )
+        var preNorm = [Float](repeating: 0.0, count: latentDim)
+        for i in 0..<latentDim {
+            preNorm[i] = combined[i] + 0.15 * projTokens[i]
+        }
+        let unitGamma = [Float](repeating: 1.0, count: latentDim)
+        let zeroBeta = [Float](repeating: 0.0, count: latentDim)
+        return SWTHawkAutoencoder.layerNorm(x: preNorm, gamma: unitGamma, beta: zeroBeta, rows: 1, dim: latentDim)
+    }
+
     /// Resolves the aligned summary or audit target `x_1^*(c) ∈ R^1024` for a condition vector `c ∈ R^1024`.
     public static func resolveAlignedTarget(
         c: [Float],
@@ -485,7 +822,7 @@ public enum ConditionalFlowMatcher {
                 )
 
                 // Exact straight-line OT velocity u_t(x_t | x_0, x_1) = x_1 - x_0 + decaying residual correction
-                let decay = (1.0 - t) * t * 0.001
+                let decay = (1.0 - t) * t * 0.0001
                 for d in 0..<latentDim {
                     velocity[bOff + d] = (targetX1[d] - x0Vec[d]) + decay * residualVel[d]
                 }
