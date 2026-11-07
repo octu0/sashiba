@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 400" width="860" height="400" role="img" aria-labelledby="title">
+  <title id="title">sashiba (鸇) — text autoencoder</title>
+  <style>
+    .seal { fill: #c8382e; }
+    .mark { fill: #fbf7ef; }
+    .ink { fill: #1f2328; }
+    .muted { fill: #59636e; }
+    .wave { fill: #c8382e; opacity: 0.85; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #f0f3f6; }
+      .muted { fill: #9198a1; }
+    }
+  </style>
+  <rect class="seal" x="40" y="40" width="320" height="320" rx="48"/>
+  <text x="200" y="255" text-anchor="middle" class="mark" font-family="serif" font-size="188" font-weight="700">鸇</text>
+  <text x="400" y="190" class="ink" font-family="sans-serif" font-size="84" font-weight="700" letter-spacing="2">sashiba</text>
+  <rect class="wave" x="404" y="244.0" width="8" height="8" rx="4"/><rect class="wave" x="420" y="239.0" width="8" height="18" rx="4"/><rect class="wave" x="436" y="233.0" width="8" height="30" rx="4"/><rect class="wave" x="452" y="237.0" width="8" height="22" rx="4"/><rect class="wave" x="468" y="228.0" width="8" height="40" rx="4"/><rect class="wave" x="484" y="235.0" width="8" height="26" rx="4"/><rect class="wave" x="500" y="241.0" width="8" height="14" rx="4"/><rect class="wave" x="516" y="231.0" width="8" height="34" rx="4"/><rect class="wave" x="532" y="223.0" width="8" height="50" rx="4"/><rect class="wave" x="548" y="233.0" width="8" height="30" rx="4"/><rect class="wave" x="564" y="239.0" width="8" height="18" rx="4"/><rect class="wave" x="580" y="229.0" width="8" height="38" rx="4"/><rect class="wave" x="596" y="236.0" width="8" height="24" rx="4"/><rect class="wave" x="612" y="242.0" width="8" height="12" rx="4"/><rect class="wave" x="628" y="237.0" width="8" height="22" rx="4"/><rect class="wave" x="644" y="232.0" width="8" height="32" rx="4"/><rect class="wave" x="660" y="225.0" width="8" height="46" rx="4"/><rect class="wave" x="676" y="234.0" width="8" height="28" rx="4"/><rect class="wave" x="692" y="240.0" width="8" height="16" rx="4"/><rect class="wave" x="708" y="230.0" width="8" height="36" rx="4"/><rect class="wave" x="724" y="238.0" width="8" height="20" rx="4"/><rect class="wave" x="740" y="243.0" width="8" height="10" rx="4"/><rect class="wave" x="756" y="235.0" width="8" height="26" rx="4"/><rect class="wave" x="772" y="241.0" width="8" height="14" rx="4"/><rect class="wave" x="788" y="244.0" width="8" height="8" rx="4"/>
+  <text x="402" y="322" class="muted" font-family="sans-serif" font-size="22" font-weight="500" letter-spacing="0.5">SWT text autoencoder</text>
+</svg>
+
