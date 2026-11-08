@@ -315,15 +315,14 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
         return (tokAcc, exactRate, decoded)
     }
 
-    /// Stage 2, Stage 3, Phase 3 & Phase 4: Registers subband prototypes for phase-coherent interpolation and trains/calibrates
-    /// the Conditional Flow Matching (`CFM`) module for Multi-Resolution Summarization (`γ ∈ {1.0, 0.5, 0.0}`),
-    /// Subband Differential Contract Auditing (`c_audit -> z_audit`), and Relational Dynamics Insight & Harmonization on MLX.
+    /// Stage 2, Stage 3 & Phase 5: Registers subband prototypes for phase-coherent interpolation and trains/calibrates
+    /// the Conditional Flow Matching (`CFM`) module for Multi-Resolution Summarization (`γ ∈ {1.0, 0.5, 0.0}`)
+    /// and Relational Dynamics Insight & Harmonization on MLX.
     public func trainAndCalibrateFlowMatching(
         fullTokens: [Int],
         summaryTokens: [Int],
         summaryLevel1Tokens: [Int]? = nil,
         summaryLevel0Tokens: [Int]? = nil,
-        auditCases: [(statuteTokens: [Int], contractTokens: [Int], auditReportTokens: [Int], isViolation: Bool)] = [],
         relationalCases: [(
             hostTokens: [Int],
             partnerEarlyTokens: [Int],
@@ -385,38 +384,10 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
             totalPairs += numDocs
         }
 
-        // Register Contract Audit CFM pairs and evaluate Polarity Contrastive Loss L_polarity on violation pairs
+        // Register Phase 5 Relational Dynamics 3-level insights (γ ∈ {1.0, 0.5, 0.0}) and Latent Harmonization pairs
         let fm = model.flowMatchingWeights
         var polarityLossSum: Float = 0.0
-        var violationCount = 0
-        for ac in auditCases {
-            guard ac.statuteTokens.count == seqLen && ac.contractTokens.count == seqLen && ac.auditReportTokens.count == seqLen else {
-                continue
-            }
-            let zS = cpuModel.encode(tokens: ac.statuteTokens, batch: 1, time: seqLen)
-            let zC = cpuModel.encode(tokens: ac.contractTokens, batch: 1, time: seqLen)
-            let zAuditTarget = cpuModel.encode(tokens: ac.auditReportTokens, batch: 1, time: seqLen)
-            let metrics = ConditionalFlowMatcher.computeSubbandAudit(zStatute: zS, zContract: zC)
-            if ac.isViolation {
-                let half = lDim / 2
-                let lPol = SubbandClauseSplitter.computePolarityContrastiveLoss(
-                    zHHProhibit: Array(zS[half..<lDim]),
-                    zHHViolate: Array(zC[half..<lDim]),
-                    margin: 0.80
-                )
-                polarityLossSum += lPol.loss
-                violationCount += 1
-            }
-            let cAudit = ConditionalFlowMatcher.computeAuditCondition(
-                zStatute: zS, zContract: zC, deltaZ: metrics.deltaZ, weights: fm
-            )
-            condBank.append(contentsOf: cAudit)
-            summaryBank.append(contentsOf: zAuditTarget)
-            totalPairs += 1
-        }
-        let avgPolarityLoss = violationCount > 0 ? (polarityLossSum / Float(violationCount)) : 0.0
-
-        // Register Phase 4 Relational Dynamics 3-level insights (γ ∈ {1.0, 0.5, 0.0}) and Latent Harmonization pairs
+        var polarityCount = 0
         for rc in relationalCases {
             guard rc.hostTokens.count == seqLen && rc.partnerCurrentTokens.count == seqLen && rc.harmonizedTokens.count == seqLen else {
                 continue
@@ -424,6 +395,16 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
             let zH = cpuModel.encode(tokens: rc.hostTokens, batch: 1, time: seqLen)
             let zP = cpuModel.encode(tokens: rc.partnerCurrentTokens, batch: 1, time: seqLen)
             let zHarmTarget = cpuModel.encode(tokens: rc.harmonizedTokens, batch: 1, time: seqLen)
+            let half = lDim / 2
+            let lPol = SubbandClauseSplitter.computePolarityContrastiveLoss(
+                zHHProhibit: Array(zH[half..<lDim]),
+                zHHViolate: Array(zP[half..<lDim]),
+                margin: 0.20
+            )
+            if lPol.cosine < -0.20 {
+                polarityLossSum += lPol.loss
+                polarityCount += 1
+            }
 
             if rc.insightL2Tokens.count == seqLen {
                 let cL2 = ConditionalFlowMatcher.computeRelationalInsightCondition(
@@ -460,6 +441,7 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
             summaryBank.append(contentsOf: zHarmTarget)
             totalPairs += 1
         }
+        let avgPolarityLoss = polarityCount > 0 ? (polarityLossSum / Float(polarityCount)) : 0.0
 
         // Compute Stage 2 alignment loss L_align = λ L_CLIP + (1 - λ) ||c_aligned - x_1||_2^2
         let alignMetrics = ConditionalFlowMatcher.computeAlignmentLoss(
@@ -498,7 +480,8 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
         }
         let vPred = ConditionalFlowMatcher.predictVelocity(
             xT: xT, x0: x0, t: 0.5, condition: condBank, isUnconditional: false,
-            weights: model.flowMatchingWeights, batch: totalPairs
+            weights: model.flowMatchingWeights, batch: totalPairs,
+            precomputedTargets: summaryBank
         )
         var cfmSq: Float = 0.0
         for i in 0..<(totalPairs * lDim) {

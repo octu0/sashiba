@@ -11,7 +11,8 @@ let package = Package(
         .executable(name: "train", targets: ["train"]),
         .executable(name: "reconstruct", targets: ["reconstruct"]),
         .executable(name: "verify_latent_space", targets: ["verify_latent_space"]),
-        .executable(name: "benchmark", targets: ["benchmark"])
+        .executable(name: "benchmark", targets: ["benchmark"]),
+        .executable(name: "relational_head", targets: ["relational_head"])
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.33.0")
@@ -48,6 +49,14 @@ let package = Package(
             name: "benchmark",
             dependencies: ["Sashiba"],
             path: "script/benchmark"
+        ),
+        .executableTarget(
+            name: "relational_head",
+            dependencies: [
+                "Sashiba",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
+            path: "script/relational_head"
         ),
         .testTarget(
             name: "SashibaTests",

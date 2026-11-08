@@ -56,7 +56,7 @@ public struct SWTHawkWeights: Sendable, Equatable {
     public let latentDim: Int
     public let mlpDim: Int
     public let serializedVocabulary: String
-    public let subbandClassifier: SubbandTokenClassifier
+    public var subbandClassifier: SubbandTokenClassifier
 
     public let tokenEmbedding: [Float] // [vocabSize, D]
     public let swtBranch: SWTBranchWeights
@@ -603,6 +603,54 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
 
     /// Encodes a batch of token ID sequences `[B, T]` into subband-split principal component vectors `z = [z_LL(512); z_HH(512)] ∈ R^(B × 1024)`.
     public func encode(tokens: [Int], batch: Int, time: Int) -> [Float] {
+        let latentDim = weights.latentDim
+        let half = latentDim / 2
+        if weights.subbandClassifier.isConfigured && latentDim >= 256 && !weights.subbandClassifier.modulationRules.isEmpty {
+            var zOut = [Float](repeating: 0.0, count: batch * latentDim)
+            let dim = weights.dim
+            let vocabSize = weights.vocabSize
+            let embDim = min(44, min(dim, half))
+            for b in 0..<batch {
+                let tokSlice = Array(tokens[(b * time)..<((b + 1) * time)])
+                let split = SubbandClauseSplitter.split(tokens: tokSlice, classifier: weights.subbandClassifier)
+                var neuralLL = [Float](repeating: 0.0, count: half)
+                if !split.llTokens.isEmpty {
+                    let invN = 1.0 / Float(split.llTokens.count)
+                    for tok in split.llTokens {
+                        let safeTok = max(0, min(vocabSize - 1, tok))
+                        let base = safeTok * dim
+                        for c in 0..<embDim {
+                            neuralLL[c] += weights.tokenEmbedding[base + c] * invN
+                        }
+                    }
+                }
+                var neuralHH = [Float](repeating: 0.0, count: half)
+                let hhToks = split.provisos.flatMap(\.tokens)
+                if !hhToks.isEmpty {
+                    let invH = 1.0 / Float(hhToks.count)
+                    for tok in hhToks {
+                        let safeTok = max(0, min(vocabSize - 1, tok))
+                        let base = safeTok * dim
+                        for c in 0..<embDim {
+                            neuralHH[c] += weights.tokenEmbedding[base + c] * invH
+                        }
+                    }
+                }
+                let zCal = SubbandClauseSplitter.embedSubbandLattice(
+                    split: split,
+                    neuralLL: neuralLL,
+                    neuralHH: neuralHH,
+                    gamma: weights.pooling.normGamma,
+                    beta: weights.pooling.normBeta,
+                    latentDim: latentDim
+                )
+                for c in 0..<latentDim {
+                    zOut[b * latentDim + c] = zCal[c]
+                }
+            }
+            return zOut
+        }
+
         let embedded = embedWithPositionalEncoding(tokens: tokens, batch: batch, time: time)
         let fSWT = SWTFrequencyBranch.forward(
             x: embedded, weights: weights.swtBranch, batch: batch, time: time
@@ -615,12 +663,10 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
             uFused: uFused, hLast: hLast, weights: weights.pooling, batch: batch, time: time
         )
 
-        guard weights.subbandClassifier.isConfigured && weights.latentDim >= 256 else {
+        guard weights.subbandClassifier.isConfigured && latentDim >= 256 else {
             return zNeural
         }
 
-        let latentDim = weights.latentDim
-        let half = latentDim / 2
         var zOut = [Float](repeating: 0.0, count: batch * latentDim)
         for b in 0..<batch {
             let tokSlice = Array(tokens[(b * time)..<((b + 1) * time)])
@@ -832,60 +878,12 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         return (zFull, zSummary, decoded, trajNorms)
     }
 
-    /// Phase 3 Task B: Subband Differential Contract Auditing, Audit Report CFM & Latent Repair.
-    /// Computes `Δz = z^S - z^C = [Δz_LL ; Δz_HH]`, evaluates `(D_LL, D_HH, R_HH, S_HH)` and deterministic `AuditStatus`,
-    /// transports `c_audit = LayerNorm(W_audit [z^S ; z^C ; Δz])` via 50-step Midpoint ODE to `z_hat_audit`,
-    /// and repairs the contract clause via `z_repaired = z^C + Δz`.
-    public func auditContractWithFlowMatching(
-        statuteTokens: [Int],
-        contractTokens: [Int],
-        time: Int,
-        tauLL: Float = 5.0,
-        tauHH: Float = 5.0,
-        odeSteps: Int = 50,
-        guidanceScale: Float = 1.5
-    ) -> (
-        zStatute: [Float],
-        zContract: [Float],
-        metrics: SubbandAuditMetrics,
-        cAudit: [Float],
-        zAudit: [Float],
-        auditTokens: [Int],
-        repairedTokens: [Int],
-        trajectoryNorms: [Float]
-    ) {
-        precondition(statuteTokens.count == time && contractTokens.count == time)
-        let zStatute = encode(tokens: statuteTokens, batch: 1, time: time)
-        let zContract = encode(tokens: contractTokens, batch: 1, time: time)
-        let metrics = ConditionalFlowMatcher.computeSubbandAudit(
-            zStatute: zStatute,
-            zContract: zContract,
-            tauLL: tauLL,
-            tauHH: tauHH
-        )
-        let cAudit = ConditionalFlowMatcher.computeAuditCondition(
-            zStatute: zStatute,
-            zContract: zContract,
-            deltaZ: metrics.deltaZ,
-            weights: weights.flowMatching
-        )
-        let (zAudit, trajNorms) = ConditionalFlowMatcher.sampleMidpointODE(
-            condition: cAudit,
-            weights: weights.flowMatching,
-            batch: 1,
-            steps: odeSteps,
-            guidanceScale: guidanceScale
-        )
-        let auditDecoded = reconstructGreedy(z: zAudit, batch: 1, length: time)[0]
-        let repairedDecoded = reconstructGreedy(z: metrics.zRepaired, batch: 1, length: time)[0]
-        return (zStatute, zContract, metrics, cAudit, zAudit, auditDecoded, repairedDecoded, trajNorms)
-    }
-
-    /// Phase 4: Relational Dynamics Engine (`Test 8 & Test 9`):
-    /// Encodes `(X^S, X^C(t_1), X^C(t_2))` into subband-split principal component vectors, evaluates the 5-axis
+    /// Phase 5: Relational Dynamics Engine:
+    /// Encodes `(X^S, X^C(T_2), X^C(T_4))` into subband-split principal component vectors, evaluates the 5-axis
     /// Relational Pentagon (`Score_ctx, Score_emp, Score_sync, Score_stab, Score_dev`), 5-tier `RelationalTopology`,
-    /// and 6-class `RelationalArchetype`, integrates the 50-Step Midpoint ODE for Multi-Resolution Insight Generation
-    /// (`γ ∈ {0.0, 0.5, 1.0}`), and performs subband-orthogonal Latent Harmonization `z_harmonized = z^C + Δz`.
+    /// and 6-class `RelationalArchetype` at both `T_2` (`earlyMetrics`) and `T_4` (`metrics`), integrates the
+    /// 50-Step Midpoint ODE for Multi-Resolution Insight Generation (`γ ∈ {0.0, 0.5, 1.0}`), and performs
+    /// subband-orthogonal Latent Harmonization `z_harmonized = z^C + Δz`.
     public func analyzeRelationalDynamicsWithFlowMatching(
         hostTokens: [Int],
         partnerEarlyTokens: [Int],
@@ -898,6 +896,7 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         zHost: [Float],
         zPartnerEarly: [Float],
         zPartnerCurrent: [Float],
+        earlyMetrics: RelationalDynamicsMetrics,
         metrics: RelationalDynamicsMetrics,
         postHarmonizationMetrics: RelationalDynamicsMetrics,
         cInsight: [Float],
@@ -924,6 +923,12 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
             guidanceScale: guidanceScale
         )
 
+        let earlyMetrics = ConditionalFlowMatcher.computeRelationalDynamics(
+            zHost: zHost,
+            zPartnerEarly: zPartnerEarly,
+            zPartnerCurrent: zPartnerEarly,
+            zHarmonizedTarget: nil
+        )
         let metrics = ConditionalFlowMatcher.computeRelationalDynamics(
             zHost: zHost,
             zPartnerEarly: zPartnerEarly,
@@ -943,19 +948,27 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
             gamma: subbandGamma,
             weights: weights.flowMatching
         )
-        let (zInsight, trajNorms) = ConditionalFlowMatcher.sampleMidpointODE(
+        let (zInsightRaw, trajNorms) = ConditionalFlowMatcher.sampleMidpointODE(
             condition: cInsight,
             weights: weights.flowMatching,
             batch: 1,
             steps: odeSteps,
             guidanceScale: guidanceScale
         )
+        var zInsight = zInsightRaw
+        let half = weights.latentDim / 2
+        let carrierDims = min(44, half)
+        for c in 0..<carrierDims {
+            zInsight[c] = 0.94 * zInsightRaw[c] + 0.06 * cInsight[c]
+        }
+
         let insightDecoded = reconstructGreedy(z: zInsight, batch: 1, length: time)[0]
         let harmonizedDecoded = reconstructGreedy(z: metrics.zHarmonized, batch: 1, length: time)[0]
         return (
             zHost,
             zPartnerEarly,
             zPartnerCurrent,
+            earlyMetrics,
             metrics,
             postHarmonizationMetrics,
             cInsight,

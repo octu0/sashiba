@@ -11,7 +11,7 @@ export MLX_CCCL_DIR ?= $(HOME)/.local/share/cccl/include
 export MLX_CUDA_INCLUDE_PATHS ?= $(HOME)/.local/share/cudnn-frontend/include:$(HOME)/.local/share/cutlass/include
 export NVCC_PREPEND_FLAGS ?= -allow-unsupported-compiler --extended-lambda
 
-.PHONY: all build test train eval reconstruct verify benchmark clean help
+.PHONY: all build test train eval reconstruct verify head benchmark clean help
 
 all: build test
 
@@ -33,6 +33,9 @@ reconstruct:
 verify:
 	$(SWIFT) run -c release verify_latent_space -d $(DATA) -w $(WEIGHTS) -o $(REPORT)
 
+head:
+	$(SWIFT) run -c release relational_head -d $(DATA) -w $(WEIGHTS) -o .tmp/relational_head_report.md --heads .tmp/relational_heads.json
+
 benchmark:
 	$(SWIFT) run -c release benchmark
 
@@ -46,6 +49,7 @@ help:
 	@echo "make eval         Evaluate trained weights on $(DATA)"
 	@echo "make reconstruct  Encode text to 1024-D vector z and reconstruct text"
 	@echo "make verify       Run 4 latent space verification tests -> $(REPORT)"
+	@echo "make head         Train learned relational classification heads and evaluate on unseen split"
 	@echo "make benchmark    Run SWT-Hawk autoencoder throughput benchmark"
 	@echo "make clean        Clean Swift build artifacts"
 

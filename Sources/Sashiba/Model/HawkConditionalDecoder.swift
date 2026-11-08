@@ -413,7 +413,7 @@ public enum HawkConditionalDecoder {
             let diffHH = hhVec[45] - hhVec[44]
 
             var provisosByAnchor: [Int: [[Int]]] = [:]
-            if relGamma >= 0.15 && diffHH > 1e-3 {
+            if relGamma >= 0.05 && diffHH > 1e-3 {
                 let offsetHH = 0.5 * (hhVec[45] + hhVec[44])
                 let scaleHH = diffHH / (2.0 * SubbandClauseSplitter.calibrationScale)
                 let magicHH = (hhVec[47] - offsetHH) / scaleHH

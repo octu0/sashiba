@@ -4,10 +4,10 @@ import Sashiba
 struct TrainCLI {
     var dataPath: String = ".tmp"
     var epochs: Int = 60
-    var batchSize: Int = 10
-    var dim: Int = SWTHawkShape.defaultDim
-    var encoderLayers: Int = SWTHawkShape.encoderLayers
-    var decoderLayers: Int = SWTHawkShape.decoderLayers
+    var batchSize: Int = 16
+    var dim: Int = 256
+    var encoderLayers: Int = 4
+    var decoderLayers: Int = 4
     var lrMax: Float = 0.003
     var lrMin: Float = 0.0003
     var wordDropout: Float = 0.25
@@ -81,39 +81,21 @@ struct TrainCLI {
     }
 }
 
-/// Generates Combinatorial Subband Augmentation texts (`Section 2.3.1`) from the loaded dataset and configuration.
+/// Generates Compositional Epoch Augmentation texts (`Phase 5 Section 4.1`) from the loaded dialogue corpus and configuration.
 func buildAugmentedCorpus(docs: [TextDocument], config: DatasetConfiguration) -> [String] {
-    var baseTexts: [String] = []
-    var highFreqPools: [[String]] = []
-    for doc in docs {
-        let (base, highFreq) = config.classifierRules.splitBaseAndHighFrequency(doc.text)
-        baseTexts.append(base)
-        highFreqPools.append(highFreq)
-    }
-
     var augmented: [String] = []
+    if !config.baseVocabularyCharacters.isEmpty {
+        augmented.append(config.baseVocabularyCharacters)
+    }
     for doc in docs {
         augmented.append(doc.text)
-    }
-    for base in baseTexts {
-        augmented.append(base)
-    }
-    for i in 0..<docs.count {
-        let j = (i + 3) % docs.count
-        if let clause = highFreqPools[j].first {
-            augmented.append(baseTexts[i] + clause)
-        }
-    }
-    for doc in docs + config.unseenDocuments {
         if !doc.summaryLevel0.isEmpty { augmented.append(doc.summaryLevel0) }
         if !doc.summaryLevel1.isEmpty { augmented.append(doc.summaryLevel1) }
         if !doc.summary.isEmpty { augmented.append(doc.summary) }
     }
-    for ac in config.contractAuditCases {
-        augmented.append(ac.contractText)
-        augmented.append(ac.expectedAuditReport)
-    }
-    for rc in config.relationalDialogueCases {
+
+    let trainCases = config.relationalDialogueCases.filter { !$0.isZeroShotUnseen }
+    for rc in trainCases {
         augmented.append(rc.hostText)
         augmented.append(rc.partnerEarlyText)
         augmented.append(rc.partnerCurrentText)
@@ -121,6 +103,28 @@ func buildAugmentedCorpus(docs: [TextDocument], config: DatasetConfiguration) ->
         augmented.append(rc.insightLevel0)
         augmented.append(rc.insightLevel1)
         augmented.append(rc.insightLevel2)
+    }
+
+    // Compositional cross-recombination across (T1..T2) context prefixes and (T3..T4) emotional reaction suffixes
+    let delim = config.classifierRules.sentenceDelimiters.first ?? "。"
+    var earlyPools: [String] = []
+    var latePools: [String] = []
+    for rc in trainCases {
+        earlyPools.append(rc.partnerEarlyText)
+        let parts = rc.partnerCurrentText.components(separatedBy: delim).filter { !$0.isEmpty }
+        if parts.count >= 3 {
+            let half = parts.count / 2
+            let suffix = parts[half..<parts.count].map { $0 + delim }.joined()
+            latePools.append(suffix)
+        }
+    }
+    for i in 0..<earlyPools.count {
+        for step in 1...min(8, max(1, latePools.count - 1)) {
+            let j = (i + step) % max(1, latePools.count)
+            if j < latePools.count {
+                augmented.append(earlyPools[i] + latePools[j])
+            }
+        }
     }
     return augmented
 }
@@ -148,6 +152,14 @@ for doc in docs {
         maxObservedLen = ids.count
     }
 }
+for rc in datasetConfig.relationalDialogueCases where !rc.isZeroShotUnseen {
+    for text in [rc.hostText, rc.partnerEarlyText, rc.partnerCurrentText, rc.harmonizedPartnerText, rc.insightLevel2] {
+        let count = vocab.encode(text, maxLength: cli.maxSeqLen, addEOS: false, padToLength: nil).count
+        if count > maxObservedLen {
+            maxObservedLen = count
+        }
+    }
+}
 let seqLen = min(cli.maxSeqLen, max(4, maxObservedLen))
 
 func padRow(_ ids: [Int], to length: Int) -> [Int] {
@@ -164,12 +176,7 @@ for ids in encodedDocs {
     allTokens.append(contentsOf: padRow(ids, to: seqLen))
 }
 
-let cfmDocs = docs + datasetConfig.unseenDocuments.filter { !$0.summary.isEmpty }
-var docTextById: [String: String] = [:]
-for doc in docs + datasetConfig.unseenDocuments {
-    docTextById[doc.id] = doc.text
-}
-
+let cfmDocs = docs
 var cfmFullTokens: [Int] = []
 var cfmSummaryTokens: [Int] = []
 var cfmSummaryL1Tokens: [Int] = []
@@ -190,15 +197,6 @@ for doc in cfmDocs {
     cfmSummaryL0Tokens.append(contentsOf: padRow(sumL0Ids, to: seqLen))
 }
 
-var trainingAuditCases: [(statuteTokens: [Int], contractTokens: [Int], auditReportTokens: [Int], isViolation: Bool)] = []
-for ac in datasetConfig.contractAuditCases {
-    guard let sText = docTextById[ac.targetStatuteId] else { continue }
-    let sIds = padRow(vocab.encode(sText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
-    let cIds = padRow(vocab.encode(ac.contractText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
-    let rIds = padRow(vocab.encode(ac.expectedAuditReport, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
-    trainingAuditCases.append((sIds, cIds, rIds, ac.expectedStatus == .violation))
-}
-
 var trainingRelationalCases: [(
     hostTokens: [Int],
     partnerEarlyTokens: [Int],
@@ -208,7 +206,7 @@ var trainingRelationalCases: [(
     insightL1Tokens: [Int],
     insightL2Tokens: [Int]
 )] = []
-for rc in datasetConfig.relationalDialogueCases {
+for rc in datasetConfig.relationalDialogueCases where !rc.isZeroShotUnseen {
     let hIds = padRow(vocab.encode(rc.hostText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
     let p1Ids = padRow(vocab.encode(rc.partnerEarlyText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
     let p2Ids = padRow(vocab.encode(rc.partnerCurrentText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
@@ -247,10 +245,10 @@ let warmupSteps = min(max(5, totalSteps / 20), max(1, totalSteps / 2))
 let scheduler = CosineLRScheduler(lrMax: cli.lrMax, lrMin: cli.lrMin)
 
 print("==================================================================")
-print("SWT-Griffin Text Autoencoder & CFM Training (Phase 2, Swift)")
+print("SWT-Griffin Relational Dynamics Engine & CFM Training (Phase 5)")
 print("==================================================================")
 print("Backend          : MLX GPU (Metal / CUDA)")
-print("Documents        : \(numDocs) statutes (\(augmentedCorpus.count) augmented clause combinations)")
+print("Train Dialogues  : \(numDocs) multi-turn dialogues (\(augmentedCorpus.count) compositional combinations)")
 print("Sequence length T: \(seqLen) tokens | Vocab size V: \(vocab.count)")
 print("Model dim D      : \(weights.dim) | Latent dim z: \(weights.latentDim) (z_LL: 512, z_HH: 512)")
 print("Griffin layers   : \(weights.hawkBranch.count) (RG-LRU + Local Window Attn W=\(SWTHawkShape.windowSize)) | Decoder layers: \(weights.decoder.layers.count)")
@@ -316,7 +314,7 @@ if cli.epochs > 0 {
                 numDocs
             ))
 
-            if cli.earlyStopOnExactGreedy && epoch >= 25 && evalResult.exactMatchRate >= 1.0 && avgRec < 0.15 {
+            if cli.earlyStopOnExactGreedy && epoch >= 20 && evalResult.exactMatchRate >= 1.0 {
                 print("Reached 100.00% exact greedy reconstruction across all \(numDocs) documents from z = [z_LL(512); z_HH(512)] ∈ R^1024!")
                 break
             }
@@ -325,20 +323,19 @@ if cli.epochs > 0 {
 }
 
 if cli.epochs > 0 || cli.importWeightsPath != nil {
-    // Stage 2, Stage 3, Phase 3 & Phase 4: Multi-Resolution CFM (γ ∈ {1.0, 0.5, 0.0}), Contract Audit CFM & Relational Dynamics CFM
+    // Stage 2, Stage 3 & Phase 5: Multi-Resolution Relational Insight CFM (γ ∈ {1.0, 0.5, 0.0}) & Latent Harmonization CFM
     let cfmStats = trainer.trainAndCalibrateFlowMatching(
         fullTokens: cfmFullTokens,
         summaryTokens: cfmSummaryTokens,
         summaryLevel1Tokens: cfmSummaryL1Tokens,
         summaryLevel0Tokens: cfmSummaryL0Tokens,
-        auditCases: trainingAuditCases,
         relationalCases: trainingRelationalCases,
         numDocs: cfmDocs.count,
         prototypeCount: numDocs,
         seqLen: seqLen
     )
     print(String(
-        format: "[Stage 2/3, Phase 3 & Phase 4 CFM] Registered %d multi-res, audit & relational pairs | L_align: %.4f | L_CFM: %.6f | L_polarity: %.4f",
+        format: "[Phase 5 Relational CFM] Registered %d multi-res insight & harmonization pairs | L_align: %.4f | L_CFM: %.6f | L_polarity: %.4f",
         cfmStats.registeredPairs,
         cfmStats.alignLoss,
         cfmStats.cfmLoss,

@@ -671,6 +671,27 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         return pooling(uFused: uFused, hLast: hLast, phi: latentPhi)
     }
 
+    /// Runs only the neural encoder (no token-ID lattice, no modulation rules) over `tokens: [B * T]` in chunks.
+    /// Returns `[B * latentDim]` features suitable for downstream learned heads.
+    public func encodeNeural(tokens: [Int], batch: Int, time: Int, chunk: Int = 32) -> [Float] {
+        let peFlat = HawkConditionalDecoder.positionalEncoding(time: time, dim: dim)
+        let pe = MLXArray(peFlat, [1, time, dim])
+        let phi = MLXArray(HawkConditionalDecoder.latentBasis(time: time, latentDim: latentDim), [1, time, latentDim])
+        var out: [Float] = []
+        out.reserveCapacity(batch * latentDim)
+        var start = 0
+        while start < batch {
+            let cur = min(chunk, batch - start)
+            let slice = tokens[(start * time)..<((start + cur) * time)].map { Int32($0) }
+            let ids = MLXArray(slice, [cur, time])
+            let z = encode(ids, pe: pe, phi: phi)
+            eval(z)
+            out.append(contentsOf: z.asArray(Float.self))
+            start += cur
+        }
+        return out
+    }
+
     /// Teacher-forced forward pass returning `(z: [B, 1024], logits: [B, T, V])`, with optional latent Gaussian noise `zNoise`.
     public func callAsFunction(
         tokenIds: MLXArray,

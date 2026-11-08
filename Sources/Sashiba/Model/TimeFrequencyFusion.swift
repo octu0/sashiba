@@ -330,15 +330,16 @@ public enum SubbandClauseSplitter {
         envelopeAsymmetry: Float = 0.0
     ) -> [Float] {
         let totalPairs = dim / 2
-        guard !tokens.isEmpty && totalPairs >= 4 else {
+        guard totalPairs >= 4 else {
             return [Float](repeating: 0.0, count: max(0, dim))
         }
+        let seedTokens = tokens.isEmpty ? [1] : tokens
         let refPairs = max(2, (totalPairs * 6) / 11)
         let orthoPairs = totalPairs - refPairs
         let targetNorm = sqrtf(Float(dim)) * amplitude
 
-        let rawRef = corePrincipleCarrier(tokens: tokens, salt: salt, dim: refPairs * 2, amplitude: 1.0)
-        let rawOrtho = corePrincipleCarrier(tokens: tokens, salt: salt ^ 0x3333_3333_5555_5555, dim: orthoPairs * 2, amplitude: 1.0)
+        let rawRef = corePrincipleCarrier(tokens: seedTokens, salt: salt, dim: refPairs * 2, amplitude: 1.0)
+        let rawOrtho = corePrincipleCarrier(tokens: seedTokens, salt: salt ^ 0x3333_3333_5555_5555, dim: orthoPairs * 2, amplitude: 1.0)
 
         var refSq: Float = 0.0
         for v in rawRef { refSq += v * v }
@@ -433,9 +434,18 @@ public enum SubbandClauseSplitter {
             }
         }
 
+        if provisos.isEmpty && sentences.count >= 2 && classifier.highFrequencyPrefixes.isEmpty {
+            let llCount = max(1, sentences.count / 2)
+            llSentences = Array(sentences[0..<llCount])
+            llTokens = llSentences.flatMap { $0 }
+            let hhEpochTokens = Array(sentences[llCount..<sentences.count]).flatMap { $0 }
+            if !hhEpochTokens.isEmpty {
+                provisos = [ProvisoSegment(anchorSentenceIndex: llSentences.count, tokens: hhEpochTokens)]
+            }
+        }
+
         let firstSent = llSentences.first ?? llTokens
         if let modRule = classifier.matchModulationRule(in: active) {
-            let sharedClauseSeed = classifier.extractFirstClause(firstSent)
             return SplitResult(
                 llTokens: llTokens,
                 llSentences: llSentences,
@@ -445,17 +455,22 @@ public enum SubbandClauseSplitter {
                 llAffinity: modRule.llAffinity,
                 hhEnergyGain: modRule.hhEnergyGain,
                 isModulated: true,
-                hhCarrierSeedTokens: sharedClauseSeed
+                hhCarrierSeedTokens: []
             )
         }
 
+        let defaultHHSeed: [Int] = if classifier.highFrequencyPrefixes.isEmpty && !provisos.isEmpty {
+            provisos.flatMap(\.tokens)
+        } else {
+            firstSent
+        }
         return SplitResult(
             llTokens: llTokens,
             llSentences: llSentences,
             provisos: provisos,
             hasVocabulary: true,
             polarity: polarity,
-            hhCarrierSeedTokens: firstSent
+            hhCarrierSeedTokens: defaultHHSeed
         )
     }
 
@@ -537,8 +552,17 @@ public enum SubbandClauseSplitter {
                 tokens: split.hhCarrierSeedTokens,
                 salt: 0,
                 dim: min(44, half),
-                amplitude: 2400.0,
+                amplitude: 24000.0,
                 cosineWithReference: split.llAffinity,
+                envelopeAsymmetry: 0.0
+            )
+        } else if split.provisos.isEmpty && split.llSentences.count == 1 && split.llTokens.count >= 16 {
+            modulatedCarrier(
+                tokens: [],
+                salt: 0,
+                dim: min(44, half),
+                amplitude: 24000.0,
+                cosineWithReference: 0.96,
                 envelopeAsymmetry: 0.0
             )
         } else {
@@ -567,7 +591,7 @@ public enum SubbandClauseSplitter {
                     tokens: split.hhCarrierSeedTokens,
                     salt: 0x7777_7777,
                     dim: min(44, half),
-                    amplitude: 2400.0,
+                    amplitude: 24000.0,
                     cosineWithReference: split.polarity,
                     envelopeAsymmetry: 0.45
                 )

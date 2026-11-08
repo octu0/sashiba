@@ -89,9 +89,20 @@ public struct TextDocument: Codable, Sendable, Equatable {
             guard fm.fileExists(atPath: path, isDirectory: &isDir) else { continue }
             if isDir.boolValue {
                 if let items = try? fm.contentsOfDirectory(atPath: path).sorted() {
-                    for item in items where item.hasSuffix(".json") || item.hasSuffix(".txt") {
+                    for item in items where (item.hasSuffix(".json") || item.hasSuffix(".txt")) && item != "dataset_config.json" {
                         loadFile((path as NSString).appendingPathComponent(item))
                     }
+                    if results.isEmpty {
+                        let jsonlDocs = DatasetConfiguration.loadAnchorDocumentsFromJSONL(inDirectory: path)
+                        if !jsonlDocs.isEmpty {
+                            results.append((source: path, documents: jsonlDocs))
+                        }
+                    }
+                }
+            } else if path.hasSuffix(".jsonl") {
+                let jsonlDocs = DatasetConfiguration.loadAnchorDocumentsFromJSONL(inDirectory: (path as NSString).deletingLastPathComponent)
+                if !jsonlDocs.isEmpty {
+                    results.append((source: path, documents: jsonlDocs))
                 }
             } else {
                 loadFile(path)
@@ -309,115 +320,504 @@ public struct SubbandClassifierRules: Codable, Sendable, Equatable {
 
 /// Dataset-level configuration loaded from `<dataPath>/dataset_config.json` (kept out of source code).
 public struct DatasetConfiguration: Codable, Sendable, Equatable {
-    public struct PairSpec: Codable, Sendable, Equatable {
+    public struct VerificationPairSpec: Codable, Sendable, Equatable {
         public let label: String
-        public let idA: String
-        public let idB: String
+        public let category: String
 
-        public init(label: String, idA: String, idB: String) {
+        public init(label: String, category: String) {
             self.label = label
-            self.idA = idA
-            self.idB = idB
-        }
-    }
-
-    public struct ExceptionArithmeticSpec: Codable, Sendable, Equatable {
-        public let baseTargetId: String
-        public let sourceAId: String
-        public let sourceALabel: String
-        public let sourceBId: String
-        public let sourceBLabel: String
-
-        public init(
-            baseTargetId: String,
-            sourceAId: String,
-            sourceALabel: String,
-            sourceBId: String,
-            sourceBLabel: String
-        ) {
-            self.baseTargetId = baseTargetId
-            self.sourceAId = sourceAId
-            self.sourceALabel = sourceALabel
-            self.sourceBId = sourceBId
-            self.sourceBLabel = sourceBLabel
-        }
-    }
-
-    public struct CoreMismatchSpec: Codable, Sendable, Equatable {
-        public let statuteId: String
-        public let contractId: String
-
-        public init(statuteId: String, contractId: String) {
-            self.statuteId = statuteId
-            self.contractId = contractId
+            self.category = category
         }
     }
 
     public let classifierRules: SubbandClassifierRules
-    public let unseenDocuments: [TextDocument]
-    public let contractAuditCases: [ContractAuditCase]
     public let relationalDialogueCases: [RelationalDialogueCase]
-    public let interpolationPairs: [PairSpec]
-    public let crossSynthesisPairs: [PairSpec]
-    public let exceptionArithmetic: ExceptionArithmeticSpec?
-    public let coreMismatchPair: CoreMismatchSpec?
+    public let baseVocabularyCharacters: String
+    public let test10Specs: [VerificationPairSpec]
+    public let test11Specs: [VerificationPairSpec]
+    public let test12Specs: [VerificationPairSpec]
 
     private enum CodingKeys: String, CodingKey {
         case classifierRules
-        case unseenDocuments
-        case contractAuditCases
         case relationalDialogueCases
-        case interpolationPairs
-        case crossSynthesisPairs
-        case exceptionArithmetic
-        case coreMismatchPair
+        case baseVocabularyCharacters
+        case test10Specs
+        case test11Specs
+        case test12Specs
     }
 
     public init(
         classifierRules: SubbandClassifierRules = SubbandClassifierRules(),
-        unseenDocuments: [TextDocument] = [],
-        contractAuditCases: [ContractAuditCase] = [],
         relationalDialogueCases: [RelationalDialogueCase] = [],
-        interpolationPairs: [PairSpec] = [],
-        crossSynthesisPairs: [PairSpec] = [],
-        exceptionArithmetic: ExceptionArithmeticSpec? = nil,
-        coreMismatchPair: CoreMismatchSpec? = nil
+        baseVocabularyCharacters: String = "",
+        test10Specs: [VerificationPairSpec] = [],
+        test11Specs: [VerificationPairSpec] = [],
+        test12Specs: [VerificationPairSpec] = []
     ) {
         self.classifierRules = classifierRules
-        self.unseenDocuments = unseenDocuments
-        self.contractAuditCases = contractAuditCases
         self.relationalDialogueCases = relationalDialogueCases
-        self.interpolationPairs = interpolationPairs
-        self.crossSynthesisPairs = crossSynthesisPairs
-        self.exceptionArithmetic = exceptionArithmetic
-        self.coreMismatchPair = coreMismatchPair
+        self.baseVocabularyCharacters = baseVocabularyCharacters
+        self.test10Specs = test10Specs
+        self.test11Specs = test11Specs
+        self.test12Specs = test12Specs
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.classifierRules = (try? container.decode(SubbandClassifierRules.self, forKey: .classifierRules)) ?? SubbandClassifierRules()
-        self.unseenDocuments = (try? container.decode([TextDocument].self, forKey: .unseenDocuments)) ?? []
-        self.contractAuditCases = (try? container.decode([ContractAuditCase].self, forKey: .contractAuditCases)) ?? []
         self.relationalDialogueCases = (try? container.decode([RelationalDialogueCase].self, forKey: .relationalDialogueCases)) ?? []
-        self.interpolationPairs = (try? container.decode([PairSpec].self, forKey: .interpolationPairs)) ?? []
-        self.crossSynthesisPairs = (try? container.decode([PairSpec].self, forKey: .crossSynthesisPairs)) ?? []
-        self.exceptionArithmetic = try? container.decode(ExceptionArithmeticSpec.self, forKey: .exceptionArithmetic)
-        self.coreMismatchPair = try? container.decode(CoreMismatchSpec.self, forKey: .coreMismatchPair)
+        self.baseVocabularyCharacters = (try? container.decode(String.self, forKey: .baseVocabularyCharacters)) ?? ""
+        self.test10Specs = (try? container.decode([VerificationPairSpec].self, forKey: .test10Specs)) ?? []
+        self.test11Specs = (try? container.decode([VerificationPairSpec].self, forKey: .test11Specs)) ?? []
+        self.test12Specs = (try? container.decode([VerificationPairSpec].self, forKey: .test12Specs)) ?? []
     }
 
-    public static func load(from directoryOrFilePath: String) -> DatasetConfiguration {
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        let candidatePath = if fm.fileExists(atPath: directoryOrFilePath, isDirectory: &isDir), isDir.boolValue {
-            (directoryOrFilePath as NSString).appendingPathComponent("dataset_config.json")
-        } else {
-            directoryOrFilePath
+    private struct ScenarioJSONLRecord: Codable {
+        struct ModulationValues: Codable {
+            let ll_t2: Float
+            let pol_t2: Float
+            let gain_t2: Float
+            let ll_t4: Float
+            let pol_t4: Float
+            let gain_t4: Float
         }
+        /// Optional persona metadata; every field falls back to an empty string when absent.
+        struct PersonaProfile: Codable {
+            let age_group: String
+            let tone: String
+            let relationship_duration: String
+            let context_domain: String
+
+            init(age_group: String = "", tone: String = "", relationship_duration: String = "", context_domain: String = "") {
+                self.age_group = age_group
+                self.tone = tone
+                self.relationship_duration = relationship_duration
+                self.context_domain = context_domain
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                self.age_group = (try? container.decode(String.self, forKey: .age_group)) ?? ""
+                self.tone = (try? container.decode(String.self, forKey: .tone)) ?? ""
+                self.relationship_duration = (try? container.decode(String.self, forKey: .relationship_duration)) ?? ""
+                self.context_domain = (try? container.decode(String.self, forKey: .context_domain)) ?? ""
+            }
+        }
+        struct Insights: Codable {
+            let level_0_core: String
+            let level_1_mid: String
+            let level_2_deep: String
+        }
+        let scenario_id: String
+        let split: String
+        let category_12: String
+        let archetype_6: RelationalArchetype
+        let topology_5: RelationalTopology
+        let expected_archetype_t2: RelationalArchetype
+        let expected_topology_t2: RelationalTopology
+        let modulation: ModulationValues
+        let persona_profile: PersonaProfile
+        let sender_log_t1_t2: String
+        let sender_log_t3_t4: String
+        let receiver_log_t1_t2: String
+        let receiver_log_t3_t4: String
+        let receiver_log_harmonized: String
+        let insights: Insights
+
+        enum CodingKeys: String, CodingKey {
+            case scenario_id
+            case split
+            case category_12
+            case archetype_6
+            case topology_5
+            case expected_archetype_t2
+            case expected_topology_t2
+            case modulation
+            case persona_profile
+            case sender_log_t1_t2
+            case sender_log_t3_t4
+            case receiver_log_t1_t2
+            case receiver_log_t3_t4
+            case receiver_log_harmonized
+            case insights
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.scenario_id = try c.decode(String.self, forKey: .scenario_id)
+            self.split = try c.decode(String.self, forKey: .split)
+            let cat = try c.decode(String.self, forKey: .category_12)
+            self.category_12 = cat
+            self.archetype_6 = try c.decode(RelationalArchetype.self, forKey: .archetype_6)
+            self.topology_5 = try c.decode(RelationalTopology.self, forKey: .topology_5)
+            self.expected_archetype_t2 = try c.decode(RelationalArchetype.self, forKey: .expected_archetype_t2)
+            self.expected_topology_t2 = try c.decode(RelationalTopology.self, forKey: .expected_topology_t2)
+            self.modulation = try c.decode(ModulationValues.self, forKey: .modulation)
+            self.persona_profile = (try? c.decode(PersonaProfile.self, forKey: .persona_profile)) ?? PersonaProfile(context_domain: cat)
+            self.sender_log_t1_t2 = try c.decode(String.self, forKey: .sender_log_t1_t2)
+            self.sender_log_t3_t4 = try c.decode(String.self, forKey: .sender_log_t3_t4)
+            self.receiver_log_t1_t2 = try c.decode(String.self, forKey: .receiver_log_t1_t2)
+            self.receiver_log_t3_t4 = try c.decode(String.self, forKey: .receiver_log_t3_t4)
+            self.receiver_log_harmonized = try c.decode(String.self, forKey: .receiver_log_harmonized)
+            self.insights = try c.decode(Insights.self, forKey: .insights)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(scenario_id, forKey: .scenario_id)
+            try c.encode(split, forKey: .split)
+            try c.encode(category_12, forKey: .category_12)
+            try c.encode(archetype_6, forKey: .archetype_6)
+            try c.encode(topology_5, forKey: .topology_5)
+            try c.encode(expected_archetype_t2, forKey: .expected_archetype_t2)
+            try c.encode(expected_topology_t2, forKey: .expected_topology_t2)
+            try c.encode(modulation, forKey: .modulation)
+            try c.encode(persona_profile, forKey: .persona_profile)
+            try c.encode(sender_log_t1_t2, forKey: .sender_log_t1_t2)
+            try c.encode(sender_log_t3_t4, forKey: .sender_log_t3_t4)
+            try c.encode(receiver_log_t1_t2, forKey: .receiver_log_t1_t2)
+            try c.encode(receiver_log_t3_t4, forKey: .receiver_log_t3_t4)
+            try c.encode(receiver_log_harmonized, forKey: .receiver_log_harmonized)
+            try c.encode(insights, forKey: .insights)
+        }
+    }
+
+    private static func normalizeTwoSentences(_ text: String, sentenceDelim: String, clauseDelim: String) -> String {
+        guard !sentenceDelim.isEmpty else { return text }
+        let parts = text
+            .components(separatedBy: sentenceDelim)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if parts.count == 2 {
+            return parts[0] + sentenceDelim + parts[1] + sentenceDelim
+        } else if parts.count > 2 {
+            let first = parts[0]
+            let rest = parts[1..<parts.count].joined(separator: clauseDelim)
+            return first + sentenceDelim + rest + sentenceDelim
+        } else if let single = parts.first {
+            let clauses = single.components(separatedBy: clauseDelim).filter { !$0.isEmpty }
+            if clauses.count >= 2 {
+                let mid = clauses.count / 2
+                let s1 = clauses[0..<mid].joined(separator: clauseDelim)
+                let s2 = clauses[mid..<clauses.count].joined(separator: clauseDelim)
+                return s1 + sentenceDelim + s2 + sentenceDelim
+            }
+            let midIdx = single.index(single.startIndex, offsetBy: max(1, single.count / 2))
+            return String(single[..<midIdx]) + sentenceDelim + String(single[midIdx...]) + sentenceDelim
+        }
+        return text
+    }
+
+    private static func readJSONLRecords(inDirectory dirPath: String) -> [ScenarioJSONLRecord] {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(atPath: dirPath).sorted() else { return [] }
+        let jsonlFiles: [String] = if items.contains("scenarios.jsonl") {
+            ["scenarios.jsonl"]
+        } else {
+            items.filter { $0.hasSuffix(".jsonl") }
+        }
+        let decoder = JSONDecoder()
+        var records: [ScenarioJSONLRecord] = []
+        for file in jsonlFiles {
+            let fullPath = (dirPath as NSString).appendingPathComponent(file)
+            guard let content = try? String(contentsOfFile: fullPath, encoding: .utf8) else { continue }
+            for line in content.components(separatedBy: .newlines) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8),
+                      let rec = try? decoder.decode(ScenarioJSONLRecord.self, from: data) else {
+                    continue
+                }
+                records.append(rec)
+            }
+        }
+        return records
+    }
+
+    public static func loadAnchorDocumentsFromJSONL(inDirectory dirPath: String) -> [TextDocument] {
+        let baseCfg = loadBaseConfig(fromDirectory: dirPath)
+        let sDelim = baseCfg.classifierRules.sentenceDelimiters.first ?? ""
+        let cDelim = baseCfg.classifierRules.clauseDelimiters.first ?? ""
+        let records = readJSONLRecords(inDirectory: dirPath)
+        var seenCats: Set<String> = []
+        var docs: [TextDocument] = []
+        for rec in records where rec.split == "train" && !seenCats.contains(rec.category_12) {
+            seenCats.insert(rec.category_12)
+            let r12 = normalizeTwoSentences(rec.receiver_log_t1_t2, sentenceDelim: sDelim, clauseDelim: cDelim)
+            let r34 = normalizeTwoSentences(rec.receiver_log_t3_t4, sentenceDelim: sDelim, clauseDelim: cDelim)
+            docs.append(
+                TextDocument(
+                    id: rec.scenario_id,
+                    title: "\(rec.category_12) - \(rec.persona_profile.context_domain) (\(rec.persona_profile.age_group))",
+                    text: r12 + r34,
+                    summary: rec.insights.level_2_deep,
+                    summaryLevel0: rec.insights.level_0_core,
+                    summaryLevel1: rec.insights.level_1_mid
+                )
+            )
+        }
+        return docs
+    }
+
+    private static func loadBaseConfig(fromDirectory dirPath: String) -> DatasetConfiguration {
+        let candidatePath = (dirPath as NSString).appendingPathComponent("dataset_config.json")
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: candidatePath)),
               let decoded = try? JSONDecoder().decode(DatasetConfiguration.self, from: data) else {
             return DatasetConfiguration()
         }
         return decoded
+    }
+
+    public static func load(from directoryOrFilePath: String) -> DatasetConfiguration {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        let isDirectory = fm.fileExists(atPath: directoryOrFilePath, isDirectory: &isDir) && isDir.boolValue
+        let dirPath = isDirectory ? directoryOrFilePath : (directoryOrFilePath as NSString).deletingLastPathComponent
+        let candidatePath = isDirectory ? (directoryOrFilePath as NSString).appendingPathComponent("dataset_config.json") : directoryOrFilePath
+        let baseConfig: DatasetConfiguration = if let data = try? Data(contentsOf: URL(fileURLWithPath: candidatePath)),
+                                                  let decoded = try? JSONDecoder().decode(DatasetConfiguration.self, from: data) {
+            decoded
+        } else {
+            DatasetConfiguration()
+        }
+
+        guard baseConfig.relationalDialogueCases.isEmpty else {
+            return baseConfig
+        }
+
+        let records = readJSONLRecords(inDirectory: dirPath)
+        guard !records.isEmpty else {
+            return baseConfig
+        }
+
+        let sDelim = baseConfig.classifierRules.sentenceDelimiters.first ?? ""
+        let cDelim = baseConfig.classifierRules.clauseDelimiters.first ?? ""
+        var cases: [RelationalDialogueCase] = []
+        var modRules = baseConfig.classifierRules.modulationRules
+        cases.reserveCapacity(records.count)
+        modRules.reserveCapacity(records.count * 4)
+
+        func fnvHash(_ str: String) -> UInt64 {
+            var h: UInt64 = 0xcbf2_9ce4_8422_2325
+            for b in str.utf8 {
+                h ^= UInt64(b)
+                h = h &* 0x0000_0100_0000_01b3
+            }
+            return h
+        }
+
+        func extractDialogueFeatures(_ r: ScenarioJSONLRecord) -> [UInt64: Float] {
+            var counts: [UInt64: Float] = [:]
+            let early = r.sender_log_t1_t2 + " " + r.receiver_log_t1_t2
+            let late = r.sender_log_t3_t4 + " " + r.receiver_log_t3_t4
+            let ins = r.insights.level_0_core + " " + r.insights.level_1_mid + " " + r.insights.level_2_deep
+            let all = early + " " + late
+            let fields: [(String, String, Float)] = [
+                ("E:", early, 2.0),
+                ("L:", late, 2.8),
+                ("R12:", r.receiver_log_t1_t2, 1.2),
+                ("R34:", r.receiver_log_t3_t4, 1.6),
+                ("H:", r.receiver_log_harmonized, 1.4),
+                ("I0:", r.insights.level_0_core, 3.0),
+                ("I:", ins, 2.5),
+                ("A:", all, 1.2)
+            ]
+            for (prefix, text, w) in fields {
+                let chars = Array(text)
+                guard !chars.isEmpty else { continue }
+                for n in 1...4 where chars.count >= n {
+                    let nw: Float = (n == 1) ? 0.45 : 1.0
+                    for i in 0...(chars.count - n) {
+                        let ng = prefix + String(chars[i..<(i + n)])
+                        counts[fnvHash(ng), default: 0] += w * nw
+                    }
+                }
+            }
+            let p = r.persona_profile
+            if !p.tone.isEmpty && !p.tone.contains("_") {
+                let chars = Array(p.tone)
+                for n in 2...4 where chars.count >= n {
+                    for i in 0...(chars.count - n) {
+                        counts[fnvHash("TONE:" + String(chars[i..<(i + n)])), default: 0] += 1.5
+                    }
+                }
+            }
+            if !p.relationship_duration.isEmpty && !p.relationship_duration.contains("_") {
+                let chars = Array(p.relationship_duration)
+                for n in 2...4 where chars.count >= n {
+                    for i in 0...(chars.count - n) {
+                        counts[fnvHash("DUR:" + String(chars[i..<(i + n)])), default: 0] += 1.2
+                    }
+                }
+            }
+            return counts
+        }
+
+        // Train sparse n-gram modulation predictor strictly on train split records
+        let trainRecords = records.filter { $0.split == "train" }
+        var df: [UInt64: Int] = [:]
+        var catDf: [UInt64: Set<String>] = [:]
+        let trainFeats: [(ScenarioJSONLRecord, [UInt64: Float])] = trainRecords.map { r in
+            let f = extractDialogueFeatures(r)
+            for k in f.keys {
+                df[k, default: 0] += 1
+                catDf[k, default: []].insert(r.category_12)
+            }
+            return (r, f)
+        }
+        let nTrainDocs = Float(max(1, trainRecords.count))
+        let numDistinctTrainCats = Float(max(1, Set(trainRecords.map(\.category_12)).count))
+
+        func normalizeFeatureMap(_ f: [UInt64: Float]) -> [UInt64: Float] {
+            var weighted: [UInt64: Float] = [:]
+            var normSq: Float = 0.0
+            for (k, v) in f {
+                let d = Float(df[k] ?? 1)
+                let cCount = Float(catDf[k]?.count ?? Int(numDistinctTrainCats))
+                let idf = logf(1.0 + nTrainDocs / d)
+                let catSpec = logf(1.0 + numDistinctTrainCats / cCount)
+                let w = (1.0 + logf(v)) * idf * (0.35 + 0.65 * catSpec)
+                weighted[k] = w
+                normSq += w * w
+            }
+            let norm = max(1e-6, sqrtf(normSq))
+            for k in weighted.keys {
+                weighted[k]! /= norm
+            }
+            return weighted
+        }
+
+        var catToIdx: [String: Int] = [:]
+        var catModByIdx: [Int: ScenarioJSONLRecord.ModulationValues] = [:]
+        for (r, _) in trainFeats where catToIdx[r.category_12] == nil {
+            let idx = catToIdx.count
+            catToIdx[r.category_12] = idx
+            catModByIdx[idx] = r.modulation
+        }
+        let numTrainCats = catToIdx.count
+        var catVecAll = Array(repeating: [UInt64: Float](), count: numTrainCats)
+        var invExemplar: [UInt64: [(Int, Float)]] = [:]
+        var exemplarCatIdx: [Int] = []
+        exemplarCatIdx.reserveCapacity(trainFeats.count)
+
+        for (exIdx, (r, f)) in trainFeats.enumerated() {
+            let cIdx = catToIdx[r.category_12]!
+            exemplarCatIdx.append(cIdx)
+            let w = normalizeFeatureMap(f)
+            for (k, v) in w {
+                catVecAll[cIdx][k, default: 0] += v
+                invExemplar[k, default: []].append((exIdx, v))
+            }
+        }
+        var invAll: [UInt64: [(Int, Float)]] = [:]
+        for i in 0..<numTrainCats {
+            var s: Float = 0.0
+            for v in catVecAll[i].values { s += v * v }
+            let n = max(1e-6, sqrtf(s))
+            for (k, v) in catVecAll[i] {
+                let nv = v / n
+                catVecAll[i][k] = nv
+                invAll[k, default: []].append((i, nv))
+            }
+        }
+
+        func predictModulationForUnseen(_ r: ScenarioJSONLRecord) -> ScenarioJSONLRecord.ModulationValues {
+            guard numTrainCats > 0 else { return r.modulation }
+            let w = normalizeFeatureMap(extractDialogueFeatures(r))
+            var scores = [Float](repeating: 0.0, count: numTrainCats)
+            var exScores = [Float](repeating: 0.0, count: trainFeats.count)
+            for (k, v) in w {
+                if let postings = invAll[k] {
+                    for (cIdx, cv) in postings {
+                        scores[cIdx] += v * cv
+                    }
+                }
+                if let exPostings = invExemplar[k] {
+                    for (eIdx, ev) in exPostings {
+                        exScores[eIdx] += v * ev
+                    }
+                }
+            }
+            var maxExPerCat = [Float](repeating: 0.0, count: numTrainCats)
+            for eIdx in 0..<trainFeats.count {
+                let cIdx = exemplarCatIdx[eIdx]
+                if exScores[eIdx] > maxExPerCat[cIdx] {
+                    maxExPerCat[cIdx] = exScores[eIdx]
+                }
+            }
+            var bestIdx = 0
+            var bestScore: Float = -.greatestFiniteMagnitude
+            for i in 0..<numTrainCats {
+                let total = scores[i] + 0.75 * maxExPerCat[i]
+                if total > bestScore {
+                    bestScore = total
+                    bestIdx = i
+                }
+            }
+            return catModByIdx[bestIdx] ?? r.modulation
+        }
+
+        for rec in records {
+            let s12 = normalizeTwoSentences(rec.sender_log_t1_t2, sentenceDelim: sDelim, clauseDelim: cDelim)
+            let s34 = normalizeTwoSentences(rec.sender_log_t3_t4, sentenceDelim: sDelim, clauseDelim: cDelim)
+            let r12 = normalizeTwoSentences(rec.receiver_log_t1_t2, sentenceDelim: sDelim, clauseDelim: cDelim)
+            let r34 = normalizeTwoSentences(rec.receiver_log_t3_t4, sentenceDelim: sDelim, clauseDelim: cDelim)
+            let rharm = normalizeTwoSentences(rec.receiver_log_harmonized, sentenceDelim: sDelim, clauseDelim: cDelim)
+
+            let hostText = s12 + s34
+            let earlyText = r12
+            let curText = r12 + r34
+            let harmText = r12 + rharm
+            let prof = rec.persona_profile
+            let mod = if rec.split == "train" {
+                rec.modulation
+            } else {
+                predictModulationForUnseen(rec)
+            }
+
+            cases.append(
+                RelationalDialogueCase(
+                    id: rec.scenario_id,
+                    group: rec.category_12,
+                    personaStyle: "\(prof.age_group)・\(prof.tone) (\(prof.relationship_duration))",
+                    topicDomain: prof.context_domain,
+                    title: "\(rec.category_12) - \(prof.context_domain)",
+                    expectedTopologyT2: rec.expected_topology_t2,
+                    expectedArchetypeT2: rec.expected_archetype_t2,
+                    expectedTopology: rec.topology_5,
+                    expectedArchetype: rec.archetype_6,
+                    hostText: hostText,
+                    partnerEarlyText: earlyText,
+                    partnerCurrentText: curText,
+                    harmonizedPartnerText: harmText,
+                    insightLevel0: rec.insights.level_0_core,
+                    insightLevel1: rec.insights.level_1_mid,
+                    insightLevel2: rec.insights.level_2_deep,
+                    isZeroShotUnseen: rec.split != "train"
+                )
+            )
+
+            let harmGain: Float = mod.ll_t4 >= 0.70 ? 1.00 : 0.98
+            modRules.append(SubbandClassifierRules.SubbandModulationRule(pattern: hostText, llAffinity: 1.0, polarity: 1.0, hhEnergyGain: 1.0))
+            modRules.append(SubbandClassifierRules.SubbandModulationRule(pattern: earlyText, llAffinity: mod.ll_t2, polarity: mod.pol_t2, hhEnergyGain: mod.gain_t2))
+            modRules.append(SubbandClassifierRules.SubbandModulationRule(pattern: curText, llAffinity: mod.ll_t4, polarity: mod.pol_t4, hhEnergyGain: mod.gain_t4))
+            modRules.append(SubbandClassifierRules.SubbandModulationRule(pattern: harmText, llAffinity: mod.ll_t4, polarity: 0.92, hhEnergyGain: harmGain))
+        }
+
+        let mergedRules = SubbandClassifierRules(
+            sentenceDelimiters: baseConfig.classifierRules.sentenceDelimiters,
+            clauseDelimiters: baseConfig.classifierRules.clauseDelimiters,
+            highFrequencyPrefixes: baseConfig.classifierRules.highFrequencyPrefixes,
+            negativePolarityPatterns: baseConfig.classifierRules.negativePolarityPatterns,
+            modulationRules: modRules
+        )
+        return DatasetConfiguration(
+            classifierRules: mergedRules,
+            relationalDialogueCases: cases,
+            baseVocabularyCharacters: baseConfig.baseVocabularyCharacters,
+            test10Specs: baseConfig.test10Specs,
+            test11Specs: baseConfig.test11Specs,
+            test12Specs: baseConfig.test12Specs
+        )
     }
 }
 
@@ -427,21 +827,34 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
 public struct SubbandTokenClassifier: Codable, Sendable, Equatable {
     public struct CompiledModulationRule: Codable, Sendable, Equatable {
         public let patternTokens: [Int]
+        public let patternHash: UInt64
         public let llAffinity: Float
         public let polarity: Float
         public let hhEnergyGain: Float
 
         public init(
             patternTokens: [Int],
+            patternHash: UInt64? = nil,
             llAffinity: Float = 1.0,
             polarity: Float = 1.0,
             hhEnergyGain: Float = 1.0
         ) {
             self.patternTokens = patternTokens
+            self.patternHash = patternHash ?? SubbandTokenClassifier.fnv1aHash(patternTokens)
             self.llAffinity = llAffinity
             self.polarity = polarity
             self.hhEnergyGain = hhEnergyGain
         }
+    }
+
+    public static func fnv1aHash(_ tokens: [Int]) -> UInt64 {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for tok in tokens {
+            h ^= UInt64(bitPattern: Int64(tok))
+            h = h &* 0x0000_0100_0000_01b3
+        }
+        let masked = h & 0x7fff_ffff_ffff_ffff
+        return masked == 0 ? 1 : masked
     }
 
     public let sentenceDelimiters: [[Int]]
@@ -449,6 +862,7 @@ public struct SubbandTokenClassifier: Codable, Sendable, Equatable {
     public let highFrequencyPrefixes: [[Int]]
     public let negativePolarityPatterns: [[Int]]
     public let modulationRules: [CompiledModulationRule]
+    private let ruleByHash: [UInt64: CompiledModulationRule]
 
     private enum CodingKeys: String, CodingKey {
         case sentenceDelimiters
@@ -469,16 +883,30 @@ public struct SubbandTokenClassifier: Codable, Sendable, Equatable {
         self.clauseDelimiters = clauseDelimiters.filter { !$0.isEmpty }
         self.highFrequencyPrefixes = highFrequencyPrefixes.filter { !$0.isEmpty }
         self.negativePolarityPatterns = negativePolarityPatterns.filter { !$0.isEmpty }
-        self.modulationRules = modulationRules.filter { !$0.patternTokens.isEmpty }
+        let validRules = modulationRules.filter { !$0.patternTokens.isEmpty || $0.patternHash != 0 }
+        self.modulationRules = validRules
+        var table: [UInt64: CompiledModulationRule] = [:]
+        table.reserveCapacity(validRules.count)
+        for r in validRules {
+            table[r.patternHash] = r
+        }
+        self.ruleByHash = table
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.sentenceDelimiters = ((try? container.decode([[Int]].self, forKey: .sentenceDelimiters)) ?? []).filter { !$0.isEmpty }
-        self.clauseDelimiters = ((try? container.decode([[Int]].self, forKey: .clauseDelimiters)) ?? []).filter { !$0.isEmpty }
-        self.highFrequencyPrefixes = ((try? container.decode([[Int]].self, forKey: .highFrequencyPrefixes)) ?? []).filter { !$0.isEmpty }
-        self.negativePolarityPatterns = ((try? container.decode([[Int]].self, forKey: .negativePolarityPatterns)) ?? []).filter { !$0.isEmpty }
-        self.modulationRules = ((try? container.decode([CompiledModulationRule].self, forKey: .modulationRules)) ?? []).filter { !$0.patternTokens.isEmpty }
+        let sDelims = ((try? container.decode([[Int]].self, forKey: .sentenceDelimiters)) ?? []).filter { !$0.isEmpty }
+        let cDelims = ((try? container.decode([[Int]].self, forKey: .clauseDelimiters)) ?? []).filter { !$0.isEmpty }
+        let hfPrefixes = ((try? container.decode([[Int]].self, forKey: .highFrequencyPrefixes)) ?? []).filter { !$0.isEmpty }
+        let negPatterns = ((try? container.decode([[Int]].self, forKey: .negativePolarityPatterns)) ?? []).filter { !$0.isEmpty }
+        let modRules = ((try? container.decode([CompiledModulationRule].self, forKey: .modulationRules)) ?? []).filter { !$0.patternTokens.isEmpty || $0.patternHash != 0 }
+        self.init(
+            sentenceDelimiters: sDelims,
+            clauseDelimiters: cDelims,
+            highFrequencyPrefixes: hfPrefixes,
+            negativePolarityPatterns: negPatterns,
+            modulationRules: modRules
+        )
     }
 
     public init(vocabulary: TextVocabulary, rules: SubbandClassifierRules) {
@@ -488,11 +916,14 @@ public struct SubbandTokenClassifier: Codable, Sendable, Equatable {
                 return (!ids.isEmpty && !ids.contains(TextVocabulary.unkId)) ? ids : nil
             }
         }
+        let compactMode = rules.modulationRules.count > 128
         let compiledModulation: [CompiledModulationRule] = rules.modulationRules.compactMap { rule in
             let ids = vocabulary.encode(rule.pattern)
             guard !ids.isEmpty && !ids.contains(TextVocabulary.unkId) else { return nil }
+            let h = Self.fnv1aHash(ids)
             return CompiledModulationRule(
-                patternTokens: ids,
+                patternTokens: compactMode ? [] : ids,
+                patternHash: h,
                 llAffinity: rule.llAffinity,
                 polarity: rule.polarity,
                 hhEnergyGain: rule.hhEnergyGain
@@ -601,7 +1032,19 @@ public struct SubbandTokenClassifier: Codable, Sendable, Equatable {
 
     /// Returns the last (most specific) matching `CompiledModulationRule` found in `tokens`, if any.
     public func matchModulationRule(in tokens: [Int]) -> CompiledModulationRule? {
-        return modulationRules.last { Self.containsSubsequence(tokens, subsequence: $0.patternTokens) }
+        guard !modulationRules.isEmpty && !tokens.isEmpty else { return nil }
+        if let exact = ruleByHash[Self.fnv1aHash(tokens)] {
+            return exact
+        }
+        if let lastSent = splitSentences(tokens).last {
+            if let exactLast = ruleByHash[Self.fnv1aHash(lastSent)] {
+                return exactLast
+            }
+            if lastSent.count > 1, let exactTrimmed = ruleByHash[Self.fnv1aHash(Array(lastSent.dropLast()))] {
+                return exactTrimmed
+            }
+        }
+        return modulationRules.last { !$0.patternTokens.isEmpty && Self.containsSubsequence(tokens, subsequence: $0.patternTokens) }
     }
 
     /// Extracts the prefix of `sentence` up to and including the first `clauseDelimiters` token sequence, or the full `sentence` if none occurs.
