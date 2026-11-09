@@ -225,6 +225,42 @@ public struct TextVocabulary: Sendable, Equatable {
         }
         return s
     }
+
+    /// Computes a corpus-statistics disentanglement gate `alphaRel ∈ [0, 1]^size` separating domain-general
+    /// relational/grammatical characters (`1.0`) from domain-specific topic-noun characters (`0.02`) using only
+    /// raw training text document frequencies and Unicode script ranges (no labels or category metadata).
+    public func computeRelationalTokenGate(trainTexts: [String]) -> [Float] {
+        var docFreq = [Int](repeating: 0, count: size)
+        for text in trainTexts {
+            var seen: Set<Int> = []
+            for ch in text {
+                if let id = charToIdTable[ch], id >= Self.specialCount {
+                    seen.insert(id)
+                }
+            }
+            for id in seen {
+                docFreq[id] += 1
+            }
+        }
+        let totalDocs = Float(max(1, trainTexts.count))
+        var gate = [Float](repeating: 0.0, count: size)
+        for idx in Self.specialCount..<size {
+            let ch = tokenList[idx]
+            let scalar = ch.unicodeScalars.first?.value ?? 0
+            let isHiragana = (scalar >= 0x3040 && scalar <= 0x309F)
+            let isPunctOrSym = (scalar >= 0x3000 && scalar <= 0x303F) || (scalar >= 0xFF01 && scalar <= 0xFF60) || (scalar >= 0x2000 && scalar <= 0x206F) || (scalar == 0x30FC)
+            let isKatakana = (scalar >= 0x30A1 && scalar <= 0x30FA)
+            if isHiragana || isPunctOrSym {
+                gate[idx] = 1.0
+            } else if isKatakana {
+                gate[idx] = 0.04
+            } else {
+                let dfRatio = Float(docFreq[idx]) / totalDocs
+                gate[idx] = (dfRatio >= 0.012) ? 0.80 : 0.04
+            }
+        }
+        return gate
+    }
 }
 
 /// String-level subband classification rules loaded from dataset configuration when building model weights.
@@ -592,169 +628,7 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
         let sDelim = baseConfig.classifierRules.sentenceDelimiters.first ?? ""
         let cDelim = baseConfig.classifierRules.clauseDelimiters.first ?? ""
         var cases: [RelationalDialogueCase] = []
-        var modRules = baseConfig.classifierRules.modulationRules
         cases.reserveCapacity(records.count)
-        modRules.reserveCapacity(records.count * 4)
-
-        func fnvHash(_ str: String) -> UInt64 {
-            var h: UInt64 = 0xcbf2_9ce4_8422_2325
-            for b in str.utf8 {
-                h ^= UInt64(b)
-                h = h &* 0x0000_0100_0000_01b3
-            }
-            return h
-        }
-
-        func extractDialogueFeatures(_ r: ScenarioJSONLRecord) -> [UInt64: Float] {
-            var counts: [UInt64: Float] = [:]
-            let early = r.sender_log_t1_t2 + " " + r.receiver_log_t1_t2
-            let late = r.sender_log_t3_t4 + " " + r.receiver_log_t3_t4
-            let ins = r.insights.level_0_core + " " + r.insights.level_1_mid + " " + r.insights.level_2_deep
-            let all = early + " " + late
-            let fields: [(String, String, Float)] = [
-                ("E:", early, 2.0),
-                ("L:", late, 2.8),
-                ("R12:", r.receiver_log_t1_t2, 1.2),
-                ("R34:", r.receiver_log_t3_t4, 1.6),
-                ("H:", r.receiver_log_harmonized, 1.4),
-                ("I0:", r.insights.level_0_core, 3.0),
-                ("I:", ins, 2.5),
-                ("A:", all, 1.2)
-            ]
-            for (prefix, text, w) in fields {
-                let chars = Array(text)
-                guard !chars.isEmpty else { continue }
-                for n in 1...4 where chars.count >= n {
-                    let nw: Float = (n == 1) ? 0.45 : 1.0
-                    for i in 0...(chars.count - n) {
-                        let ng = prefix + String(chars[i..<(i + n)])
-                        counts[fnvHash(ng), default: 0] += w * nw
-                    }
-                }
-            }
-            let p = r.persona_profile
-            if !p.tone.isEmpty && !p.tone.contains("_") {
-                let chars = Array(p.tone)
-                for n in 2...4 where chars.count >= n {
-                    for i in 0...(chars.count - n) {
-                        counts[fnvHash("TONE:" + String(chars[i..<(i + n)])), default: 0] += 1.5
-                    }
-                }
-            }
-            if !p.relationship_duration.isEmpty && !p.relationship_duration.contains("_") {
-                let chars = Array(p.relationship_duration)
-                for n in 2...4 where chars.count >= n {
-                    for i in 0...(chars.count - n) {
-                        counts[fnvHash("DUR:" + String(chars[i..<(i + n)])), default: 0] += 1.2
-                    }
-                }
-            }
-            return counts
-        }
-
-        // Train sparse n-gram modulation predictor strictly on train split records
-        let trainRecords = records.filter { $0.split == "train" }
-        var df: [UInt64: Int] = [:]
-        var catDf: [UInt64: Set<String>] = [:]
-        let trainFeats: [(ScenarioJSONLRecord, [UInt64: Float])] = trainRecords.map { r in
-            let f = extractDialogueFeatures(r)
-            for k in f.keys {
-                df[k, default: 0] += 1
-                catDf[k, default: []].insert(r.category_12)
-            }
-            return (r, f)
-        }
-        let nTrainDocs = Float(max(1, trainRecords.count))
-        let numDistinctTrainCats = Float(max(1, Set(trainRecords.map(\.category_12)).count))
-
-        func normalizeFeatureMap(_ f: [UInt64: Float]) -> [UInt64: Float] {
-            var weighted: [UInt64: Float] = [:]
-            var normSq: Float = 0.0
-            for (k, v) in f {
-                let d = Float(df[k] ?? 1)
-                let cCount = Float(catDf[k]?.count ?? Int(numDistinctTrainCats))
-                let idf = logf(1.0 + nTrainDocs / d)
-                let catSpec = logf(1.0 + numDistinctTrainCats / cCount)
-                let w = (1.0 + logf(v)) * idf * (0.35 + 0.65 * catSpec)
-                weighted[k] = w
-                normSq += w * w
-            }
-            let norm = max(1e-6, sqrtf(normSq))
-            for k in weighted.keys {
-                weighted[k]! /= norm
-            }
-            return weighted
-        }
-
-        var catToIdx: [String: Int] = [:]
-        var catModByIdx: [Int: ScenarioJSONLRecord.ModulationValues] = [:]
-        for (r, _) in trainFeats where catToIdx[r.category_12] == nil {
-            let idx = catToIdx.count
-            catToIdx[r.category_12] = idx
-            catModByIdx[idx] = r.modulation
-        }
-        let numTrainCats = catToIdx.count
-        var catVecAll = Array(repeating: [UInt64: Float](), count: numTrainCats)
-        var invExemplar: [UInt64: [(Int, Float)]] = [:]
-        var exemplarCatIdx: [Int] = []
-        exemplarCatIdx.reserveCapacity(trainFeats.count)
-
-        for (exIdx, (r, f)) in trainFeats.enumerated() {
-            let cIdx = catToIdx[r.category_12]!
-            exemplarCatIdx.append(cIdx)
-            let w = normalizeFeatureMap(f)
-            for (k, v) in w {
-                catVecAll[cIdx][k, default: 0] += v
-                invExemplar[k, default: []].append((exIdx, v))
-            }
-        }
-        var invAll: [UInt64: [(Int, Float)]] = [:]
-        for i in 0..<numTrainCats {
-            var s: Float = 0.0
-            for v in catVecAll[i].values { s += v * v }
-            let n = max(1e-6, sqrtf(s))
-            for (k, v) in catVecAll[i] {
-                let nv = v / n
-                catVecAll[i][k] = nv
-                invAll[k, default: []].append((i, nv))
-            }
-        }
-
-        func predictModulationForUnseen(_ r: ScenarioJSONLRecord) -> ScenarioJSONLRecord.ModulationValues {
-            guard numTrainCats > 0 else { return r.modulation }
-            let w = normalizeFeatureMap(extractDialogueFeatures(r))
-            var scores = [Float](repeating: 0.0, count: numTrainCats)
-            var exScores = [Float](repeating: 0.0, count: trainFeats.count)
-            for (k, v) in w {
-                if let postings = invAll[k] {
-                    for (cIdx, cv) in postings {
-                        scores[cIdx] += v * cv
-                    }
-                }
-                if let exPostings = invExemplar[k] {
-                    for (eIdx, ev) in exPostings {
-                        exScores[eIdx] += v * ev
-                    }
-                }
-            }
-            var maxExPerCat = [Float](repeating: 0.0, count: numTrainCats)
-            for eIdx in 0..<trainFeats.count {
-                let cIdx = exemplarCatIdx[eIdx]
-                if exScores[eIdx] > maxExPerCat[cIdx] {
-                    maxExPerCat[cIdx] = exScores[eIdx]
-                }
-            }
-            var bestIdx = 0
-            var bestScore: Float = -.greatestFiniteMagnitude
-            for i in 0..<numTrainCats {
-                let total = scores[i] + 0.75 * maxExPerCat[i]
-                if total > bestScore {
-                    bestScore = total
-                    bestIdx = i
-                }
-            }
-            return catModByIdx[bestIdx] ?? r.modulation
-        }
 
         for rec in records {
             let s12 = normalizeTwoSentences(rec.sender_log_t1_t2, sentenceDelim: sDelim, clauseDelim: cDelim)
@@ -768,11 +642,6 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
             let curText = r12 + r34
             let harmText = r12 + rharm
             let prof = rec.persona_profile
-            let mod = if rec.split == "train" {
-                rec.modulation
-            } else {
-                predictModulationForUnseen(rec)
-            }
 
             cases.append(
                 RelationalDialogueCase(
@@ -795,23 +664,10 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
                     isZeroShotUnseen: rec.split != "train"
                 )
             )
-
-            let harmGain: Float = mod.ll_t4 >= 0.70 ? 1.00 : 0.98
-            modRules.append(SubbandClassifierRules.SubbandModulationRule(pattern: hostText, llAffinity: 1.0, polarity: 1.0, hhEnergyGain: 1.0))
-            modRules.append(SubbandClassifierRules.SubbandModulationRule(pattern: earlyText, llAffinity: mod.ll_t2, polarity: mod.pol_t2, hhEnergyGain: mod.gain_t2))
-            modRules.append(SubbandClassifierRules.SubbandModulationRule(pattern: curText, llAffinity: mod.ll_t4, polarity: mod.pol_t4, hhEnergyGain: mod.gain_t4))
-            modRules.append(SubbandClassifierRules.SubbandModulationRule(pattern: harmText, llAffinity: mod.ll_t4, polarity: 0.92, hhEnergyGain: harmGain))
         }
 
-        let mergedRules = SubbandClassifierRules(
-            sentenceDelimiters: baseConfig.classifierRules.sentenceDelimiters,
-            clauseDelimiters: baseConfig.classifierRules.clauseDelimiters,
-            highFrequencyPrefixes: baseConfig.classifierRules.highFrequencyPrefixes,
-            negativePolarityPatterns: baseConfig.classifierRules.negativePolarityPatterns,
-            modulationRules: modRules
-        )
         return DatasetConfiguration(
-            classifierRules: mergedRules,
+            classifierRules: baseConfig.classifierRules,
             relationalDialogueCases: cases,
             baseVocabularyCharacters: baseConfig.baseVocabularyCharacters,
             test10Specs: baseConfig.test10Specs,

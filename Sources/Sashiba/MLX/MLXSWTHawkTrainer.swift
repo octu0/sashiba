@@ -286,7 +286,7 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
         batch: Int,
         time: Int
     ) -> (tokenAccuracy: Float, exactMatchRate: Float, reconstructed: [[Int]]) {
-        let cpuModel = SWTHawkAutoencoder(weights: weights)
+        let cpuModel = model.makeAcceleratedCPUModel()
         let z = cpuModel.encode(tokens: tokens, batch: batch, time: time)
         let decoded = cpuModel.reconstructGreedy(z: z, batch: batch, length: time)
 
@@ -336,10 +336,10 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
         prototypeCount: Int? = nil,
         seqLen: Int
     ) -> (alignLoss: Float, cfmLoss: Float, polarityLoss: Float, registeredPairs: Int) {
-        let currentWeights = weights
-        let cpuModel = SWTHawkAutoencoder(weights: currentWeights)
-        let lDim = currentWeights.latentDim
-        let d = currentWeights.dim
+
+        let cpuModel = model.makeAcceleratedCPUModel()
+        let lDim = cpuModel.weights.latentDim
+        let d = cpuModel.weights.dim
 
         let zFullAll = cpuModel.encode(tokens: fullTokens, batch: numDocs, time: seqLen)
         let zSumAll = cpuModel.encode(tokens: summaryTokens, batch: numDocs, time: seqLen)
@@ -388,58 +388,72 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
         let fm = model.flowMatchingWeights
         var polarityLossSum: Float = 0.0
         var polarityCount = 0
-        for rc in relationalCases {
-            guard rc.hostTokens.count == seqLen && rc.partnerCurrentTokens.count == seqLen && rc.harmonizedTokens.count == seqLen else {
-                continue
-            }
-            let zH = cpuModel.encode(tokens: rc.hostTokens, batch: 1, time: seqLen)
-            let zP = cpuModel.encode(tokens: rc.partnerCurrentTokens, batch: 1, time: seqLen)
-            let zHarmTarget = cpuModel.encode(tokens: rc.harmonizedTokens, batch: 1, time: seqLen)
+        let validRelCases = relationalCases.filter {
+            $0.hostTokens.count == seqLen && $0.partnerCurrentTokens.count == seqLen && $0.harmonizedTokens.count == seqLen
+        }
+        let nRel = validRelCases.count
+        if nRel > 0 {
+            let zHAll = cpuModel.encode(tokens: validRelCases.flatMap(\.hostTokens), batch: nRel, time: seqLen)
+            let zPAll = cpuModel.encode(tokens: validRelCases.flatMap(\.partnerCurrentTokens), batch: nRel, time: seqLen)
+            let zHarmAll = cpuModel.encode(tokens: validRelCases.flatMap(\.harmonizedTokens), batch: nRel, time: seqLen)
+            let hasL2 = validRelCases.allSatisfy { $0.insightL2Tokens.count == seqLen }
+            let hasL1 = validRelCases.allSatisfy { $0.insightL1Tokens.count == seqLen }
+            let hasL0 = validRelCases.allSatisfy { $0.insightL0Tokens.count == seqLen }
+            let zL2All = hasL2 ? cpuModel.encode(tokens: validRelCases.flatMap(\.insightL2Tokens), batch: nRel, time: seqLen) : []
+            let zL1All = hasL1 ? cpuModel.encode(tokens: validRelCases.flatMap(\.insightL1Tokens), batch: nRel, time: seqLen) : []
+            let zL0All = hasL0 ? cpuModel.encode(tokens: validRelCases.flatMap(\.insightL0Tokens), batch: nRel, time: seqLen) : []
             let half = lDim / 2
-            let lPol = SubbandClauseSplitter.computePolarityContrastiveLoss(
-                zHHProhibit: Array(zH[half..<lDim]),
-                zHHViolate: Array(zP[half..<lDim]),
-                margin: 0.20
-            )
-            if lPol.cosine < -0.20 {
-                polarityLossSum += lPol.loss
-                polarityCount += 1
-            }
 
-            if rc.insightL2Tokens.count == seqLen {
-                let cL2 = ConditionalFlowMatcher.computeRelationalInsightCondition(
-                    zHost: zH, zPartnerCurrent: zP, gamma: 1.0, weights: fm
+            for (idx, rc) in validRelCases.enumerated() {
+                let off = idx * lDim
+                let zH = Array(zHAll[off..<(off + lDim)])
+                let zP = Array(zPAll[off..<(off + lDim)])
+                let zHarmTarget = Array(zHarmAll[off..<(off + lDim)])
+                let lPol = SubbandClauseSplitter.computePolarityContrastiveLoss(
+                    zHHProhibit: Array(zH[half..<lDim]),
+                    zHHViolate: Array(zP[half..<lDim]),
+                    margin: 0.20
                 )
-                let zL2 = cpuModel.encode(tokens: rc.insightL2Tokens, batch: 1, time: seqLen)
-                condBank.append(contentsOf: cL2)
-                summaryBank.append(contentsOf: zL2)
-                totalPairs += 1
-            }
-            if rc.insightL1Tokens.count == seqLen {
-                let cL1 = ConditionalFlowMatcher.computeRelationalInsightCondition(
-                    zHost: zH, zPartnerCurrent: zP, gamma: 0.5, weights: fm
-                )
-                let zL1 = cpuModel.encode(tokens: rc.insightL1Tokens, batch: 1, time: seqLen)
-                condBank.append(contentsOf: cL1)
-                summaryBank.append(contentsOf: zL1)
-                totalPairs += 1
-            }
-            if rc.insightL0Tokens.count == seqLen {
-                let cL0 = ConditionalFlowMatcher.computeRelationalInsightCondition(
-                    zHost: zH, zPartnerCurrent: zP, gamma: 0.0, weights: fm
-                )
-                let zL0 = cpuModel.encode(tokens: rc.insightL0Tokens, batch: 1, time: seqLen)
-                condBank.append(contentsOf: cL0)
-                summaryBank.append(contentsOf: zL0)
-                totalPairs += 1
-            }
+                if lPol.cosine < -0.20 {
+                    polarityLossSum += lPol.loss
+                    polarityCount += 1
+                }
 
-            let cHarm = ConditionalFlowMatcher.computeRelationalHarmonizationCondition(
-                zHost: zH, zPartnerCurrent: zP, weights: fm
-            )
-            condBank.append(contentsOf: cHarm)
-            summaryBank.append(contentsOf: zHarmTarget)
-            totalPairs += 1
+                if rc.insightL2Tokens.count == seqLen {
+                    let cL2 = ConditionalFlowMatcher.computeRelationalInsightCondition(
+                        zHost: zH, zPartnerCurrent: zP, gamma: 1.0, weights: fm
+                    )
+                    let zL2 = hasL2 ? Array(zL2All[off..<(off + lDim)]) : cpuModel.encode(tokens: rc.insightL2Tokens, batch: 1, time: seqLen)
+                    condBank.append(contentsOf: cL2)
+                    summaryBank.append(contentsOf: zL2)
+                    totalPairs += 1
+                }
+                if rc.insightL1Tokens.count == seqLen {
+                    let cL1 = ConditionalFlowMatcher.computeRelationalInsightCondition(
+                        zHost: zH, zPartnerCurrent: zP, gamma: 0.5, weights: fm
+                    )
+                    let zL1 = hasL1 ? Array(zL1All[off..<(off + lDim)]) : cpuModel.encode(tokens: rc.insightL1Tokens, batch: 1, time: seqLen)
+                    condBank.append(contentsOf: cL1)
+                    summaryBank.append(contentsOf: zL1)
+                    totalPairs += 1
+                }
+                if rc.insightL0Tokens.count == seqLen {
+                    let cL0 = ConditionalFlowMatcher.computeRelationalInsightCondition(
+                        zHost: zH, zPartnerCurrent: zP, gamma: 0.0, weights: fm
+                    )
+                    let zL0 = hasL0 ? Array(zL0All[off..<(off + lDim)]) : cpuModel.encode(tokens: rc.insightL0Tokens, batch: 1, time: seqLen)
+                    condBank.append(contentsOf: cL0)
+                    summaryBank.append(contentsOf: zL0)
+                    totalPairs += 1
+                }
+
+                let cHarm = ConditionalFlowMatcher.computeRelationalHarmonizationCondition(
+                    zHost: zH, zPartnerCurrent: zP, weights: fm
+                )
+                condBank.append(contentsOf: cHarm)
+                summaryBank.append(contentsOf: zHarmTarget)
+                totalPairs += 1
+            }
         }
         let avgPolarityLoss = polarityCount > 0 ? (polarityLossSum / Float(polarityCount)) : 0.0
 

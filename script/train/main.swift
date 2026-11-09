@@ -18,6 +18,10 @@ struct TrainCLI {
     var exportWeightsPath: String = ".tmp/weights.safetensors"
     var importWeightsPath: String? = nil
     var earlyStopOnExactGreedy: Bool = true
+    var relEpochs: Int = 12
+    var relBatch: Int = 32
+    var relLR: Float = 1e-3
+    var aeWeightsPath: String = ".tmp/weights_ae.safetensors"
 
     static func parse(_ args: [String]) -> TrainCLI {
         var cli = TrainCLI()
@@ -72,6 +76,18 @@ struct TrainCLI {
                 if i < args.count { cli.importWeightsPath = args[i] }
             case "--no-early-stop":
                 cli.earlyStopOnExactGreedy = false
+            case "--rel-epochs":
+                i += 1
+                if i < args.count, let v = Int(args[i]) { cli.relEpochs = max(0, v) }
+            case "--rel-batch":
+                i += 1
+                if i < args.count, let v = Int(args[i]) { cli.relBatch = max(2, v) }
+            case "--rel-lr":
+                i += 1
+                if i < args.count, let v = Float(args[i]) { cli.relLR = v }
+            case "--ae-weights":
+                i += 1
+                if i < args.count { cli.aeWeightsPath = args[i] }
             default:
                 break
             }
@@ -322,7 +338,7 @@ if cli.epochs > 0 {
     }
 }
 
-if cli.epochs > 0 || cli.importWeightsPath != nil {
+if cli.epochs > 0 || weights.flowMatching.numPairs == 0 {
     // Stage 2, Stage 3 & Phase 5: Multi-Resolution Relational Insight CFM (γ ∈ {1.0, 0.5, 0.0}) & Latent Harmonization CFM
     let cfmStats = trainer.trainAndCalibrateFlowMatching(
         fullTokens: cfmFullTokens,
@@ -341,32 +357,72 @@ if cli.epochs > 0 || cli.importWeightsPath != nil {
         cfmStats.cfmLoss,
         cfmStats.polarityLoss
     ))
+} else {
+    print("[Phase 5 Relational CFM] Reusing \(weights.flowMatching.numPairs) registered pairs from imported weights")
 }
 
 let elapsed = Date().timeIntervalSince(startTime)
-let finalEval = trainer.evaluateGreedyReconstruction(
-    tokens: allTokens,
-    batch: numDocs,
-    time: seqLen
-)
-
-print("------------------------------------------------------------------")
-print(String(
-    format: "Training finished in %.2fs | Greedy Token Accuracy: %.2f%% | Exact Document Reconstruction: %d/%d (%.1f%%)",
-    elapsed,
-    finalEval.tokenAccuracy * 100.0,
-    Int((finalEval.exactMatchRate * Float(numDocs)).rounded()),
-    numDocs,
-    finalEval.exactMatchRate * 100.0
-))
+if cli.epochs > 0 {
+    let finalEval = trainer.evaluateGreedyReconstruction(
+        tokens: allTokens,
+        batch: numDocs,
+        time: seqLen
+    )
+    print("------------------------------------------------------------------")
+    print(String(
+        format: "Training finished in %.2fs | Greedy Token Accuracy: %.2f%% | Exact Document Reconstruction: %d/%d (%.1f%%)",
+        elapsed,
+        finalEval.tokenAccuracy * 100.0,
+        Int((finalEval.exactMatchRate * Float(numDocs)).rounded()),
+        numDocs,
+        finalEval.exactMatchRate * 100.0
+    ))
+}
 
 if (cli.epochs > 0 || cli.importWeightsPath != nil) && !cli.exportWeightsPath.isEmpty {
-    let exported = trainer.weights
     let exportURL = URL(fileURLWithPath: cli.exportWeightsPath)
     try FileManager.default.createDirectory(
         at: exportURL.deletingLastPathComponent(),
         withIntermediateDirectories: true
     )
+    // Autoencoder-stage snapshot (before relational E2E): starting point for per-fold retraining in `relational_head`.
+    if !cli.aeWeightsPath.isEmpty {
+        try trainer.weights.save(to: URL(fileURLWithPath: cli.aeWeightsPath))
+        print("Saved autoencoder-stage weights to \(cli.aeWeightsPath)")
+    }
+
+    // Phase 5.1: End-to-End Dual-Stream relational training on the train split only (split == "train").
+    if cli.relEpochs > 0 {
+        let relTrainCases = datasetConfig.relationalDialogueCases.filter { !$0.isZeroShotUnseen }
+        var relLen = 4
+        for rc in relTrainCases {
+            for text in [rc.hostText, rc.partnerEarlyText, rc.partnerCurrentText, rc.harmonizedPartnerText] {
+                relLen = max(relLen, vocab.encode(text, maxLength: cli.maxSeqLen, addEOS: false, padToLength: nil).count)
+            }
+        }
+        print("------------------------------------------------------------------")
+        print("[Phase 5.1] Relational E2E stage: \(relTrainCases.count) train scenarios | T = \(relLen) | epochs = \(cli.relEpochs)")
+        let relStart = Date()
+        let telemetry = RelationalPipeline.trainRelationalStage(
+            model: model,
+            trainCases: relTrainCases,
+            vocab: vocab,
+            time: relLen,
+            epochs: cli.relEpochs,
+            batchSize: cli.relBatch,
+            learningRate: cli.relLR,
+            seed: cli.seed &+ 7
+        )
+        print(String(format: "[Phase 5.1] Relational stage finished in %.1fs", Date().timeIntervalSince(relStart)))
+        for m in telemetry.modules {
+            print(String(
+                format: "  %-36@ params %8d | ||W_final - W_0||_F %.6f | mean ||grad||_2 %.6f",
+                m.moduleName as NSString, m.parameterCount, m.weightDeltaFrobeniusNorm, m.meanGradientNorm
+            ))
+        }
+    }
+
+    let exported = trainer.weights
     try exported.save(to: exportURL)
     print("Saved trained weights to \(cli.exportWeightsPath)")
 }

@@ -65,6 +65,7 @@ public struct SWTHawkWeights: Sendable, Equatable {
     public let pooling: AttentionPoolingWeights
     public let decoder: HawkDecoderWeights
     public let flowMatching: FlowMatchingWeights
+    public var relational: DualStreamRelationalWeights
 
     public init(
         vocabSize: Int,
@@ -79,7 +80,8 @@ public struct SWTHawkWeights: Sendable, Equatable {
         fusion: GatedFusionWeights,
         pooling: AttentionPoolingWeights,
         decoder: HawkDecoderWeights,
-        flowMatching: FlowMatchingWeights? = nil
+        flowMatching: FlowMatchingWeights? = nil,
+        relational: DualStreamRelationalWeights? = nil
     ) {
         self.vocabSize = vocabSize
         self.dim = dim
@@ -99,10 +101,18 @@ public struct SWTHawkWeights: Sendable, Equatable {
             var fmRng = SplitMix64(seed: 999)
             self.flowMatching = FlowMatchingWeights.makeRandom(latentDim: latentDim, rng: &fmRng)
         }
+        if let rel = relational {
+            self.relational = rel
+        } else {
+            var relRng = SplitMix64(seed: 1777)
+            self.relational = DualStreamRelationalWeights.makeRandom(
+                vocabSize: vocabSize, dim: dim, latentDim: latentDim, rng: &relRng
+            )
+        }
     }
 
     public var parameterCount: Int {
-        return tokenEmbedding.count + swtBranch.parameterCount + fusion.parameterCount + pooling.parameterCount + decoder.parameterCount + flowMatching.parameterCount + hawkBranch.reduce(0) { $0 + $1.parameterCount }
+        return tokenEmbedding.count + swtBranch.parameterCount + fusion.parameterCount + pooling.parameterCount + decoder.parameterCount + flowMatching.parameterCount + relational.parameterCount + hawkBranch.reduce(0) { $0 + $1.parameterCount }
     }
 
     public static func makeRandom(
@@ -145,6 +155,7 @@ public struct SWTHawkWeights: Sendable, Equatable {
             numLayers: decoderLayers, mlpDim: m, rng: &rng
         )
         let fm = FlowMatchingWeights.makeRandom(latentDim: latentDim, rng: &rng)
+        let rel = DualStreamRelationalWeights.makeRandom(vocabSize: vocabSize, dim: dim, latentDim: latentDim, rng: &rng)
 
         return SWTHawkWeights(
             vocabSize: vocabSize,
@@ -159,7 +170,8 @@ public struct SWTHawkWeights: Sendable, Equatable {
             fusion: fus,
             pooling: pool,
             decoder: dec,
-            flowMatching: fm
+            flowMatching: fm,
+            relational: rel
         )
     }
 
@@ -302,6 +314,48 @@ public struct SWTHawkWeights: Sendable, Equatable {
             ]
         }
 
+        let half = latentDim / 2
+        let cohDim = DualStreamRelationalWeights.coherenceDim
+        tensors += [
+            ("rel.alphaRel", T(shape: [vocabSize], values: relational.alphaRel)),
+            ("rel.eEcho", T(shape: [dim], values: relational.eEcho)),
+            ("rel.eTopic", T(shape: [dim], values: relational.eTopic)),
+            ("rel.wQLL", T(shape: [dim, dim], values: relational.wQLL)),
+            ("rel.bQLL", T(shape: [dim], values: relational.bQLL)),
+            ("rel.wKLL", T(shape: [dim, dim], values: relational.wKLL)),
+            ("rel.bKLL", T(shape: [dim], values: relational.bKLL)),
+            ("rel.wVLL", T(shape: [dim, dim], values: relational.wVLL)),
+            ("rel.bVLL", T(shape: [dim], values: relational.bVLL)),
+            ("rel.wCohLL", T(shape: [cohDim, dim], values: relational.wCohLL)),
+            ("rel.bCohLL", T(shape: [dim], values: relational.bCohLL)),
+            ("rel.wQHH", T(shape: [dim, dim], values: relational.wQHH)),
+            ("rel.bQHH", T(shape: [dim], values: relational.bQHH)),
+            ("rel.wKHH", T(shape: [dim, dim], values: relational.wKHH)),
+            ("rel.bKHH", T(shape: [dim], values: relational.bKHH)),
+            ("rel.wVHH", T(shape: [dim, dim], values: relational.wVHH)),
+            ("rel.bVHH", T(shape: [dim], values: relational.bVHH)),
+            ("rel.wCohHH", T(shape: [cohDim, dim], values: relational.wCohHH)),
+            ("rel.bCohHH", T(shape: [dim], values: relational.bCohHH)),
+            ("rel.wProjLL", T(shape: [5 * dim, half], values: relational.wProjLL)),
+            ("rel.bProjLL", T(shape: [half], values: relational.bProjLL)),
+            ("rel.normLLGamma", T(shape: [half], values: relational.normLLGamma)),
+            ("rel.normLLBeta", T(shape: [half], values: relational.normLLBeta)),
+            ("rel.wProjHH", T(shape: [5 * dim, half], values: relational.wProjHH)),
+            ("rel.bProjHH", T(shape: [half], values: relational.bProjHH)),
+            ("rel.normHHGamma", T(shape: [half], values: relational.normHHGamma)),
+            ("rel.normHHBeta", T(shape: [half], values: relational.normHHBeta)),
+            ("rel.wContent", T(shape: [2 * dim, half], values: relational.wContent)),
+            ("rel.bContent", T(shape: [half], values: relational.bContent)),
+            ("rel.wArchT4", T(shape: [latentDim, 6], values: relational.wArchT4)),
+            ("rel.bArchT4", T(shape: [6], values: relational.bArchT4)),
+            ("rel.wTopoT4", T(shape: [latentDim, 5], values: relational.wTopoT4)),
+            ("rel.bTopoT4", T(shape: [5], values: relational.bTopoT4)),
+            ("rel.wArchT2", T(shape: [latentDim, 6], values: relational.wArchT2)),
+            ("rel.bArchT2", T(shape: [6], values: relational.bArchT2)),
+            ("rel.wTopoT2", T(shape: [latentDim, 5], values: relational.wTopoT2)),
+            ("rel.bTopoT2", T(shape: [5], values: relational.bTopoT2))
+        ]
+
         let metadata: [String: String] = [
             "vocabSize": "\(vocabSize)",
             "dim": "\(dim)",
@@ -315,7 +369,9 @@ public struct SWTHawkWeights: Sendable, Equatable {
             "cfmHiddenDim": "\(fmH)",
             "cfmNumPairs": "\(flowMatching.numPairs)",
             "vocabulary": serializedVocabulary,
-            "subbandClassifier": subbandClassifier.serialize()
+            "subbandClassifier": subbandClassifier.serialize(),
+            "calibratedHeads": relational.calibratedHeads.serialize(),
+            "auditTelemetry": relational.auditTelemetry.serialize()
         ]
         try SafeTensors.write(tensors, metadata: metadata, to: url)
     }
@@ -518,6 +574,56 @@ public struct SWTHawkWeights: Sendable, Equatable {
             )
         }
 
+        var relWeights: DualStreamRelationalWeights? = nil
+        if tensors["rel.wQLL"] != nil {
+            let calHeads = RelationalCalibratedHeads.deserialize(metadata["calibratedHeads"] ?? "")
+            let telemetry = RelationalAuditTelemetry.deserialize(metadata["auditTelemetry"] ?? "")
+            relWeights = DualStreamRelationalWeights(
+                vocabSize: vocabSize,
+                dim: dim,
+                latentDim: latentDim,
+                alphaRel: try vals("rel.alphaRel"),
+                eEcho: try vals("rel.eEcho"),
+                eTopic: try vals("rel.eTopic"),
+                wQLL: try vals("rel.wQLL"),
+                bQLL: try vals("rel.bQLL"),
+                wKLL: try vals("rel.wKLL"),
+                bKLL: try vals("rel.bKLL"),
+                wVLL: try vals("rel.wVLL"),
+                bVLL: try vals("rel.bVLL"),
+                wCohLL: try vals("rel.wCohLL"),
+                bCohLL: try vals("rel.bCohLL"),
+                wQHH: try vals("rel.wQHH"),
+                bQHH: try vals("rel.bQHH"),
+                wKHH: try vals("rel.wKHH"),
+                bKHH: try vals("rel.bKHH"),
+                wVHH: try vals("rel.wVHH"),
+                bVHH: try vals("rel.bVHH"),
+                wCohHH: try vals("rel.wCohHH"),
+                bCohHH: try vals("rel.bCohHH"),
+                wProjLL: try vals("rel.wProjLL"),
+                bProjLL: try vals("rel.bProjLL"),
+                normLLGamma: try vals("rel.normLLGamma"),
+                normLLBeta: try vals("rel.normLLBeta"),
+                wProjHH: try vals("rel.wProjHH"),
+                bProjHH: try vals("rel.bProjHH"),
+                normHHGamma: try vals("rel.normHHGamma"),
+                normHHBeta: try vals("rel.normHHBeta"),
+                wContent: try vals("rel.wContent"),
+                bContent: try vals("rel.bContent"),
+                wArchT4: try vals("rel.wArchT4"),
+                bArchT4: try vals("rel.bArchT4"),
+                wTopoT4: try vals("rel.wTopoT4"),
+                bTopoT4: try vals("rel.bTopoT4"),
+                wArchT2: try vals("rel.wArchT2"),
+                bArchT2: try vals("rel.bArchT2"),
+                wTopoT2: try vals("rel.wTopoT2"),
+                bTopoT2: try vals("rel.bTopoT2"),
+                calibratedHeads: calHeads,
+                auditTelemetry: telemetry
+            )
+        }
+
         return SWTHawkWeights(
             vocabSize: vocabSize,
             dim: dim,
@@ -531,7 +637,8 @@ public struct SWTHawkWeights: Sendable, Equatable {
             fusion: fus,
             pooling: pool,
             decoder: dec,
-            flowMatching: fmWeights
+            flowMatching: fmWeights,
+            relational: relWeights
         )
     }
 }
@@ -539,6 +646,12 @@ public struct SWTHawkWeights: Sendable, Equatable {
 /// CPU inference engine for the SWT-Griffin Text Autoencoder & Conditional Flow Matcher (`Section 2 & 3`).
 public final class SWTHawkAutoencoder: @unchecked Sendable {
     public let weights: SWTHawkWeights
+
+    /// Optional accelerated (MLX GPU) backend for `encode(tokens:batch:time:)`; when set, replaces the CPU encoder.
+    public var latentEncoderBackend: (([Int], Int, Int) -> [Float])? = nil
+
+    /// Optional accelerated (MLX GPU) backend for the Dual-Stream relational encoder returning `(zRel, zContent)`.
+    public var relationalEncoderBackend: (([Int], [Int], Int, Int) -> (zRel: [Float], zContent: [Float]))? = nil
 
     public init(weights: SWTHawkWeights) {
         self.weights = weights
@@ -603,6 +716,14 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
 
     /// Encodes a batch of token ID sequences `[B, T]` into subband-split principal component vectors `z = [z_LL(512); z_HH(512)] ∈ R^(B × 1024)`.
     public func encode(tokens: [Int], batch: Int, time: Int) -> [Float] {
+        if let backend = latentEncoderBackend {
+            return backend(tokens, batch, time)
+        }
+        return encodeCPU(tokens: tokens, batch: batch, time: time)
+    }
+
+    /// CPU reference implementation of `encode(tokens:batch:time:)`.
+    public func encodeCPU(tokens: [Int], batch: Int, time: Int) -> [Float] {
         let latentDim = weights.latentDim
         let half = latentDim / 2
         if weights.subbandClassifier.isConfigured && latentDim >= 256 && !weights.subbandClassifier.modulationRules.isEmpty {
@@ -878,12 +999,74 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         return (zFull, zSummary, decoded, trajNorms)
     }
 
-    /// Phase 5: Relational Dynamics Engine:
-    /// Encodes `(X^S, X^C(T_2), X^C(T_4))` into subband-split principal component vectors, evaluates the 5-axis
-    /// Relational Pentagon (`Score_ctx, Score_emp, Score_sync, Score_stab, Score_dev`), 5-tier `RelationalTopology`,
-    /// and 6-class `RelationalArchetype` at both `T_2` (`earlyMetrics`) and `T_4` (`metrics`), integrates the
-    /// 50-Step Midpoint ODE for Multi-Resolution Insight Generation (`γ ∈ {0.0, 0.5, 1.0}`), and performs
-    /// subband-orthogonal Latent Harmonization `z_harmonized = z^C + Δz`.
+    // MARK: - Phase 5.1: Pure-Neural Dual-Stream Relational Engine (Zero-Metadata Signature)
+
+    /// Encodes `(senderTokenIDs: [Int], receiverTokenIDs: [Int])` into the pure-neural relational vector
+    /// `z_rel = [z_LL^rel(512) ; z_HH^rel(512)] ∈ R^1024` (`Phase 5.1 Audit 1`).
+    public func encodeRelational(
+        senderTokenIDs: [Int],
+        receiverTokenIDs: [Int]
+    ) -> [Float] {
+        let time = max(DualStreamRelationalWeights.canonicalSeqLen, max(senderTokenIDs.count, receiverTokenIDs.count))
+        return encodeRelationalBatch(
+            senderTokens: DualStreamRelationalEngine.padOrTruncate(senderTokenIDs, to: time),
+            receiverTokens: DualStreamRelationalEngine.padOrTruncate(receiverTokenIDs, to: time),
+            batch: 1,
+            time: time
+        )
+    }
+
+    /// Batched pure-neural Dual-Stream Relational Encoder returning `z_rel ∈ R^(B × 1024)`.
+    public func encodeRelationalBatch(
+        senderTokens: [Int],
+        receiverTokens: [Int],
+        batch: Int,
+        time: Int
+    ) -> [Float] {
+        return encodeRelationalBatchWithContent(senderTokens: senderTokens, receiverTokens: receiverTokens, batch: batch, time: time).zRel
+    }
+
+    /// Batched Dual-Stream encoder returning `(zRel: [B × 1024], zContent: [B × 512])` (GPU backend when available).
+    public func encodeRelationalBatchWithContent(
+        senderTokens: [Int],
+        receiverTokens: [Int],
+        batch: Int,
+        time: Int
+    ) -> (zRel: [Float], zContent: [Float]) {
+        if let backend = relationalEncoderBackend {
+            return backend(senderTokens, receiverTokens, batch, time)
+        }
+        let res = DualStreamRelationalEngine.forwardBatchCPU(
+            senderTokens: senderTokens,
+            receiverTokens: receiverTokens,
+            batch: batch,
+            time: time,
+            weights: weights
+        )
+        return (res.zRel, res.zContent)
+    }
+
+    /// Runs pure-neural Dual-Stream Relational Inference taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])` (`Phase 5.1 Audit 1`).
+    public func inferRelational(
+        senderTokenIDs: [Int],
+        receiverTokenIDs: [Int]
+    ) -> RelationalInferenceOutput {
+        let time = max(DualStreamRelationalWeights.canonicalSeqLen, max(senderTokenIDs.count, receiverTokenIDs.count))
+        let res = encodeRelationalBatchWithContent(
+            senderTokens: DualStreamRelationalEngine.padOrTruncate(senderTokenIDs, to: time),
+            receiverTokens: DualStreamRelationalEngine.padOrTruncate(receiverTokenIDs, to: time),
+            batch: 1,
+            time: time
+        )
+        return DualStreamRelationalEngine.makeInferenceOutput(zRel: res.zRel, zContent: res.zContent, weights: weights.relational)
+    }
+
+    /// Phase 5 & 5.1: Relational Dynamics Engine:
+    /// Encodes `(X^S, X^C(T_2), X^C(T_4))` via the Dual-Stream Subband Bidirectional Cross-Attention Encoder into
+    /// `z_rel(T_2), z_rel(T_4) ∈ R^1024`, evaluates the 5-axis Relational Pentagon (`Score_ctx, Score_emp, Score_sync, Score_stab, Score_dev`),
+    /// 5-tier `RelationalTopology`, and 6-class `RelationalArchetype` from the identical `z_rel` tensor (`Audit 5`),
+    /// integrates the 50-Step Midpoint ODE for Multi-Resolution Insight Generation (`γ ∈ {0.0, 0.5, 1.0}`),
+    /// and performs subband-orthogonal Latent Harmonization.
     public func analyzeRelationalDynamicsWithFlowMatching(
         hostTokens: [Int],
         partnerEarlyTokens: [Int],
@@ -923,24 +1106,115 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
             guidanceScale: guidanceScale
         )
 
-        let earlyMetrics = ConditionalFlowMatcher.computeRelationalDynamics(
-            zHost: zHost,
-            zPartnerEarly: zPartnerEarly,
-            zPartnerCurrent: zPartnerEarly,
-            zHarmonizedTarget: nil
-        )
-        let metrics = ConditionalFlowMatcher.computeRelationalDynamics(
+        let legacyMetrics = ConditionalFlowMatcher.computeRelationalDynamics(
             zHost: zHost,
             zPartnerEarly: zPartnerEarly,
             zPartnerCurrent: zPartnerCurrent,
             zHarmonizedTarget: zHarmTarget
         )
-        let postHarmonizationMetrics = ConditionalFlowMatcher.computeRelationalDynamics(
-            zHost: zHost,
-            zPartnerEarly: zPartnerEarly,
-            zPartnerCurrent: metrics.zHarmonized,
-            zHarmonizedTarget: zHarmTarget
-        )
+
+        let earlyMetrics: RelationalDynamicsMetrics
+        let metrics: RelationalDynamicsMetrics
+        let postHarmonizationMetrics: RelationalDynamicsMetrics
+
+        if weights.relational.calibratedHeads.archetypeT4 != nil || weights.subbandClassifier.modulationRules.isEmpty {
+            let zRelT2 = encodeRelationalBatch(
+                senderTokens: hostTokens, receiverTokens: partnerEarlyTokens, batch: 1, time: time
+            )
+            let zRelT4 = encodeRelationalBatch(
+                senderTokens: hostTokens, receiverTokens: partnerCurrentTokens, batch: 1, time: time
+            )
+            let p2 = DualStreamRelationalEngine.computePentagonFromZRel(zRel: zRelT2, zRelEarly: nil)
+            let c2 = DualStreamRelationalEngine.classifyFromZRel(
+                zRel: zRelT2, isEarlyT2: true, weights: weights.relational
+            )
+            let p4 = DualStreamRelationalEngine.computePentagonFromZRel(zRel: zRelT4, zRelEarly: zRelT2)
+            let c4 = DualStreamRelationalEngine.classifyFromZRel(
+                zRel: zRelT4, isEarlyT2: false, weights: weights.relational
+            )
+
+            // Subband-orthogonal Latent Harmonization in z_rel: preserve z_LL^rel [0..<512] exactly, harmonize z_HH^rel [512..<1024]
+            let half = weights.latentDim / 2
+            let zHarmProto = DualStreamRelationalEngine.targetPrototype(
+                archetype: .trueSupporter, topology: .deepAffection, latentDim: weights.latentDim
+            )
+            var zRelHarmonized = zRelT4
+            var deltaZRel = [Float](repeating: 0.0, count: weights.latentDim)
+            for i in half..<weights.latentDim {
+                let d = zHarmProto[i] - zRelT4[i]
+                deltaZRel[i] = d
+                zRelHarmonized[i] = zRelT4[i] + d
+            }
+            var llErrSq: Float = 0.0
+            for i in 0..<half {
+                let e = zRelHarmonized[i] - zRelT4[i]
+                llErrSq += e * e
+            }
+            let llPreservationError = sqrtf(llErrSq)
+
+            let pHarm = DualStreamRelationalEngine.computePentagonFromZRel(
+                zRel: zRelHarmonized, zRelEarly: zRelT2
+            )
+            let cHarm = DualStreamRelationalEngine.classifyFromZRel(
+                zRel: zRelHarmonized, isEarlyT2: false, weights: weights.relational
+            )
+            earlyMetrics = RelationalDynamicsMetrics(
+                dLL: p2.dLL,
+                dHH: p2.dHH,
+                rHH: p2.rHH,
+                sHH: p2.sHH,
+                sLL: p2.sLL,
+                temporalConsistencyLL: p2.temporalConsistencyLL,
+                pentagon: p2.pentagon,
+                topology: c2.topology,
+                archetype: c2.archetype,
+                deltaZHarmonize: [Float](repeating: 0.0, count: weights.latentDim),
+                zHarmonized: zPartnerEarly,
+                llPreservationError: 0.0
+            )
+            metrics = RelationalDynamicsMetrics(
+                dLL: p4.dLL,
+                dHH: p4.dHH,
+                rHH: p4.rHH,
+                sHH: p4.sHH,
+                sLL: p4.sLL,
+                temporalConsistencyLL: p4.temporalConsistencyLL,
+                pentagon: p4.pentagon,
+                topology: c4.topology,
+                archetype: c4.archetype,
+                deltaZHarmonize: legacyMetrics.deltaZHarmonize,
+                zHarmonized: legacyMetrics.zHarmonized,
+                llPreservationError: max(llPreservationError, legacyMetrics.llPreservationError)
+            )
+            postHarmonizationMetrics = RelationalDynamicsMetrics(
+                dLL: pHarm.dLL,
+                dHH: pHarm.dHH,
+                rHH: pHarm.rHH,
+                sHH: pHarm.sHH,
+                sLL: pHarm.sLL,
+                temporalConsistencyLL: pHarm.temporalConsistencyLL,
+                pentagon: pHarm.pentagon,
+                topology: cHarm.topology,
+                archetype: cHarm.archetype,
+                deltaZHarmonize: deltaZRel,
+                zHarmonized: legacyMetrics.zHarmonized,
+                llPreservationError: llPreservationError
+            )
+        } else {
+            earlyMetrics = ConditionalFlowMatcher.computeRelationalDynamics(
+                zHost: zHost,
+                zPartnerEarly: zPartnerEarly,
+                zPartnerCurrent: zPartnerEarly,
+                zHarmonizedTarget: nil
+            )
+            metrics = legacyMetrics
+            postHarmonizationMetrics = ConditionalFlowMatcher.computeRelationalDynamics(
+                zHost: zHost,
+                zPartnerEarly: zPartnerEarly,
+                zPartnerCurrent: legacyMetrics.zHarmonized,
+                zHarmonizedTarget: zHarmTarget
+            )
+        }
 
         let cInsight = ConditionalFlowMatcher.computeRelationalInsightCondition(
             zHost: zHost,

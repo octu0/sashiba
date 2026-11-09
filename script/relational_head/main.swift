@@ -5,10 +5,16 @@ import Sashiba
 struct RelationalHeadCLI {
     var dataPath: String = ".tmp"
     var weightsPath: String = ".tmp/weights.safetensors"
+    var aeWeightsPath: String = ".tmp/weights_ae.safetensors"
     var reportPath: String = ".tmp/relational_head_report.md"
     var headsPath: String = ".tmp/relational_heads.json"
+    var predictionsPath: String = ".tmp/relational_head_predictions_A.json"
     var steps: Int = 300
     var maxSeqLen: Int = 512
+    var foldEpochs: Int = 12
+    var relBatch: Int = 32
+    var relLR: Float = 1e-3
+    var skipFolds: Bool = false
 
     static func parse(_ args: [String]) -> RelationalHeadCLI {
         var cli = RelationalHeadCLI()
@@ -21,6 +27,9 @@ struct RelationalHeadCLI {
             case "-w", "--weights":
                 i += 1
                 if i < args.count { cli.weightsPath = args[i] }
+            case "--ae-weights":
+                i += 1
+                if i < args.count { cli.aeWeightsPath = args[i] }
             case "-o", "--report":
                 i += 1
                 if i < args.count { cli.reportPath = args[i] }
@@ -30,6 +39,17 @@ struct RelationalHeadCLI {
             case "--steps":
                 i += 1
                 if i < args.count, let v = Int(args[i]) { cli.steps = max(1, v) }
+            case "--fold-epochs":
+                i += 1
+                if i < args.count, let v = Int(args[i]) { cli.foldEpochs = max(1, v) }
+            case "--rel-batch":
+                i += 1
+                if i < args.count, let v = Int(args[i]) { cli.relBatch = max(2, v) }
+            case "--rel-lr":
+                i += 1
+                if i < args.count, let v = Float(args[i]) { cli.relLR = v }
+            case "--skip-folds":
+                cli.skipFolds = true
             default:
                 break
             }
@@ -39,7 +59,7 @@ struct RelationalHeadCLI {
     }
 }
 
-/// One prediction target: which text is used as input and which label is predicted.
+/// One prediction target: which receiver text is used as input and which label is predicted.
 struct HeadTask {
     let name: String
     let useEarlyText: Bool
@@ -49,76 +69,48 @@ struct HeadTask {
 
 let archetypeNames = RelationalArchetype.allCases.map(\.rawValue)
 let topologyNames = RelationalTopology.allCases.map(\.rawValue)
-func archetypeIndex(_ a: RelationalArchetype) -> Int {
-    return RelationalArchetype.allCases.firstIndex(of: a) ?? 0
-}
-func topologyIndex(_ t: RelationalTopology) -> Int {
-    return RelationalTopology.allCases.firstIndex(of: t) ?? 0
-}
 
 let tasks: [HeadTask] = [
-    HeadTask(name: "archetype_t4", useEarlyText: false, classNames: archetypeNames) { archetypeIndex($0.expectedArchetype) },
-    HeadTask(name: "topology_t4", useEarlyText: false, classNames: topologyNames) { topologyIndex($0.expectedTopology) },
-    HeadTask(name: "archetype_t2", useEarlyText: true, classNames: archetypeNames) { archetypeIndex($0.expectedArchetypeT2) },
-    HeadTask(name: "topology_t2", useEarlyText: true, classNames: topologyNames) { topologyIndex($0.expectedTopologyT2) }
+    HeadTask(name: "archetype_t4", useEarlyText: false, classNames: archetypeNames) { RelationalPipeline.archetypeIndex($0.expectedArchetype) },
+    HeadTask(name: "topology_t4", useEarlyText: false, classNames: topologyNames) { RelationalPipeline.topologyIndex($0.expectedTopology) },
+    HeadTask(name: "archetype_t2", useEarlyText: true, classNames: archetypeNames) { RelationalPipeline.archetypeIndex($0.expectedArchetypeT2) },
+    HeadTask(name: "topology_t2", useEarlyText: true, classNames: topologyNames) { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
 ]
 
 let cli = RelationalHeadCLI.parse(CommandLine.arguments)
 let config = DatasetConfiguration.load(from: cli.dataPath)
-let trainCases = config.relationalDialogueCases.filter { !$0.isZeroShotUnseen }
-let unseenCases = config.relationalDialogueCases.filter { $0.isZeroShotUnseen }
-guard !trainCases.isEmpty && !unseenCases.isEmpty else {
+let trainCasesAll = config.relationalDialogueCases.filter { !$0.isZeroShotUnseen }
+let unseenCasesAll = config.relationalDialogueCases.filter { $0.isZeroShotUnseen }
+guard !trainCasesAll.isEmpty && !unseenCasesAll.isEmpty else {
     print("No train / unseen relational cases found in \(cli.dataPath)")
     exit(1)
 }
 
 let weights = try SWTHawkWeights.load(from: URL(fileURLWithPath: cli.weightsPath))
 let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
-let mlxModel = MLXSWTHawkAutoencoder(weights: weights)
+let mainModel = MLXSWTHawkAutoencoder(weights: weights)
 
-let allCases = trainCases + unseenCases
+let allCases = trainCasesAll + unseenCasesAll
 let seqLen = allCases
     .flatMap { [$0.hostText, $0.partnerEarlyText, $0.partnerCurrentText] }
     .map { min(cli.maxSeqLen, vocab.encode($0).count) }
     .reduce(4, max)
 
 print("==================================================================")
-print("Learned Relational Classification Heads (train on train split only)")
+print("Phase 5.1 Relational Head Evaluation (pure-neural z_rel, unified heads)")
 print("==================================================================")
-print("Train cases: \(trainCases.count) | Unseen cases: \(unseenCases.count) | seqLen: \(seqLen)")
+print("Train cases: \(trainCasesAll.count) | Unseen cases: \(unseenCasesAll.count) | seqLen: \(seqLen)")
 
-/// Neural features for a list of texts via the trained encoder (no lattice, no rules).
-func neuralFeatures(_ texts: [String]) -> [[Float]] {
-    var flat: [Int] = []
-    flat.reserveCapacity(texts.count * seqLen)
-    for t in texts {
-        flat.append(contentsOf: vocab.encode(t, maxLength: seqLen, addEOS: false, padToLength: seqLen))
-    }
-    let z = mlxModel.encodeNeural(tokens: flat, batch: texts.count, time: seqLen)
-    let d = mlxModel.latentDim
-    return (0..<texts.count).map { Array(z[($0 * d)..<(($0 + 1) * d)]) }
-}
+let hostTok = allCases.map { RelationalPipeline.encodeTokens($0.hostText, vocab: vocab, time: seqLen) }
+let earlyTok = allCases.map { RelationalPipeline.encodeTokens($0.partnerEarlyText, vocab: vocab, time: seqLen) }
+let currentTok = allCases.map { RelationalPipeline.encodeTokens($0.partnerCurrentText, vocab: vocab, time: seqLen) }
 
 let ngram = CharNGramFeaturizer(dim: 2048)
-
-/// Per-case features for host / early partner / current partner texts, computed once per featurizer.
-struct CaseFeatures {
-    let host: [[Float]]
-    let early: [[Float]]
-    let current: [[Float]]
-
-    func input(_ i: Int, useEarlyText: Bool) -> [Float] {
-        return host[i] + (useEarlyText ? early[i] : current[i])
-    }
-}
-
-func computeFeatures(neural: Bool) -> CaseFeatures {
-    let f: ([String]) -> [[Float]] = if neural { neuralFeatures } else { { $0.map { ngram.features($0) } } }
-    return CaseFeatures(
-        host: f(allCases.map(\.hostText)),
-        early: f(allCases.map(\.partnerEarlyText)),
-        current: f(allCases.map(\.partnerCurrentText))
-    )
+let ngramHost = allCases.map { ngram.features($0.hostText) }
+let ngramEarly = allCases.map { ngram.features($0.partnerEarlyText) }
+let ngramCurrent = allCases.map { ngram.features($0.partnerCurrentText) }
+func ngramInput(_ i: Int, _ early: Bool) -> [Float] {
+    return ngramHost[i] + (early ? ngramEarly[i] : ngramCurrent[i])
 }
 
 struct EvalResult {
@@ -130,27 +122,6 @@ struct EvalResult {
     let correct: Int
     let total: Int
     let perClass: [(name: String, correct: Int, total: Int)]
-}
-
-/// Trains a head on `trainIdx` and evaluates on `testIdx` (indices into `allCases`).
-func trainAndEvaluate(
-    task: HeadTask,
-    features: CaseFeatures,
-    trainIdx: [Int],
-    testIdx: [Int],
-    steps: Int
-) -> (head: SoftmaxClassifierHead, trainCorrect: Int, testPred: [Int], majorityClass: Int) {
-    let trainX = trainIdx.map { features.input($0, useEarlyText: task.useEarlyText) }
-    let trainY = trainIdx.map { task.label(allCases[$0]) }
-    let head = SoftmaxClassifierHead.train(features: trainX, labels: trainY, classCount: task.classNames.count, steps: steps)
-    let trainCorrect = zip(trainX, trainY).filter { head.predict($0) == $1 }.count
-    let testPred = testIdx.map { head.predict(features.input($0, useEarlyText: task.useEarlyText)) }
-    var counts = [Int](repeating: 0, count: task.classNames.count)
-    for y in trainY {
-        counts[y] += 1
-    }
-    let majorityClass = counts.firstIndex(of: counts.max() ?? 0) ?? 0
-    return (head, trainCorrect, testPred, majorityClass)
 }
 
 func summarize(task: HeadTask, featurizer: String, testIdx: [Int], preds: [Int], majorityPreds: [Int], trainCorrect: Int, trainTotal: Int) -> EvalResult {
@@ -175,69 +146,196 @@ func summarize(task: HeadTask, featurizer: String, testIdx: [Int], preds: [Int],
     )
 }
 
+func majorityClass(_ labels: [Int], classCount: Int) -> Int {
+    var counts = [Int](repeating: 0, count: classCount)
+    for y in labels {
+        counts[y] += 1
+    }
+    return counts.firstIndex(of: counts.max() ?? 0) ?? 0
+}
+
+func head(_ heads: RelationalCalibratedHeads, _ task: HeadTask) -> SoftmaxClassifierHead? {
+    switch task.name {
+    case "archetype_t4": return heads.archetypeT4
+    case "topology_t4": return heads.topologyT4
+    case "archetype_t2": return heads.archetypeT2
+    default: return heads.topologyT2
+    }
+}
+
 let trainIndices = allCases.indices.filter { !allCases[$0].isZeroShotUnseen }
 let unseenIndices = allCases.indices.filter { allCases[$0].isZeroShotUnseen }
-
-// Category-holdout folds: every category is held out exactly once, with all of its scenarios (train + unseen).
-let foldCount = 6
-let categories = Array(Set(allCases.map(\.group))).sorted()
-let foldOfCategory = Dictionary(uniqueKeysWithValues: categories.enumerated().map { ($1, $0 % foldCount) })
-
-var splitResults: [EvalResult] = []
-var holdoutResults: [EvalResult] = []
-var holdoutMissingLabelCases: [String: Int] = [:]
-var savedHeads: [String: SoftmaxClassifierHead] = [:]
 let pct = { (v: Float) in String(format: "%6.2f%%", v * 100.0) }
 
-for featurizer in ["neural", "char_ngram"] {
-    let features = computeFeatures(neural: featurizer == "neural")
-    for task in tasks {
-        // (A) Scenario split: train split -> unseen_test split (same categories on both sides).
-        let a = trainAndEvaluate(task: task, features: features, trainIdx: trainIndices, testIdx: unseenIndices, steps: cli.steps)
-        savedHeads["\(featurizer).\(task.name)"] = a.head
-        let ra = summarize(
-            task: task,
-            featurizer: featurizer,
-            testIdx: unseenIndices,
-            preds: a.testPred,
-            majorityPreds: unseenIndices.map { _ in a.majorityClass },
-            trainCorrect: a.trainCorrect,
-            trainTotal: trainIndices.count
-        )
-        splitResults.append(ra)
-        print("[split   ][\(featurizer)] \(task.name): train \(pct(ra.trainAcc)) | unseen \(pct(ra.testAcc)) | majority \(pct(ra.majorityAcc))")
+// ------------------------------------------------------------------
+// (A) Scenario split: the SAME calibrated heads and the SAME z_rel tensor used by verify_latent_space (Audit 5).
+// ------------------------------------------------------------------
+let zT2All = RelationalPipeline.encodeZRel(model: mainModel, senders: hostTok, receivers: earlyTok, time: seqLen)
+let zT4All = RelationalPipeline.encodeZRel(model: mainModel, senders: hostTok, receivers: currentTok, time: seqLen)
 
-        // (B) Category holdout: train on train-split scenarios of other categories, test on all scenarios of held-out categories.
-        var allTestIdx: [Int] = []
-        var allPreds: [Int] = []
-        var allMajority: [Int] = []
-        var trainCorrectSum = 0
-        var trainTotalSum = 0
-        var missing = 0
-        for fold in 0..<foldCount {
-            let foldTrain = trainIndices.filter { foldOfCategory[allCases[$0].group] != fold }
-            let foldTest = allCases.indices.filter { foldOfCategory[allCases[$0].group] == fold }
-            let b = trainAndEvaluate(task: task, features: features, trainIdx: foldTrain, testIdx: foldTest, steps: cli.steps)
-            let trainLabels = Set(foldTrain.map { task.label(allCases[$0]) })
-            missing += foldTest.filter { !trainLabels.contains(task.label(allCases[$0])) }.count
-            allTestIdx += foldTest
-            allPreds += b.testPred
-            allMajority += foldTest.map { _ in b.majorityClass }
-            trainCorrectSum += b.trainCorrect
-            trainTotalSum += foldTrain.count
-        }
-        holdoutMissingLabelCases["\(featurizer).\(task.name)"] = missing
-        let rb = summarize(
-            task: task,
-            featurizer: featurizer,
-            testIdx: allTestIdx,
-            preds: allPreds,
-            majorityPreds: allMajority,
-            trainCorrect: trainCorrectSum,
-            trainTotal: trainTotalSum
+var splitResults: [EvalResult] = []
+var predictionsA: [String: [String: Int]] = [:]
+for task in tasks {
+    guard let h = head(weights.relational.calibratedHeads, task) else {
+        print("Calibrated head missing for \(task.name); run `make train` with --rel-epochs > 0")
+        exit(1)
+    }
+    let z = task.useEarlyText ? zT2All : zT4All
+    let trainCorrect = trainIndices.filter { h.predict(z[$0]) == task.label(allCases[$0]) }.count
+    let preds = unseenIndices.map { h.predict(z[$0]) }
+    var perCase: [String: Int] = [:]
+    for (k, i) in unseenIndices.enumerated() {
+        perCase[allCases[i].id] = preds[k]
+    }
+    predictionsA[task.name] = perCase
+    let maj = majorityClass(trainIndices.map { task.label(allCases[$0]) }, classCount: task.classNames.count)
+    let r = summarize(
+        task: task, featurizer: "neural", testIdx: unseenIndices, preds: preds,
+        majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
+    )
+    splitResults.append(r)
+    print("[split   ][neural] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+}
+for task in tasks {
+    let trainX = trainIndices.map { ngramInput($0, task.useEarlyText) }
+    let trainY = trainIndices.map { task.label(allCases[$0]) }
+    let h = SoftmaxClassifierHead.trainMLX(features: trainX, labels: trainY, classCount: task.classNames.count, steps: cli.steps)
+    let trainCorrect = zip(trainX, trainY).filter { h.predict($0) == $1 }.count
+    let preds = unseenIndices.map { h.predict(ngramInput($0, task.useEarlyText)) }
+    let maj = majorityClass(trainY, classCount: task.classNames.count)
+    let r = summarize(
+        task: task, featurizer: "char_ngram", testIdx: unseenIndices, preds: preds,
+        majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
+    )
+    splitResults.append(r)
+    print("[split   ][char_ngram] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+}
+let predData = try JSONEncoder().encode(predictionsA)
+try predData.write(to: URL(fileURLWithPath: cli.predictionsPath))
+
+// ------------------------------------------------------------------
+// (B) Stratified Group 6-Fold: categories grouped by (arch_T2, topo_T2, arch_T4, topo_T4) signature and assigned
+// round-robin, so every label of a held-out fold also appears on the training side. The encoder is RE-TRAINED
+// per fold from the autoencoder-stage weights on the fold's training categories only.
+// ------------------------------------------------------------------
+let foldCount = 6
+let categories = Array(Set(allCases.map(\.group))).sorted()
+var signatureOfCategory: [String: String] = [:]
+for c in categories {
+    if let rc = allCases.first(where: { $0.group == c }) {
+        signatureOfCategory[c] = "\(rc.expectedArchetypeT2.rawValue)|\(rc.expectedTopologyT2.rawValue)|\(rc.expectedArchetype.rawValue)|\(rc.expectedTopology.rawValue)"
+    }
+}
+let signatureGroups = Dictionary(grouping: categories) { signatureOfCategory[$0] ?? "" }
+var foldOfCategory: [String: Int] = [:]
+var rr = 0
+for sig in signatureGroups.keys.sorted() {
+    for c in (signatureGroups[sig] ?? []).sorted() {
+        foldOfCategory[c] = rr % foldCount
+        rr += 1
+    }
+}
+
+var missingByTask: [String: Int] = [:]
+for task in tasks {
+    var missing = 0
+    for fold in 0..<foldCount {
+        let foldTrain = trainIndices.filter { foldOfCategory[allCases[$0].group] != fold }
+        let foldTest = allCases.indices.filter { foldOfCategory[allCases[$0].group] == fold }
+        let labels = Set(foldTrain.map { task.label(allCases[$0]) })
+        missing += foldTest.filter { !labels.contains(task.label(allCases[$0])) }.count
+    }
+    missingByTask[task.name] = missing
+    print("[folds] \(task.name): label unseen in training = \(missing)")
+}
+
+var holdoutResults: [EvalResult] = []
+var foldLog: [String] = []
+if !cli.skipFolds {
+    let aeWeights = try SWTHawkWeights.load(from: URL(fileURLWithPath: cli.aeWeightsPath))
+    var neuralPreds: [String: [Int: Int]] = [:]
+    var neuralTrainCorrect: [String: Int] = [:]
+    var neuralTrainTotal: [String: Int] = [:]
+    var majorityPredsByTask: [String: [Int: Int]] = [:]
+    var ngramPreds: [String: [Int: Int]] = [:]
+    var ngramTrainCorrect: [String: Int] = [:]
+
+    for fold in 0..<foldCount {
+        let foldTrain = trainIndices.filter { foldOfCategory[allCases[$0].group] != fold }
+        let foldTest = allCases.indices.filter { foldOfCategory[allCases[$0].group] == fold }
+        let foldCats = categories.filter { foldOfCategory[$0] == fold }
+        print("------------------------------------------------------------------")
+        print("[fold \(fold)] held-out categories: \(foldCats.count) | train scenarios: \(foldTrain.count) | test scenarios: \(foldTest.count)")
+        let start = Date()
+
+        let model = MLXSWTHawkAutoencoder(weights: aeWeights)
+        RelationalPipeline.trainRelationalStage(
+            model: model,
+            trainCases: foldTrain.map { allCases[$0] },
+            vocab: vocab,
+            time: seqLen,
+            epochs: cli.foldEpochs,
+            batchSize: cli.relBatch,
+            learningRate: cli.relLR,
+            seed: UInt64(9000 + fold),
+            log: { print("  [fold \(fold)] " + $0) }
         )
-        holdoutResults.append(rb)
-        print("[holdout ][\(featurizer)] \(task.name): train \(pct(rb.trainAcc)) | held-out categories \(pct(rb.testAcc)) | majority \(pct(rb.majorityAcc)) | label unseen in training: \(missing)")
+        let fw = model.exportWeights()
+        let evalIdx = foldTrain + foldTest
+        let z2 = RelationalPipeline.encodeZRel(model: model, senders: evalIdx.map { hostTok[$0] }, receivers: evalIdx.map { earlyTok[$0] }, time: seqLen)
+        let z4 = RelationalPipeline.encodeZRel(model: model, senders: evalIdx.map { hostTok[$0] }, receivers: evalIdx.map { currentTok[$0] }, time: seqLen)
+        var row: [Int: Int] = [:]
+        for (k, i) in evalIdx.enumerated() {
+            row[i] = k
+        }
+
+        for task in tasks {
+            guard let h = head(fw.relational.calibratedHeads, task) else { continue }
+            let z = task.useEarlyText ? z2 : z4
+            let tc = foldTrain.filter { h.predict(z[row[$0]!]) == task.label(allCases[$0]) }.count
+            neuralTrainCorrect[task.name, default: 0] += tc
+            neuralTrainTotal[task.name, default: 0] += foldTrain.count
+            let maj = majorityClass(foldTrain.map { task.label(allCases[$0]) }, classCount: task.classNames.count)
+            for i in foldTest {
+                neuralPreds[task.name, default: [:]][i] = h.predict(z[row[i]!])
+                majorityPredsByTask[task.name, default: [:]][i] = maj
+            }
+
+            let trainX = foldTrain.map { ngramInput($0, task.useEarlyText) }
+            let trainY = foldTrain.map { task.label(allCases[$0]) }
+            let nh = SoftmaxClassifierHead.trainMLX(features: trainX, labels: trainY, classCount: task.classNames.count, steps: cli.steps)
+            ngramTrainCorrect[task.name, default: 0] += zip(trainX, trainY).filter { nh.predict($0) == $1 }.count
+            for i in foldTest {
+                ngramPreds[task.name, default: [:]][i] = nh.predict(ngramInput(i, task.useEarlyText))
+            }
+            let foldAcc = Float(foldTest.filter { neuralPreds[task.name]![$0] == task.label(allCases[$0]) }.count) / Float(max(1, foldTest.count))
+            print("  [fold \(fold)] \(task.name): neural held-out \(pct(foldAcc))")
+        }
+        let line = String(format: "fold %d: %d categories, train %d, test %d, %.1fs", fold, foldCats.count, foldTrain.count, foldTest.count, Date().timeIntervalSince(start))
+        foldLog.append(line)
+        print("[fold \(fold)] done (\(line))")
+    }
+
+    let allTest = allCases.indices.filter { foldOfCategory[allCases[$0].group] != nil }
+    for task in tasks {
+        let rn = summarize(
+            task: task, featurizer: "neural", testIdx: allTest,
+            preds: allTest.map { neuralPreds[task.name]?[$0] ?? 0 },
+            majorityPreds: allTest.map { majorityPredsByTask[task.name]?[$0] ?? 0 },
+            trainCorrect: neuralTrainCorrect[task.name] ?? 0, trainTotal: neuralTrainTotal[task.name] ?? 1
+        )
+        holdoutResults.append(rn)
+        print("[holdout ][neural] \(task.name): held-out categories \(pct(rn.testAcc)) | majority \(pct(rn.majorityAcc)) | label unseen in training: \(missingByTask[task.name] ?? -1)")
+    }
+    for task in tasks {
+        let rg = summarize(
+            task: task, featurizer: "char_ngram", testIdx: allTest,
+            preds: allTest.map { ngramPreds[task.name]?[$0] ?? 0 },
+            majorityPreds: allTest.map { majorityPredsByTask[task.name]?[$0] ?? 0 },
+            trainCorrect: ngramTrainCorrect[task.name] ?? 0, trainTotal: neuralTrainTotal[task.name] ?? 1
+        )
+        holdoutResults.append(rg)
+        print("[holdout ][char_ngram] \(task.name): held-out categories \(pct(rg.testAcc)) | majority \(pct(rg.majorityAcc))")
     }
 }
 
@@ -259,24 +357,32 @@ func perClassList(_ rs: [EvalResult]) -> String {
     return s
 }
 
-var report = "# 学習される分類ヘッドによる汎化評価\n\n"
-report += "- 入力特徴: `[送信側テキスト ; 受信側テキスト]` の連結（$T_4$ は全文、$T_2$ は前半のみ）\n"
-report += "- `neural`: 学習済みエンコーダのニューラル出力 `z` のみ（文字ID格納やルールを経由しない）\n"
-report += "- `char_ngram`: 文字 1-gram / 2-gram のハッシュ特徴（比較用ベースライン）\n\n"
-report += "## (A) シナリオ分割: 同じカテゴリ内で train → unseen_test\n\n"
-report += "学習 `\(trainIndices.count)` 件、評価 `\(unseenIndices.count)` 件。学習と評価に同じカテゴリが含まれるため、カテゴリ固有の語彙を覚えるだけでも高得点になり得る。\n\n"
+var report = "# 関係性分類の汎化評価（Phase 5.1: Dual-Stream 純ニューラル `z_rel`）\n\n"
+report += "- 入力: `(senderTokenIDs, receiverTokenIDs)` の2配列のみ（連結しない Dual-Stream。$T_4$ は受信側全文、$T_2$ は受信側前半）\n"
+report += "- `neural`: `z_rel = [z_LL^rel(512); z_HH^rel(512)]`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
+report += "- `char_ngram`: 文字 1-gram / 2-gram のハッシュ特徴（`[送信側 ; 受信側]` 連結、比較用ベースライン）\n\n"
+report += "## (A) シナリオ分割: train → unseen_test\n\n"
+report += "学習 `\(trainIndices.count)` 件、評価 `\(unseenIndices.count)` 件。`neural` は学習時に保存された校正ヘッドをそのまま適用（再学習なし）。\n\n"
 report += resultTable(splitResults, testLabel: "未学習精度")
 report += "\n### クラス別正解数\n\n"
 report += perClassList(splitResults)
-report += "\n## (B) カテゴリ単位の取り分け（\(foldCount)分割）\n\n"
-report += "全 `\(categories.count)` カテゴリを \(foldCount) グループに分け、各グループのカテゴリを丸ごと評価に回す（学習には他グループの train 分割のみを使用）。見たことのないカテゴリでも属性・距離感を推定できるかを測る。\n\n"
-report += resultTable(holdoutResults, testLabel: "未見カテゴリ精度")
-report += "\n- 学習側に同じラベルが1件も無かった評価ケース数（原理的に正解不能）: "
-report += holdoutMissingLabelCases.sorted { $0.key < $1.key }.map { "`\($0.key)` \($0.value)" }.joined(separator: ", ")
-report += "\n\n### クラス別正解数\n\n"
-report += perClassList(holdoutResults)
+report += "\n## (B) Stratified Group \(foldCount)-Fold（カテゴリ単位の取り分け・フォールドごとにエンコーダ再学習）\n\n"
+report += "全 `\(categories.count)` カテゴリをラベル署名 $(\\text{arch}_{T_2}, \\text{topo}_{T_2}, \\text{arch}_{T_4}, \\text{topo}_{T_4})$ で層化し、ラウンドロビンで \(foldCount) フォールドに割り当てた。"
+report += "各フォールドでは、オートエンコーダ段階の重み（ラベル不使用）から出発し、**他フォールドのカテゴリの train 分割のみ**で Dual-Stream エンコーダ・校正ヘッドを End-to-End 再学習し、取り分けたカテゴリの全シナリオ（train + unseen）で評価する。\n\n"
+report += "- 学習側に同じラベルが1件も無かった評価ケース数: "
+report += tasks.map { "`\($0.name)` \(missingByTask[$0.name] ?? -1)" }.joined(separator: ", ")
+report += "\n- 注記: オートエンコーダ段階（文章再構成、ラベル不使用）は全カテゴリの train 分割テキストで事前学習されている。\n\n"
+if holdoutResults.isEmpty {
+    report += "_(--skip-folds により未実行)_\n"
+} else {
+    report += resultTable(holdoutResults, testLabel: "未見カテゴリ精度")
+    report += "\n### フォールド実行ログ\n\n"
+    report += foldLog.map { "- \($0)" }.joined(separator: "\n")
+    report += "\n\n### クラス別正解数\n\n"
+    report += perClassList(holdoutResults)
+}
 
 try report.write(to: URL(fileURLWithPath: cli.reportPath), atomically: true, encoding: .utf8)
-let headsData = try JSONEncoder().encode(savedHeads)
+let headsData = try JSONEncoder().encode(weights.relational.calibratedHeads)
 try headsData.write(to: URL(fileURLWithPath: cli.headsPath))
 print("Saved report to \(cli.reportPath) and heads to \(cli.headsPath)")

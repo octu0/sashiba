@@ -4,6 +4,8 @@ EPOCHS ?= 60
 WEIGHTS ?= .tmp/weights.safetensors
 REPORT ?= .tmp/verification_report.md
 DROPOUT ?= 0.25
+REL_EPOCHS ?= 12
+AE_WEIGHTS ?= .tmp/weights_ae.safetensors
 
 export PATH := /usr/local/cuda/bin:$(PATH)
 export CUDA_ARCH ?= sm_86
@@ -22,19 +24,22 @@ test:
 	$(SWIFT) test
 
 train:
-	$(SWIFT) run -c release train -d $(DATA) -e $(EPOCHS) --word-dropout $(DROPOUT) --export-weights $(WEIGHTS)
+	$(SWIFT) run -c release train -d $(DATA) -e $(EPOCHS) --word-dropout $(DROPOUT) --rel-epochs $(REL_EPOCHS) --ae-weights $(AE_WEIGHTS) --export-weights $(WEIGHTS)
+
+train-rel:
+	$(SWIFT) run -c release train -d $(DATA) -e 0 --import-weights $(AE_WEIGHTS) --rel-epochs $(REL_EPOCHS) --ae-weights "" --export-weights $(WEIGHTS)
 
 eval:
-	$(SWIFT) run -c release train -d $(DATA) -e 0 --import-weights $(WEIGHTS)
+	$(SWIFT) run -c release train -d $(DATA) -e 0 --rel-epochs 0 --import-weights $(WEIGHTS)
 
 reconstruct:
 	$(SWIFT) run -c release reconstruct -d $(DATA) -w $(WEIGHTS)
 
 verify:
-	$(SWIFT) run -c release verify_latent_space -d $(DATA) -w $(WEIGHTS) -o $(REPORT)
+	$(SWIFT) run -c release verify_latent_space -d $(DATA) -w $(WEIGHTS) -o $(REPORT) --ae-weights $(AE_WEIGHTS) --perm-epochs $(REL_EPOCHS) --audit-report .tmp/audit_and_verification_report.md
 
 head:
-	$(SWIFT) run -c release relational_head -d $(DATA) -w $(WEIGHTS) -o .tmp/relational_head_report.md --heads .tmp/relational_heads.json
+	$(SWIFT) run -c release relational_head -d $(DATA) -w $(WEIGHTS) --ae-weights $(AE_WEIGHTS) --fold-epochs $(REL_EPOCHS) -o .tmp/relational_head_report.md --heads .tmp/relational_heads.json
 
 benchmark:
 	$(SWIFT) run -c release benchmark
