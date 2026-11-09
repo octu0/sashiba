@@ -10,7 +10,7 @@ extension SoftmaxClassifierHead {
         classCount: Int,
         steps: Int = 300,
         learningRate: Float = 0.05,
-        l2: Float = 2.5e-3
+        l2: Float = 1e-3
     ) -> SoftmaxClassifierHead {
         precondition(!features.isEmpty && features.count == labels.count)
         let n = features.count

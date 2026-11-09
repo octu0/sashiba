@@ -728,7 +728,7 @@ for (i, rc) in unseenCases.enumerated() {
     mismatchSenders.append(tokensOf(rc.hostText))
     mismatchReceivers.append(tokensOf(unseenCases[j].partnerCurrentText))
 }
-let mismatchZAll = RelationalPipeline.encodeZRel(model: mainModel, senders: mismatchSenders, receivers: mismatchReceivers, time: seqLen)
+let mismatchZAll = RelationalPipeline.encodeZRel(model: gpuModel, senders: mismatchSenders, receivers: mismatchReceivers, time: seqLen)
 for z in mismatchZAll {
     mismatchCtx.append(DualStreamRelationalEngine.computePentagonFromZRel(zRel: z).pentagon.contextDepth)
     let c = DualStreamRelationalEngine.classifyFromZRel(zRel: z, isEarlyT2: false, weights: weights.relational)
@@ -771,10 +771,10 @@ for rc in unseenCases {
     origRecvsT2.append(recv2)
     shufRecvsT2.append(s2)
 }
-let zOrigT4All = RelationalPipeline.encodeZRel(model: mainModel, senders: shufSenders, receivers: origRecvsT4, time: seqLen)
-let zShufT4All = RelationalPipeline.encodeZRel(model: mainModel, senders: shufSenders, receivers: shufRecvsT4, time: seqLen)
-let zOrigT2All = RelationalPipeline.encodeZRel(model: mainModel, senders: shufSenders, receivers: origRecvsT2, time: seqLen)
-let zShufT2All = RelationalPipeline.encodeZRel(model: mainModel, senders: shufSenders, receivers: shufRecvsT2, time: seqLen)
+let zOrigT4All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSenders, receivers: origRecvsT4, time: seqLen)
+let zShufT4All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSenders, receivers: shufRecvsT4, time: seqLen)
+let zOrigT2All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSenders, receivers: origRecvsT2, time: seqLen)
+let zShufT2All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSenders, receivers: shufRecvsT2, time: seqLen)
 for (idx, rc) in unseenCases.enumerated() {
     for task in taskNames {
         let useEarly = task.hasSuffix("t2")
@@ -904,7 +904,7 @@ for (idx, rc) in unseenCases.enumerated() {
     subSenders.append(tokensOf(hs))
     subRecvs.append(tokensOf(cs))
 }
-let zSubAll = subIndices.isEmpty ? [] : RelationalPipeline.encodeZRel(model: mainModel, senders: subSenders, receivers: subRecvs, time: seqLen)
+let zSubAll = subIndices.isEmpty ? [] : RelationalPipeline.encodeZRel(model: gpuModel, senders: subSenders, receivers: subRecvs, time: seqLen)
 for (k, idx) in subIndices.enumerated() {
     let zO = zOrigT4All[idx]
     let zS = zSubAll[k]

@@ -378,6 +378,8 @@ public enum DualStreamRelationalEngine {
         switch (archetype, topology) {
         case (.trueSupporter, .deepAffection):
             return (sLL: 0.88, sHH: 0.88, rHH: 1.00)
+        case (.trueSupporter, .benevolentGuardian):
+            return (sLL: 0.85, sHH: 0.82, rHH: 0.96)
         case (.gachikoiSafe, .deepAffection):
             return (sLL: 0.90, sHH: 0.84, rHH: 1.20)
         case (.gachikoiRisk, .closeConfidant), (.gachikoiRisk, _):
@@ -428,22 +430,9 @@ public enum DualStreamRelationalEngine {
             return v
         }
 
-        // Construct orthogonal u1, u2 in R^quarter using Gram-Schmidt with shared archetype/topology subspace
+        // Construct orthogonal u1, u2 in R^quarter using Gram-Schmidt
         func makeCorrelatedPair(seed: UInt64, cosine: Float, normS: Float, normC: Float) -> ([Float], [Float]) {
-            let baseBandSeed = seed & 0xF000_0000_0000_0000
-            let uArch = makeZeroMeanUnitBasis(seed: baseBandSeed ^ UInt64((archIdx + 1) * 1009), count: quarter)
-            let uTopo = makeZeroMeanUnitBasis(seed: baseBandSeed ^ UInt64((topoIdx + 1) * 2027), count: quarter)
-            let uJoint = makeZeroMeanUnitBasis(seed: seed, count: quarter)
-            var u1 = [Float](repeating: 0.0, count: quarter)
-            var sq1: Float = 0.0
-            for i in 0..<quarter {
-                let v = 0.55 * uArch[i] + 0.55 * uTopo[i] + 0.62 * uJoint[i]
-                u1[i] = v
-                sq1 += v * v
-            }
-            let inv1 = 1.0 / sqrtf(max(sq1, 1e-12))
-            for i in 0..<quarter { u1[i] *= inv1 }
-
+            let u1 = makeZeroMeanUnitBasis(seed: seed, count: quarter)
             var u2 = makeZeroMeanUnitBasis(seed: seed ^ 0x5555_AAAA_5555_AAAA, count: quarter)
             var dot: Float = 0.0
             for i in 0..<quarter { dot += u1[i] * u2[i] }
@@ -949,7 +938,7 @@ public enum DualStreamRelationalEngine {
             echoSq += rel.eEcho[c] * rel.eEcho[c]
             topicSq += rel.eTopic[c] * rel.eTopic[c]
         }
-        let scaleEcho = 0.18 * rootD / sqrtf(max(echoSq, 1e-12))
+        let scaleEcho = rootD / sqrtf(max(echoSq, 1e-12))
         let scaleTopic = 0.12 * rootD / sqrtf(max(topicSq, 1e-12))
 
         for b in 0..<batch {
@@ -990,16 +979,16 @@ public enum DualStreamRelationalEngine {
                     let topicVal = rel.eTopic[c] * scaleTopic
                     let subS = gS * echoVal + (1.0 - gS) * topicVal
                     let subC = gC * echoVal + (1.0 - gC) * topicVal
-                    eRelS[dst + c] = (aS * normValS + (1.0 - aS) * subS + 0.05 * pe[peOff + c]) * mS
-                    eRelC[dst + c] = (aC * normValC + (1.0 - aC) * subC + 0.05 * pe[peOff + c]) * mC
+                    eRelS[dst + c] = (aS * normValS + (1.0 - aS) * subS + 0.25 * gS * echoVal + 0.05 * pe[peOff + c]) * mS
+                    eRelC[dst + c] = (aC * normValC + (1.0 - aC) * subC + 0.25 * gC * echoVal + 0.05 * pe[peOff + c]) * mC
                     uRawContent[contOff + c] += wmS * (1.0 - aS * 0.5) * rawValS
                     uRawContent[contOff + d + c] += wmC * (1.0 - aC * 0.5) * rawValC
                 }
             }
         }
 
-        // 4. Full-Resolution Wavelet Transition Scan + 4-Window Multi-Scale SWT-Griffin Backbone
-        let winCount = 4
+        // 4. Full-Resolution Wavelet Transition Scan + 12-Window Triple-Bank Multi-Scale SWT-Griffin Backbone
+        let winCount = 12
         let bw = batch * winCount
         var k0 = [Float](repeating: 0.0, count: d)
         var k1 = [Float](repeating: 0.0, count: d)
@@ -1043,10 +1032,18 @@ public enum DualStreamRelationalEngine {
                 }
                 let invMid = 1.0 / max(sumMidWeight, 1e-6)
 
-                let wOff0 = (b * winCount + 0) * d // early window
-                let wOff1 = (b * winCount + 1) * d // mid window
-                let wOff2 = (b * winCount + 2) * d // late window
-                let wOff3 = (b * winCount + 3) * d // full mean window
+                let wOff0 = (b * winCount + 0) * d // Bank A early
+                let wOff1 = (b * winCount + 1) * d // Bank A mid
+                let wOff2 = (b * winCount + 2) * d // Bank A late
+                let wOff3 = (b * winCount + 3) * d // Bank A mean
+                let wOff4 = (b * winCount + 4) * d // Bank B early
+                let wOff5 = (b * winCount + 5) * d // Bank B mid
+                let wOff6 = (b * winCount + 6) * d // Bank B late
+                let wOff7 = (b * winCount + 7) * d // Bank B mean
+                let wOff8 = (b * winCount + 8) * d // Bank C early
+                let wOff9 = (b * winCount + 9) * d // Bank C mid
+                let wOff10 = (b * winCount + 10) * d // Bank C late
+                let wOff11 = (b * winCount + 11) * d // Bank C mean
 
                 for t in 0..<actT {
                     let idx = bTimeOff + t
@@ -1068,38 +1065,77 @@ public enum DualStreamRelationalEngine {
                         let c1 = (c + 1) % d
                         let c2 = (c + 2) % d
                         let c3 = (c + 3) % d
+                        let c4 = (c + 4) % d
                         let c5 = (c + 5) % d
+                        let c6 = (c + 6) % d
+                        let c7 = (c + 7) % d
+                        let c8 = (c + 8) % d
                         let c9 = (c + 9) % d
+                        let c11 = (c + 11) % d
+                        let c13 = (c + 13) % d
                         let shiftPrevE = (0.6 * eRel[prevOff + c1] - 0.4 * eRel[prevOff + c3] + 0.5 * eRel[prevOff + c]) * k0[c]
                         let shiftPrevE2 = (0.6 * eRel[prevOff + c5] - 0.4 * eRel[prevOff + c9] + 0.5 * eRel[prevOff + c2]) * k2[c]
+                        let shiftPrevE3 = (0.6 * eRel[prevOff + c7] - 0.4 * eRel[prevOff + c11] + 0.5 * eRel[prevOff + c4]) * k1[c]
+                        let shiftPrevE4 = (0.6 * eRel[prevOff + c8] - 0.4 * eRel[prevOff + c13] + 0.5 * eRel[prevOff + c6]) * k0[c]
                         let shiftSkipE = (0.6 * eRel[prev2Off + c5] - 0.4 * eRel[prev2Off + c1] + 0.5 * eRel[prev2Off + c3]) * k1[c]
+                        let shiftSkipE2 = (0.6 * eRel[prev2Off + c8] - 0.4 * eRel[prev2Off + c13] + 0.5 * eRel[prev2Off + c6]) * k0[c]
                         let shiftPrevCA1 = (0.6 * ca1[prevOff + c1] - 0.4 * ca1[prevOff + c3] + 0.5 * ca1[prevOff + c]) * k1[c]
+                        let shiftPrevCA1_2 = (0.6 * ca1[prevOff + c5] - 0.4 * ca1[prevOff + c9] + 0.5 * ca1[prevOff + c2]) * k0[c]
+                        let shiftPrevCA1_3 = (0.6 * ca1[prevOff + c8] - 0.4 * ca1[prevOff + c13] + 0.5 * ca1[prevOff + c6]) * k2[c]
                         let shiftCA2 = (0.6 * ca2[curOff + c1] - 0.4 * ca2[curOff + c3] + 0.5 * ca2[curOff + c]) * k0[c]
 
                         let pBi = shiftPrevE * (eRel[curOff + c] * k1[c]) * pm
                         let pBi2 = shiftPrevE2 * (eRel[curOff + c] * k0[c]) * pm
+                        let pBi3 = shiftPrevE3 * (eRel[curOff + c] * k2[c]) * pm
+                        let pBi4 = shiftPrevE4 * (eRel[curOff + c] * k1[c]) * pm
                         let pSkip = shiftSkipE * (eRel[curOff + c] * k2[c]) * pm
+                        let pSkip2 = shiftSkipE2 * (eRel[curOff + c] * k1[c]) * pm
                         let pTri = shiftPrevCA1 * (cd1[curOff + c] * k2[c]) * pm
+                        let pTri2 = shiftPrevCA1_2 * (cd1[curOff + c] * k1[c]) * pm
+                        let pTri3 = shiftPrevCA1_3 * (cd1[curOff + c] * k0[c]) * pm
                         let pCD2 = shiftCA2 * (cd2[curOff + c] * k2[c]) * pm
                         let dT = (hRGLRU[c] - prevH[c]) * eRel[curOff + c] * pm
 
-                        let rawVLL = pBi + 0.55 * pSkip + 0.5 * pCD2 + 0.35 * dT
-                        let rawVHH = pTri + 0.85 * pBi2 + 0.45 * pSkip + 0.35 * dT
-                        let tau: Float = 0.15
-                        let stLL = max(0.0, rawVLL - tau) - max(0.0, -rawVLL - tau)
-                        let stHH = max(0.0, rawVHH - tau) - max(0.0, -rawVHH - tau)
-                        let vLL = stLL / (1.0 + 0.25 * abs(stLL))
-                        let vHH = stHH / (1.0 + 0.25 * abs(stHH))
+                        let tau: Float = 0.45
+                        let rawVLL_A = pBi + 0.55 * pSkip + 0.5 * pCD2 + 0.35 * dT
+                        let rawVLL_B = pBi3 + 0.65 * pBi2 + 0.55 * pTri - 0.45 * pSkip + 0.35 * dT
+                        let rawVLL_C = pBi4 + 0.65 * pSkip2 + 0.55 * pTri3 - 0.40 * pBi2 + 0.35 * dT
+                        let rawVHH_A = pTri + 0.85 * pBi2 + 0.45 * pSkip + 0.35 * dT
+                        let rawVHH_B = pTri2 + 0.75 * pBi3 + 0.55 * pCD2 - 0.45 * pBi + 0.35 * dT
+                        let rawVHH_C = pTri3 + 0.75 * pBi4 + 0.55 * pSkip2 - 0.40 * pTri + 0.35 * dT
 
-                        winInLL[wOff0 + c] += we * vLL
-                        winInLL[wOff1 + c] += wMid * vLL
-                        winInLL[wOff2 + c] += wl * vLL
-                        winInLL[wOff3 + c] += wm * vLL
+                        let vLL_A = max(0.0, rawVLL_A - tau) - max(0.0, -rawVLL_A - tau)
+                        let vLL_B = max(0.0, rawVLL_B - tau) - max(0.0, -rawVLL_B - tau)
+                        let vLL_C = max(0.0, rawVLL_C - tau) - max(0.0, -rawVLL_C - tau)
+                        let vHH_A = max(0.0, rawVHH_A - tau) - max(0.0, -rawVHH_A - tau)
+                        let vHH_B = max(0.0, rawVHH_B - tau) - max(0.0, -rawVHH_B - tau)
+                        let vHH_C = max(0.0, rawVHH_C - tau) - max(0.0, -rawVHH_C - tau)
 
-                        winInHH[wOff0 + c] += we * vHH
-                        winInHH[wOff1 + c] += wMid * vHH
-                        winInHH[wOff2 + c] += wl * vHH
-                        winInHH[wOff3 + c] += wm * vHH
+                        winInLL[wOff0 + c] += we * vLL_A
+                        winInLL[wOff1 + c] += wMid * vLL_A
+                        winInLL[wOff2 + c] += wl * vLL_A
+                        winInLL[wOff3 + c] += wm * vLL_A
+                        winInLL[wOff4 + c] += we * vLL_B
+                        winInLL[wOff5 + c] += wMid * vLL_B
+                        winInLL[wOff6 + c] += wl * vLL_B
+                        winInLL[wOff7 + c] += wm * vLL_B
+                        winInLL[wOff8 + c] += we * vLL_C
+                        winInLL[wOff9 + c] += wMid * vLL_C
+                        winInLL[wOff10 + c] += wl * vLL_C
+                        winInLL[wOff11 + c] += wm * vLL_C
+
+                        winInHH[wOff0 + c] += we * vHH_A
+                        winInHH[wOff1 + c] += wMid * vHH_A
+                        winInHH[wOff2 + c] += wl * vHH_A
+                        winInHH[wOff3 + c] += wm * vHH_A
+                        winInHH[wOff4 + c] += we * vHH_B
+                        winInHH[wOff5 + c] += wMid * vHH_B
+                        winInHH[wOff6 + c] += wl * vHH_B
+                        winInHH[wOff7 + c] += wm * vHH_B
+                        winInHH[wOff8 + c] += we * vHH_C
+                        winInHH[wOff9 + c] += wMid * vHH_C
+                        winInHH[wOff10 + c] += wl * vHH_C
+                        winInHH[wOff11 + c] += wm * vHH_C
                     }
                 }
             }
@@ -1204,59 +1240,116 @@ public enum DualStreamRelationalEngine {
             SWTHawkAutoencoder.gemm(scoresLL, vLL_B, &attnLL, m: winCount, n: d, k: winCount)
             SWTHawkAutoencoder.gemm(scoresHH, vHH_B, &attnHH, m: winCount, n: d, k: winCount)
 
-            // Windows: 0 = early, 1 = mid, 2 = late, 3 = mean
-            let offE = bMatOff + 0 * d
-            let offMid = bMatOff + 1 * d
-            let offL = bMatOff + 2 * d
-            let offM = bMatOff + 3 * d
-            let attnOffM = 3 * d
-            let attnOffL = 2 * d
+            // Windows: 0..3 = Bank A (early, mid, late, mean), 4..7 = Bank B (early, mid, late, mean)
+            let offAE = bMatOff + 0 * d
+            let offAMid = bMatOff + 1 * d
+            let offAL = bMatOff + 2 * d
+            let offAM = bMatOff + 3 * d
+            let offBE = bMatOff + 4 * d
+            let offBMid = bMatOff + 5 * d
+            let offBL = bMatOff + 6 * d
+            let offBM = bMatOff + 7 * d
+            let attnOffAL = 2 * d
+            let attnOffAM = 3 * d
+            let attnOffBL = 6 * d
+            let attnOffBM = 7 * d
 
             let gBar = 0.2 + 0.8 * gBarBatch[b]
             let betaLate = min(1.0, max(0.0, (activeLenC[b] - 110.0) / 20.0))
+            let betaEarly = 1.0 - betaLate
             let phiBOff = b * 5 * d
             let cohOff = b * d
             for c in 0..<d {
-                let sL_early = hLLS[offE + c] + kLLS[offE + c]
-                let sL_mid = hLLS[offMid + c] + kLLS[offMid + c]
-                let sL_late = hLLS[offL + c] + kLLS[offL + c]
-                let sL_mean = hLLS[offM + c] + kLLS[offM + c]
-                let sL = 0.5 * sL_mean + 0.5 * sL_late
-                let cL_mean = hLLC[offM + c] + qLLC[offM + c]
-                let cL_early = hLLC[offE + c] + qLLC[offE + c]
-                let cL_mid = hLLC[offMid + c] + qLLC[offMid + c]
-                let cL_late = hLLC[offL + c] + qLLC[offL + c]
-                let cL = (1.0 - 0.70 * betaLate) * cL_mean + (0.70 * betaLate) * cL_late
-                let diffL = (sL - cL) + (1.0 - betaLate) * (cL_mean + 0.5 * cL_early - sL_early) + betaLate * (cL_late - cL_early + 0.5 * (cL_mid - sL_mid))
-                let prodL = sL * cL
-                let crossL = gBar * attnLL[attnOffM + c] + (0.45 * betaLate) * (cL_late - cL_early) + cohProjLL[cohOff + c]
+                let sLA_mean = hLLS[offAM + c] + kLLS[offAM + c]
+                let sLA_early = hLLS[offAE + c] + kLLS[offAE + c]
+                let sLA_mid = hLLS[offAMid + c] + kLLS[offAMid + c]
+                let sLA_late = hLLS[offAL + c] + kLLS[offAL + c]
+                let cLA_mean = hLLC[offAM + c] + qLLC[offAM + c]
+                let cLA_early = hLLC[offAE + c] + qLLC[offAE + c]
+                let cLA_mid = hLLC[offAMid + c] + qLLC[offAMid + c]
+                let cLA_late = hLLC[offAL + c] + qLLC[offAL + c]
 
-                phiLL[phiBOff + c] = sL
-                phiLL[phiBOff + d + c] = cL
-                phiLL[phiBOff + 2 * d + c] = diffL
-                phiLL[phiBOff + 3 * d + c] = prodL
+                let sLB_mean = hLLS[offBM + c] + kLLS[offBM + c]
+                let sLB_early = hLLS[offBE + c] + kLLS[offBE + c]
+                let sLB_mid = hLLS[offBMid + c] + kLLS[offBMid + c]
+                let sLB_late = hLLS[offBL + c] + kLLS[offBL + c]
+                let cLB_mean = hLLC[offBM + c] + qLLC[offBM + c]
+                let cLB_early = hLLC[offBE + c] + qLLC[offBE + c]
+                let cLB_mid = hLLC[offBMid + c] + qLLC[offBMid + c]
+                let cLB_late = hLLC[offBL + c] + qLLC[offBL + c]
+
+                let sLA_t4 = 0.45 * sLA_mean + 0.55 * sLA_late + 0.20 * (sLA_late - sLA_early)
+                let cLA_t4 = 0.25 * cLA_mean + 0.75 * cLA_late + 0.35 * (cLA_late - cLA_early)
+                let diffLA_t4 = 0.50 * abs(sLA_t4 - cLA_t4) + 0.45 * (cLA_late - cLA_early) + 0.35 * (cLA_mid - sLA_mid)
+
+                let sLB_t4 = 0.45 * sLB_mean + 0.55 * sLB_late + 0.20 * (sLB_late - sLB_early)
+                let cLB_t4 = 0.25 * cLB_mean + 0.75 * cLB_late + 0.35 * (cLB_late - cLB_early)
+                let diffLB_t4 = 0.50 * abs(sLB_t4 - cLB_t4) + 0.45 * (cLB_late - cLB_early) + 0.35 * (cLB_mid - sLB_mid)
+
+                let sLA_t2 = 0.55 * sLA_early + 0.45 * sLA_mid + 0.25 * (sLA_early - sLA_late)
+                let cLA_t2 = 0.50 * cLA_mean + 0.50 * cLA_late + 0.35 * (cLA_late - cLA_early)
+                let diffLA_t2 = 0.50 * abs(sLA_t2 - cLA_t2) + 0.45 * (cLA_late - cLA_early) + 0.35 * (cLA_early - sLA_early)
+
+                let sLB_t2 = 0.55 * sLB_early + 0.45 * sLB_mid + 0.25 * (sLB_early - sLB_late)
+                let cLB_t2 = 0.50 * cLB_mean + 0.50 * cLB_late + 0.35 * (cLB_late - cLB_early)
+                let diffLB_t2 = 0.50 * abs(sLB_t2 - cLB_t2) + 0.45 * (cLB_late - cLB_early) + 0.35 * (cLB_early - sLB_early)
+
+                let b0L = betaLate * (0.85 * cLA_t4 + 0.55 * sLA_t4 + diffLA_t4 + 0.35 * (sLA_t4 * cLA_t4) + 0.35 * cLA_mid)
+                let b1L = betaLate * (0.85 * cLB_t4 - 0.35 * sLB_t4 + diffLB_t4 + 0.35 * (sLB_t4 * cLB_t4) + 0.35 * cLB_mid)
+                let b2L = betaEarly * (0.85 * cLA_t2 + 0.55 * sLA_t2 + diffLA_t2 + 0.35 * (sLA_t2 * cLA_t2) + 0.40 * cLA_early + 0.35 * cLA_mid)
+                let b3L = betaEarly * (0.85 * cLB_t2 - 0.35 * sLB_t2 + diffLB_t2 + 0.35 * (sLB_t2 * cLB_t2) + 0.40 * cLB_early + 0.35 * cLB_mid)
+                let crossL = gBar * (attnLL[attnOffAM + c] + attnLL[attnOffBM + c]) + 0.45 * (cLA_late - cLA_early) + cohProjLL[cohOff + c]
+
+                phiLL[phiBOff + c] = b0L
+                phiLL[phiBOff + d + c] = b1L
+                phiLL[phiBOff + 2 * d + c] = b2L
+                phiLL[phiBOff + 3 * d + c] = b3L
                 phiLL[phiBOff + 4 * d + c] = crossL
 
-                let sH_early = hHHS[offE + c] + kHHS[offE + c]
-                let sH_mid = hHHS[offMid + c] + kHHS[offMid + c]
-                let sH_late = hHHS[offL + c] + kHHS[offL + c]
-                let sH_mean = hHHS[offM + c] + kHHS[offM + c]
-                let sH = 0.4 * sH_mean + 0.6 * sH_late
-                let cH_mean = hHHC[offM + c] + qHHC[offM + c]
-                let cH_early = hHHC[offE + c] + qHHC[offE + c]
-                let cH_mid = hHHC[offMid + c] + qHHC[offMid + c]
-                let cH_late = hHHC[offL + c] + qHHC[offL + c]
-                let cH_t2 = cH_mean
-                let cH_t4 = 0.85 * cH_late + 0.15 * cH_mean + 0.35 * (cH_late - cH_early)
-                let cH = (1.0 - betaLate) * cH_t2 + betaLate * cH_t4
-                let diffH = (sH - cH) + (1.0 - betaLate) * (cH_mean + 0.5 * cH_early - sH_early) + betaLate * (cH_late - cH_early + 0.5 * (cH_mid - sH_mid))
-                let prodH = sH * cH
-                let crossH = (1.0 - betaLate) * attnHH[attnOffM + c] + betaLate * (attnHH[attnOffL + c] + 0.55 * cH_early) + cohProjHH[cohOff + c]
+                let sHA_mean = hHHS[offAM + c] + kHHS[offAM + c]
+                let sHA_early = hHHS[offAE + c] + kHHS[offAE + c]
+                let sHA_mid = hHHS[offAMid + c] + kHHS[offAMid + c]
+                let sHA_late = hHHS[offAL + c] + kHHS[offAL + c]
+                let cHA_mean = hHHC[offAM + c] + qHHC[offAM + c]
+                let cHA_early = hHHC[offAE + c] + qHHC[offAE + c]
+                let cHA_mid = hHHC[offAMid + c] + qHHC[offAMid + c]
+                let cHA_late = hHHC[offAL + c] + qHHC[offAL + c]
 
-                phiHH[phiBOff + c] = sH
-                phiHH[phiBOff + d + c] = cH
-                phiHH[phiBOff + 2 * d + c] = diffH
-                phiHH[phiBOff + 3 * d + c] = prodH
+                let sHB_mean = hHHS[offBM + c] + kHHS[offBM + c]
+                let sHB_early = hHHS[offBE + c] + kHHS[offBE + c]
+                let sHB_mid = hHHS[offBMid + c] + kHHS[offBMid + c]
+                let sHB_late = hHHS[offBL + c] + kHHS[offBL + c]
+                let cHB_mean = hHHC[offBM + c] + qHHC[offBM + c]
+                let cHB_early = hHHC[offBE + c] + qHHC[offBE + c]
+                let cHB_mid = hHHC[offBMid + c] + qHHC[offBMid + c]
+                let cHB_late = hHHC[offBL + c] + qHHC[offBL + c]
+
+                let sHA_t4 = 0.35 * sHA_mean + 0.65 * sHA_late + 0.20 * (sHA_late - sHA_early)
+                let cHA_t4 = 0.85 * cHA_late + 0.15 * cHA_mean + 0.35 * (cHA_late - cHA_early)
+                let diffHA_t4 = 0.50 * abs(sHA_t4 - cHA_t4) + 0.45 * (cHA_late - cHA_early) + 0.35 * (cHA_mid - sHA_mid)
+
+                let sHB_t4 = 0.35 * sHB_mean + 0.65 * sHB_late + 0.20 * (sHB_late - sHB_early)
+                let cHB_t4 = 0.85 * cHB_late + 0.15 * cHB_mean + 0.35 * (cHB_late - cHB_early)
+                let diffHB_t4 = 0.50 * abs(sHB_t4 - cHB_t4) + 0.45 * (cHB_late - cHB_early) + 0.35 * (cHB_mid - sHB_mid)
+
+                let sHA_t2 = 0.55 * sHA_early + 0.45 * sHA_mid + 0.25 * (sHA_early - sHA_late)
+                let cHA_t2 = 0.50 * cHA_mean + 0.50 * cHA_late + 0.35 * (cHA_late - cHA_early)
+                let diffHA_t2 = 0.50 * abs(sHA_t2 - cHA_t2) + 0.45 * (cHA_late - cHA_early) + 0.35 * (cHA_early - sHA_early)
+
+                let sHB_t2 = 0.55 * sHB_early + 0.45 * sHB_mid + 0.25 * (sHB_early - sHB_late)
+                let cHB_t2 = 0.50 * cHB_mean + 0.50 * cHB_late + 0.35 * (cHB_late - cHB_early)
+                let diffHB_t2 = 0.50 * abs(sHB_t2 - cHB_t2) + 0.45 * (cHB_late - cHB_early) + 0.35 * (cHB_early - sHB_early)
+
+                let b0H = betaLate * (0.85 * cHA_t4 + 0.55 * sHA_t4 + diffHA_t4 + 0.35 * (sHA_t4 * cHA_t4) + 0.40 * cHA_early + 0.35 * cHA_mid)
+                let b1H = betaLate * (0.85 * cHB_t4 - 0.35 * sHB_t4 + diffHB_t4 + 0.35 * (sHB_t4 * cHB_t4) + 0.40 * cHB_early + 0.35 * cHB_mid)
+                let b2H = betaEarly * (0.85 * cHA_t2 + 0.55 * sHA_t2 + diffHA_t2 + 0.35 * (sHA_t2 * cHA_t2) + 0.50 * cHA_early + 0.35 * cHA_mid)
+                let b3H = betaEarly * (0.85 * cHB_t2 - 0.35 * sHB_t2 + diffHB_t2 + 0.35 * (sHB_t2 * cHB_t2) + 0.50 * cHB_early + 0.35 * cHB_mid)
+                let crossH = betaEarly * (attnHH[attnOffAM + c] + attnHH[attnOffBM + c] + 0.50 * cHA_early) + betaLate * (attnHH[attnOffAL + c] + attnHH[attnOffBL + c] + 0.55 * cHA_early) + cohProjHH[cohOff + c]
+
+                phiHH[phiBOff + c] = b0H
+                phiHH[phiBOff + d + c] = b1H
+                phiHH[phiBOff + 2 * d + c] = b2H
+                phiHH[phiBOff + 3 * d + c] = b3H
                 phiHH[phiBOff + 4 * d + c] = crossH
             }
         }
@@ -1355,7 +1448,7 @@ public enum DualStreamRelationalEngine {
 
         var gram = [Float](repeating: 0.0, count: augDim * augDim)
         SWTHawkAutoencoder.gemm(phiAugT, phiAug, &gram, m: augDim, n: augDim, k: rows)
-        let reg = max(ridgeLambda, 0.55)
+        let reg = max(ridgeLambda, 0.25)
         for i in 0..<inDim {
             gram[i * augDim + i] += reg
         }

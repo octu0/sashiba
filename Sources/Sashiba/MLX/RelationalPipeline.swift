@@ -64,7 +64,7 @@ public enum RelationalPipeline {
                 cfs.append(RelationalCounterfactualPair(senderTokens: host[i], receiverTokens: current[i], harmonizedTokens: harm[i]))
             }
             if cases.count > 1 && i % 6 == 0 {
-                for k in 0..<mismatchPerCase {
+                for k in 0..<min(1, mismatchPerCase) {
                     var j = Int(rng.next() % UInt64(cases.count))
                     var guardCount = 0
                     while cases[j].group == rc.group && guardCount < 16 {
@@ -72,14 +72,13 @@ public enum RelationalPipeline {
                         guardCount += 1
                     }
                     guard cases[j].group != rc.group else { continue }
-                    let useEarly = (((i / 6) + k) % 2 == 1)
                     let ref = lowCohPool.isEmpty ? cases[j] : lowCohPool[(i + k) % lowCohPool.count]
-                    let mArch = useEarly ? archetypeIndex(ref.expectedArchetypeT2) : archetypeIndex(ref.expectedArchetype)
-                    let mTopo = useEarly ? topologyIndex(ref.expectedTopologyT2) : topologyIndex(ref.expectedTopology)
+                    let mArch = archetypeIndex(ref.expectedArchetype)
+                    let mTopo = topologyIndex(ref.expectedTopology)
                     pairs.append(RelationalTrainingPair(
-                        senderTokens: host[i], receiverTokens: useEarly ? early[j] : current[j],
+                        senderTokens: host[i], receiverTokens: current[j],
                         archetype: mArch, topology: mTopo,
-                        isEarlyT2: useEarly, groupKey: "MISMATCH:" + rc.group + ":" + cases[j].group
+                        isEarlyT2: false, groupKey: "MISMATCH:" + rc.group + ":" + cases[j].group
                     ))
                 }
             }

@@ -256,7 +256,7 @@ public struct TextVocabulary: Sendable, Equatable {
                 gate[idx] = 0.04
             } else {
                 let dfRatio = Float(docFreq[idx]) / totalDocs
-                gate[idx] = (dfRatio >= 0.012) ? 0.80 : 0.04
+                gate[idx] = (dfRatio >= 0.012) ? 0.88 : 0.04
             }
         }
         return gate

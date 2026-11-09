@@ -961,10 +961,10 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         let rootD = sqrt(Float(d))
         let eNormS = l2NormalizeRows(eRawS) * rootD * maskS
         let eNormC = l2NormalizeRows(eRawC) * rootD * maskC
-        let echo = l2NormalizeRows(relational.eEcho.reshaped([1, 1, d])) * (0.18 * rootD)
+        let echo = l2NormalizeRows(relational.eEcho.reshaped([1, 1, d])) * rootD
         let topic = l2NormalizeRows(relational.eTopic.reshaped([1, 1, d])) * (0.12 * rootD)
-        let eRelS = (alphaS * eNormS + (1.0 - alphaS) * (gS * echo + (1.0 - gS) * topic) + 0.05 * pe) * maskS
-        let eRelC = (alphaC * eNormC + (1.0 - alphaC) * (gC * echo + (1.0 - gC) * topic) + 0.05 * pe) * maskC
+        let eRelS = (alphaS * eNormS + (1.0 - alphaS) * (gS * echo + (1.0 - gS) * topic) + 0.25 * gS * echo + 0.05 * pe) * maskS
+        let eRelC = (alphaC * eNormC + (1.0 - alphaC) * (gC * echo + (1.0 - gC) * topic) + 0.25 * gC * echo + 0.05 * pe) * maskC
         let uContS = sum(wMeanS * (1.0 - 0.5 * alphaS) * eRawS, axis: 1)
         let uContC = sum(wMeanC * (1.0 - 0.5 * alphaC) * eRawC, axis: 1)
 
@@ -994,25 +994,42 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
             let hPrev = shiftTime(h)
             let ePrev1 = shiftTimeReplicate(eRel)
             let ePrev2 = shiftTimeReplicate(ePrev1)
+            func channelMix3(_ x: MLXArray) -> MLXArray {
+                let d = x.dim(-1)
+                func roll(_ k: Int) -> MLXArray {
+                    return concatenated([x[0..., 0..., k..<d], x[0..., 0..., 0..<k]], axis: -1)
+                }
+                return 0.6 * roll(7) - 0.4 * roll(11) + 0.5 * roll(4)
+            }
+            let ca1Prev = shiftTimeReplicate(ca1)
             let pBi = channelMix(ePrev1) * k0 * (eRel * k1) * pm
             let pBi2 = channelMix2(ePrev1) * k2 * (eRel * k0) * pm
+            let pBi3 = channelMix3(ePrev1) * k1 * (eRel * k2) * pm
             let pSkip = channelMixSkip(ePrev2) * k1 * (eRel * k2) * pm
-            let pTri = channelMix(shiftTimeReplicate(ca1)) * k1 * (cd1 * k2) * pm
+            let pTri = channelMix(ca1Prev) * k1 * (cd1 * k2) * pm
+            let pTri2 = channelMix2(ca1Prev) * k0 * (cd1 * k1) * pm
             let pCD2 = channelMix(ca2) * k0 * (cd2 * k2) * pm
             let dT = (h - hPrev) * eRel * pm
-            let rawVLL = pBi + 0.55 * pSkip + 0.5 * pCD2 + 0.35 * dT
-            let rawVHH = pTri + 0.85 * pBi2 + 0.45 * pSkip + 0.35 * dT
-            let tau = MLXArray(Float(0.15))
+            let tau = MLXArray(Float(0.45))
             let zero = MLXArray(Float(0.0))
-            let stLL = maximum(zero, rawVLL - tau) - maximum(zero, -rawVLL - tau)
-            let stHH = maximum(zero, rawVHH - tau) - maximum(zero, -rawVHH - tau)
-            let vLL = stLL / (1.0 + 0.25 * abs(stLL))
-            let vHH = stHH / (1.0 + 0.25 * abs(stHH))
+            func soft(_ v: MLXArray) -> MLXArray {
+                return maximum(zero, v - tau) - maximum(zero, -v - tau)
+            }
+            let vLLA = soft(pBi + 0.55 * pSkip + 0.5 * pCD2 + 0.35 * dT)
+            let vLLB = soft(pBi3 + 0.65 * pBi2 + 0.55 * pTri - 0.45 * pSkip + 0.35 * dT)
+            let vHHA = soft(pTri + 0.85 * pBi2 + 0.45 * pSkip + 0.35 * dT)
+            let vHHB = soft(pTri2 + 0.75 * pBi3 + 0.55 * pCD2 - 0.45 * pBi + 0.35 * dT)
 
             let wMidRaw = maximum(MLXArray(Float(0.0)), wm - 0.35 * (we + wl))
             let wMid = normalizeOverTime(wMidRaw)
-            let winLL = stacked([pool(we, vLL), pool(wMid, vLL), pool(wl, vLL), pool(wm, vLL)], axis: 1) // [B, 4, D]
-            let winHH = stacked([pool(we, vHH), pool(wMid, vHH), pool(wl, vHH), pool(wm, vHH)], axis: 1)
+            let winLL = stacked([
+                pool(we, vLLA), pool(wMid, vLLA), pool(wl, vLLA), pool(wm, vLLA),
+                pool(we, vLLB), pool(wMid, vLLB), pool(wl, vLLB), pool(wm, vLLB)
+            ], axis: 1) // [B, 8, D]
+            let winHH = stacked([
+                pool(we, vHHA), pool(wMid, vHHA), pool(wl, vHHA), pool(wm, vHHA),
+                pool(we, vHHB), pool(wMid, vHHB), pool(wl, vHHB), pool(wm, vHHB)
+            ], axis: 1)
 
             func backbone(_ x: MLXArray) -> MLXArray {
                 let fSWT = swtBranch(x)
@@ -1028,7 +1045,7 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         let (hLLS, hHHS) = buildStream(eRelS, pairS, wMeanS, wEarlyS, wLateS)
         let (hLLC, hHHC) = buildStream(eRelC, pairC, wMeanC, wEarlyC, wLateC)
 
-        // 5. Subband Bidirectional Cross-Attention over the 4 temporal windows (0 = early, 1 = mid, 2 = late, 3 = mean)
+        // 5. Subband Bidirectional Cross-Attention over the 8 Dual-Bank temporal windows (0..3 = Bank A, 4..7 = Bank B)
         let qLLC = matmul(hLLC, relational.wQLL) + relational.bQLL
         let kLLS = matmul(hLLS, relational.wKLL) + relational.bKLL
         let vLLS = matmul(hLLS, relational.wVLL) + relational.bVLL
@@ -1047,38 +1064,89 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         }
         let gBar = 0.2 + 0.8 * s6
         let betaLate = clip01((lenC2 - 110.0) / 20.0)
+        let betaEarly = 1.0 - betaLate
 
-        let sLEarly = win(hLLS, 0) + win(kLLS, 0)
-        let sLMid = win(hLLS, 1) + win(kLLS, 1)
-        let sLLate = win(hLLS, 2) + win(kLLS, 2)
-        let sLMean = win(hLLS, 3) + win(kLLS, 3)
-        let sL = 0.5 * sLMean + 0.5 * sLLate
-        let cLMean = win(hLLC, 3) + win(qLLC, 3)
-        let cLEarly = win(hLLC, 0) + win(qLLC, 0)
-        let cLMid = win(hLLC, 1) + win(qLLC, 1)
-        let cLLate = win(hLLC, 2) + win(qLLC, 2)
-        let cL = (1.0 - 0.70 * betaLate) * cLMean + (0.70 * betaLate) * cLLate
-        let diffL = (sL - cL) + (1.0 - betaLate) * (cLMean + 0.5 * cLEarly - sLEarly) + betaLate * (cLLate - cLEarly + 0.5 * (cLMid - sLMid))
-        let prodL = sL * cL
-        let crossL = gBar * win(attnLL, 3) + (0.45 * betaLate) * (cLLate - cLEarly) + cohProjLL
-        let phiLL = concatenated([sL, cL, diffL, prodL, crossL], axis: -1) // [B, 5D]
+        let sLAMean = win(hLLS, 3) + win(kLLS, 3)
+        let sLAEarly = win(hLLS, 0) + win(kLLS, 0)
+        let sLAMid = win(hLLS, 1) + win(kLLS, 1)
+        let sLALate = win(hLLS, 2) + win(kLLS, 2)
+        let cLAMean = win(hLLC, 3) + win(qLLC, 3)
+        let cLAEarly = win(hLLC, 0) + win(qLLC, 0)
+        let cLAMid = win(hLLC, 1) + win(qLLC, 1)
+        let cLALate = win(hLLC, 2) + win(qLLC, 2)
 
-        let sHEarly = win(hHHS, 0) + win(kHHS, 0)
-        let sHMid = win(hHHS, 1) + win(kHHS, 1)
-        let sHLate = win(hHHS, 2) + win(kHHS, 2)
-        let sHMean = win(hHHS, 3) + win(kHHS, 3)
-        let sH = 0.4 * sHMean + 0.6 * sHLate
-        let cHMean = win(hHHC, 3) + win(qHHC, 3)
-        let cHEarly = win(hHHC, 0) + win(qHHC, 0)
-        let cHMid = win(hHHC, 1) + win(qHHC, 1)
-        let cHLate = win(hHHC, 2) + win(qHHC, 2)
-        let cHT2 = cHMean
-        let cHT4 = 0.85 * cHLate + 0.15 * cHMean + 0.35 * (cHLate - cHEarly)
-        let cH = (1.0 - betaLate) * cHT2 + betaLate * cHT4
-        let diffH = (sH - cH) + (1.0 - betaLate) * (cHMean + 0.5 * cHEarly - sHEarly) + betaLate * (cHLate - cHEarly + 0.5 * (cHMid - sHMid))
-        let prodH = sH * cH
-        let crossH = (1.0 - betaLate) * win(attnHH, 3) + betaLate * (win(attnHH, 2) + 0.55 * cHEarly) + cohProjHH
-        let phiHH = concatenated([sH, cH, diffH, prodH, crossH], axis: -1)
+        let sLBMean = win(hLLS, 7) + win(kLLS, 7)
+        let sLBEarly = win(hLLS, 4) + win(kLLS, 4)
+        let sLBMid = win(hLLS, 5) + win(kLLS, 5)
+        let sLBLate = win(hLLS, 6) + win(kLLS, 6)
+        let cLBMean = win(hLLC, 7) + win(qLLC, 7)
+        let cLBEarly = win(hLLC, 4) + win(qLLC, 4)
+        let cLBMid = win(hLLC, 5) + win(qLLC, 5)
+        let cLBLate = win(hLLC, 6) + win(qLLC, 6)
+
+        let sLAT4 = 0.45 * sLAMean + 0.55 * sLALate + 0.20 * (sLALate - sLAEarly)
+        let cLAT4 = 0.25 * cLAMean + 0.75 * cLALate + 0.35 * (cLALate - cLAEarly)
+        let diffLAT4 = 0.50 * abs(sLAT4 - cLAT4) + 0.45 * (cLALate - cLAEarly) + 0.35 * (cLAMid - sLAMid)
+
+        let sLBT4 = 0.45 * sLBMean + 0.55 * sLBLate + 0.20 * (sLBLate - sLBEarly)
+        let cLBT4 = 0.25 * cLBMean + 0.75 * cLBLate + 0.35 * (cLBLate - cLBEarly)
+        let diffLBT4 = 0.50 * abs(sLBT4 - cLBT4) + 0.45 * (cLBLate - cLBEarly) + 0.35 * (cLBMid - sLBMid)
+
+        let sLAT2 = 0.55 * sLAEarly + 0.45 * sLAMid + 0.25 * (sLAEarly - sLALate)
+        let cLAT2 = 0.50 * cLAMean + 0.50 * cLALate + 0.35 * (cLALate - cLAEarly)
+        let diffLAT2 = 0.50 * abs(sLAT2 - cLAT2) + 0.45 * (cLALate - cLAEarly) + 0.35 * (cLAEarly - sLAEarly)
+
+        let sLBT2 = 0.55 * sLBEarly + 0.45 * sLBMid + 0.25 * (sLBEarly - sLBLate)
+        let cLBT2 = 0.50 * cLBMean + 0.50 * cLBLate + 0.35 * (cLBLate - cLBEarly)
+        let diffLBT2 = 0.50 * abs(sLBT2 - cLBT2) + 0.45 * (cLBLate - cLBEarly) + 0.35 * (cLBEarly - sLBEarly)
+
+        let b0L = betaLate * (0.85 * cLAT4 + 0.55 * sLAT4 + diffLAT4 + 0.35 * (sLAT4 * cLAT4) + 0.35 * cLAMid)
+        let b1L = betaLate * (0.85 * cLBT4 - 0.35 * sLBT4 + diffLBT4 + 0.35 * (sLBT4 * cLBT4) + 0.35 * cLBMid)
+        let b2L = betaEarly * (0.85 * cLAT2 + 0.55 * sLAT2 + diffLAT2 + 0.35 * (sLAT2 * cLAT2) + 0.40 * cLAEarly + 0.35 * cLAMid)
+        let b3L = betaEarly * (0.85 * cLBT2 - 0.35 * sLBT2 + diffLBT2 + 0.35 * (sLBT2 * cLBT2) + 0.40 * cLBEarly + 0.35 * cLBMid)
+        let crossL = gBar * (win(attnLL, 3) + win(attnLL, 7)) + 0.45 * (cLALate - cLAEarly) + cohProjLL
+        let phiLL = concatenated([b0L, b1L, b2L, b3L, crossL], axis: -1) // [B, 5D]
+
+        let sHAMean = win(hHHS, 3) + win(kHHS, 3)
+        let sHAEarly = win(hHHS, 0) + win(kHHS, 0)
+        let sHAMid = win(hHHS, 1) + win(kHHS, 1)
+        let sHALate = win(hHHS, 2) + win(kHHS, 2)
+        let cHAMean = win(hHHC, 3) + win(qHHC, 3)
+        let cHAEarly = win(hHHC, 0) + win(qHHC, 0)
+        let cHAMid = win(hHHC, 1) + win(qHHC, 1)
+        let cHALate = win(hHHC, 2) + win(qHHC, 2)
+
+        let sHBMean = win(hHHS, 7) + win(kHHS, 7)
+        let sHBEarly = win(hHHS, 4) + win(kHHS, 4)
+        let sHBMid = win(hHHS, 5) + win(kHHS, 5)
+        let sHBLate = win(hHHS, 6) + win(kHHS, 6)
+        let cHBMean = win(hHHC, 7) + win(qHHC, 7)
+        let cHBEarly = win(hHHC, 4) + win(qHHC, 4)
+        let cHBMid = win(hHHC, 5) + win(qHHC, 5)
+        let cHBLate = win(hHHC, 6) + win(qHHC, 6)
+
+        let sHAT4 = 0.35 * sHAMean + 0.65 * sHALate + 0.20 * (sHALate - sHAEarly)
+        let cHAT4 = 0.85 * cHALate + 0.15 * cHAMean + 0.35 * (cHALate - cHAEarly)
+        let diffHAT4 = 0.50 * abs(sHAT4 - cHAT4) + 0.45 * (cHALate - cHAEarly) + 0.35 * (cHAMid - sHAMid)
+
+        let sHBT4 = 0.35 * sHBMean + 0.65 * sHBLate + 0.20 * (sHBLate - sHBEarly)
+        let cHBT4 = 0.85 * cHBLate + 0.15 * cHBMean + 0.35 * (cHBLate - cHBEarly)
+        let diffHBT4 = 0.50 * abs(sHBT4 - cHBT4) + 0.45 * (cHBLate - cHBEarly) + 0.35 * (cHBMid - sHBMid)
+
+        let sHAT2 = 0.55 * sHAEarly + 0.45 * sHAMid + 0.25 * (sHAEarly - sHALate)
+        let cHAT2 = 0.50 * cHAMean + 0.50 * cHALate + 0.35 * (cHALate - cHAEarly)
+        let diffHAT2 = 0.50 * abs(sHAT2 - cHAT2) + 0.45 * (cHALate - cHAEarly) + 0.35 * (cHAEarly - sHAEarly)
+
+        let sHBT2 = 0.55 * sHBEarly + 0.45 * sHBMid + 0.25 * (sHBEarly - sHBLate)
+        let cHBT2 = 0.50 * cHBMean + 0.50 * cHBLate + 0.35 * (cHBLate - cHBEarly)
+        let diffHBT2 = 0.50 * abs(sHBT2 - cHBT2) + 0.45 * (cHBLate - cHBEarly) + 0.35 * (cHBEarly - sHBEarly)
+
+        let b0H = betaLate * (0.85 * cHAT4 + 0.55 * sHAT4 + diffHAT4 + 0.35 * (sHAT4 * cHAT4) + 0.40 * cHAEarly + 0.35 * cHAMid)
+        let b1H = betaLate * (0.85 * cHBT4 - 0.35 * sHBT4 + diffHBT4 + 0.35 * (sHBT4 * cHBT4) + 0.40 * cHBEarly + 0.35 * cHBMid)
+        let b2H = betaEarly * (0.85 * cHAT2 + 0.55 * sHAT2 + diffHAT2 + 0.35 * (sHAT2 * cHAT2) + 0.50 * cHAEarly + 0.35 * cHAMid)
+        let b3H = betaEarly * (0.85 * cHBT2 - 0.35 * sHBT2 + diffHBT2 + 0.35 * (sHBT2 * cHBT2) + 0.50 * cHBEarly + 0.35 * cHBMid)
+        let crossH = betaEarly * (win(attnHH, 3) + win(attnHH, 7) + 0.50 * cHAEarly) + betaLate * (win(attnHH, 2) + win(attnHH, 6) + 0.55 * cHAEarly) + cohProjHH
+        let phiHH = concatenated([b0H, b1H, b2H, b3H, crossH], axis: -1)
 
         // 6. Latent Projection Layer & LayerNorm
         let zLL = mlxLayerNorm(matmul(phiLL, relational.wProjLL) + relational.bProjLL, gamma: relational.normLLGamma, beta: relational.normLLBeta)
