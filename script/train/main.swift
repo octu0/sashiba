@@ -5,9 +5,9 @@ struct TrainCLI {
     var dataPath: String = ".tmp"
     var epochs: Int = 60
     var batchSize: Int = 16
-    var dim: Int = 256
-    var encoderLayers: Int = 4
-    var decoderLayers: Int = 4
+    var dim: Int = SWTHawkShape.defaultDim
+    var encoderLayers: Int = SWTHawkShape.encoderLayers
+    var decoderLayers: Int = SWTHawkShape.decoderLayers
     var lrMax: Float = 0.003
     var lrMin: Float = 0.0003
     var wordDropout: Float = 0.25
@@ -18,10 +18,11 @@ struct TrainCLI {
     var exportWeightsPath: String = ".tmp/weights.safetensors"
     var importWeightsPath: String? = nil
     var earlyStopOnExactGreedy: Bool = true
-    var relEpochs: Int = 12
+    var relEpochs: Int = 15
     var relBatch: Int = 32
-    var relLR: Float = 1e-3
+    var relLR: Float = 1.4e-3
     var aeWeightsPath: String = ".tmp/weights_ae.safetensors"
+    var recalibrateCFM: Bool = false
 
     static func parse(_ args: [String]) -> TrainCLI {
         var cli = TrainCLI()
@@ -88,6 +89,8 @@ struct TrainCLI {
             case "--ae-weights":
                 i += 1
                 if i < args.count { cli.aeWeightsPath = args[i] }
+            case "--recalibrate-cfm":
+                cli.recalibrateCFM = true
             default:
                 break
             }
@@ -145,6 +148,7 @@ func buildAugmentedCorpus(docs: [TextDocument], config: DatasetConfiguration) ->
     return augmented
 }
 
+MLXSWTHawkAutoencoder.configureLowMemoryCache()
 let cli = TrainCLI.parse(CommandLine.arguments)
 let dataURL = URL(fileURLWithPath: cli.dataPath)
 let docs = try TextVocabulary.loadDocuments(from: dataURL)
@@ -266,7 +270,7 @@ print("==================================================================")
 print("Backend          : MLX GPU (Metal / CUDA)")
 print("Train Dialogues  : \(numDocs) multi-turn dialogues (\(augmentedCorpus.count) compositional combinations)")
 print("Sequence length T: \(seqLen) tokens | Vocab size V: \(vocab.count)")
-print("Model dim D      : \(weights.dim) | Latent dim z: \(weights.latentDim) (z_LL: 512, z_HH: 512)")
+print("Model dim D      : \(weights.dim) | AE z: \(weights.latentDim) (z_LL: \(weights.latentDim / 2), z_HH: \(weights.latentDim / 2)) | Rel z_rel: \(weights.relational.latentDim)")
 print("Griffin layers   : \(weights.hawkBranch.count) (RG-LRU + Local Window Attn W=\(SWTHawkShape.windowSize)) | Decoder layers: \(weights.decoder.layers.count)")
 print("Word Dropout p   : \(String(format: "%.2f", cli.wordDropout)) | Latent Noise σ: \(String(format: "%.2f", cli.latentNoiseStd)) | Reg α: \(String(format: "%.4f", cli.regWeight))")
 print("Parameters       : \(weights.parameterCount)")
@@ -331,14 +335,14 @@ if cli.epochs > 0 {
             ))
 
             if cli.earlyStopOnExactGreedy && epoch >= 20 && evalResult.exactMatchRate >= 1.0 {
-                print("Reached 100.00% exact greedy reconstruction across all \(numDocs) documents from z = [z_LL(512); z_HH(512)] ∈ R^1024!")
+                print("Reached 100.00% exact greedy reconstruction across all \(numDocs) documents from z = [z_LL(\(weights.latentDim / 2)); z_HH(\(weights.latentDim / 2))] ∈ R^\(weights.latentDim)!")
                 break
             }
         }
     }
 }
 
-if cli.epochs > 0 || weights.flowMatching.numPairs == 0 {
+if cli.epochs > 0 || weights.flowMatching.numPairs == 0 || cli.recalibrateCFM {
     // Stage 2, Stage 3 & Phase 5: Multi-Resolution Relational Insight CFM (γ ∈ {1.0, 0.5, 0.0}) & Latent Harmonization CFM
     let cfmStats = trainer.trainAndCalibrateFlowMatching(
         fullTokens: cfmFullTokens,

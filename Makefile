@@ -4,7 +4,7 @@ EPOCHS ?= 60
 WEIGHTS ?= .tmp/weights.safetensors
 REPORT ?= .tmp/verification_report.md
 DROPOUT ?= 0.25
-REL_EPOCHS ?= 12
+REL_EPOCHS ?= 15
 AE_WEIGHTS ?= .tmp/weights_ae.safetensors
 
 export PATH := /usr/local/cuda/bin:$(PATH)

@@ -301,22 +301,69 @@ public final class MLXLocalAttention: Module, @unchecked Sendable {
         super.init()
     }
 
+    private struct TableKey: Hashable {
+        let time: Int
+        let headDim: Int
+        let windowSize: Int
+    }
+
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var tableCache: [TableKey: (cos: MLXArray?, sin: MLXArray?, mask: MLXArray)] = [:]
+
+    private static func cachedTables(time: Int, headDim: Int, windowSize: Int) -> (cos: MLXArray?, sin: MLXArray?, mask: MLXArray) {
+        let key = TableKey(time: time, headDim: headDim, windowSize: windowSize)
+        cacheLock.lock()
+        if let hit = tableCache[key] {
+            cacheLock.unlock()
+            return hit
+        }
+        cacheLock.unlock()
+
+        let half = headDim / 2
+        let cosArr: MLXArray?
+        let sinArr: MLXArray?
+        if half > 0 {
+            let (cosFlat, sinFlat) = LocalSlidingWindowAttention.ropeTables(time: time, headDim: headDim)
+            cosArr = MLXArray(cosFlat, [1, time, 1, half])
+            sinArr = MLXArray(sinFlat, [1, time, 1, half])
+        } else {
+            cosArr = nil
+            sinArr = nil
+        }
+        var maskFlat = [Float](repeating: -1e9, count: time * time)
+        for t in 0..<time {
+            let sStart = max(0, t - windowSize + 1)
+            for s in sStart...t {
+                maskFlat[t * time + s] = 0.0
+            }
+        }
+        let mask = MLXArray(maskFlat, [1, 1, time, time])
+        if let c = cosArr, let s = sinArr {
+            eval(c, s, mask)
+        } else {
+            eval(mask)
+        }
+
+        let entry = (cos: cosArr, sin: sinArr, mask: mask)
+        cacheLock.lock()
+        tableCache[key] = entry
+        cacheLock.unlock()
+        return entry
+    }
+
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let batch = x.shape[0]
         let time = x.shape[1]
         let headDim = dim / numHeads
         let half = headDim / 2
+        let tables = Self.cachedTables(time: time, headDim: headDim, windowSize: windowSize)
 
         let normed = mlxLayerNorm(x, gamma: normGamma, beta: normBeta)
         var q = (matmul(normed, wQ) + bQ).reshaped([batch, time, numHeads, headDim])
         var k = (matmul(normed, wK) + bK).reshaped([batch, time, numHeads, headDim])
         let v = (matmul(normed, wV) + bV).reshaped([batch, time, numHeads, headDim]).transposed(0, 2, 1, 3) // [B, H, T, headDim]
 
-        if half > 0 {
-            let (cosFlat, sinFlat) = LocalSlidingWindowAttention.ropeTables(time: time, headDim: headDim)
-            let cosArr = MLXArray(cosFlat, [1, time, 1, half])
-            let sinArr = MLXArray(sinFlat, [1, time, 1, half])
-
+        if half > 0, let cosArr = tables.cos, let sinArr = tables.sin {
             let q1 = q[0..., 0..., 0..., 0..<half]
             let q2 = q[0..., 0..., 0..., half..<headDim]
             q = concatenated([q1 * cosArr - q2 * sinArr, q1 * sinArr + q2 * cosArr], axis: -1)
@@ -330,15 +377,7 @@ public final class MLXLocalAttention: Module, @unchecked Sendable {
         let kHeadsT = k.transposed(0, 2, 3, 1) // [B, H, headDim, T]
         let scale = 1.0 / sqrt(Float(max(1, headDim)))
 
-        var maskFlat = [Float](repeating: -1e9, count: time * time)
-        for t in 0..<time {
-            let sStart = max(0, t - windowSize + 1)
-            for s in sStart...t {
-                maskFlat[t * time + s] = 0.0
-            }
-        }
-        let mask = MLXArray(maskFlat, [1, 1, time, time])
-        let scores = matmul(qHeads, kHeadsT) * scale + mask
+        let scores = matmul(qHeads, kHeadsT) * scale + tables.mask
         let probs = softmax(scores, axis: -1)
         let attended = matmul(probs, v).transposed(0, 2, 1, 3).reshaped([batch, time, dim])
         let attnOut = matmul(attended, wOut) + bOut
@@ -628,6 +667,12 @@ public final class MLXDualStreamRelationalModule: Module, @unchecked Sendable {
     // Bidirectional_CrossAttention_Layer parameters
     public var eEcho: MLXArray
     public var eTopic: MLXArray
+    public var convRelLL1: MLXConv1D3
+    public var convRelLL2: MLXConv1D3
+    public var convRelHH1: MLXConv1D3
+    public var convRelHH2: MLXConv1D3
+    public var wPoolLL: MLXArray
+    public var wPoolHH: MLXArray
     public var wQLL: MLXArray
     public var bQLL: MLXArray
     public var wKLL: MLXArray
@@ -684,6 +729,32 @@ public final class MLXDualStreamRelationalModule: Module, @unchecked Sendable {
 
         self.eEcho = MLXArray(weights.eEcho, [d])
         self.eTopic = MLXArray(weights.eTopic, [d])
+        self.convRelLL1 = MLXConv1D3(
+            inDim: d,
+            outDim: d,
+            w: MLXArray(weights.convRelLL1.w, [3, d, d]),
+            b: MLXArray(weights.convRelLL1.b, [d])
+        )
+        self.convRelLL2 = MLXConv1D3(
+            inDim: d,
+            outDim: d,
+            w: MLXArray(weights.convRelLL2.w, [3, d, d]),
+            b: MLXArray(weights.convRelLL2.b, [d])
+        )
+        self.convRelHH1 = MLXConv1D3(
+            inDim: 2 * d,
+            outDim: d,
+            w: MLXArray(weights.convRelHH1.w, [3, 2 * d, d]),
+            b: MLXArray(weights.convRelHH1.b, [d])
+        )
+        self.convRelHH2 = MLXConv1D3(
+            inDim: d,
+            outDim: d,
+            w: MLXArray(weights.convRelHH2.w, [3, d, d]),
+            b: MLXArray(weights.convRelHH2.b, [d])
+        )
+        self.wPoolLL = MLXArray(weights.wPoolLL, [d, 2])
+        self.wPoolHH = MLXArray(weights.wPoolHH, [d, 2])
         self.wQLL = MLXArray(weights.wQLL, [d, d])
         self.bQLL = MLXArray(weights.bQLL, [d])
         self.wKLL = MLXArray(weights.wKLL, [d, d])
@@ -745,6 +816,19 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
     public var decoder: MLXHawkConditionalDecoder
     public var relational: MLXDualStreamRelationalModule
     public var flowMatchingWeights: FlowMatchingWeights
+    public var isTokenEmbeddingFrozen: Bool = false
+
+    /// Default 128 MB MLX buffer cache limit for bounded VRAM execution on CUDA / Metal.
+    public static let lowMemoryCacheLimitBytes = 128 * 1024 * 1024
+
+    public static func configureLowMemoryCache(limitBytes: Int = lowMemoryCacheLimitBytes) {
+        MLX.Memory.cacheLimit = limitBytes
+        MLX.Memory.clearCache()
+    }
+
+    public static func clearMemoryCache() {
+        MLX.Memory.clearCache()
+    }
 
     public init(weights: SWTHawkWeights) {
         self.vocabSize = weights.vocabSize
@@ -814,12 +898,17 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
     public func forwardDualStream(
         senderIds: MLXArray,
         receiverIds: MLXArray,
-        pe: MLXArray
+        pe: MLXArray,
+        dropoutMaskLL: MLXArray? = nil,
+        dropoutMaskHH: MLXArray? = nil,
+        tokenKeepMaskS: MLXArray? = nil,
+        tokenKeepMaskC: MLXArray? = nil
     ) -> (
         phiLL: MLXArray,
         phiHH: MLXArray,
         zRel: MLXArray,
         zContent: MLXArray,
+        uContent: MLXArray,
         logitsArchT4: MLXArray,
         logitsTopoT4: MLXArray,
         logitsArchT2: MLXArray,
@@ -884,7 +973,6 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         let pairC = maskC * shiftTime(maskC)
         let lenS = maximum(sum(maskS, axis: 1, keepDims: true), MLXArray(Float(1.0))) // [B, 1, 1]
         let lenC = maximum(sum(maskC, axis: 1, keepDims: true), MLXArray(Float(1.0)))
-        let tauS = (cumsum(maskS, axis: 1) / lenS) * maskS
         let tauC = (cumsum(maskC, axis: 1) / lenC) * maskC
 
         func normalizeOverTime(_ w: MLXArray) -> MLXArray {
@@ -892,16 +980,15 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         }
         let wMeanS = normalizeOverTime(pairS)
         let wMeanC = normalizeOverTime(pairC)
-        let omS = maximum(MLXArray(Float(0.0)), 1.0 - tauS)
         let omC = maximum(MLXArray(Float(0.0)), 1.0 - tauC)
-        let wEarlyS = normalizeOverTime(pairS * omS * omS)
         let wEarlyC = normalizeOverTime(pairC * omC * omC)
-        let wLateS = normalizeOverTime(pairS * tauS * tauS * tauS)
         let wLateC = normalizeOverTime(pairC * tauC * tauC * tauC)
 
         // 2. Raw embeddings & Multi-Scale Haar Wavelet Cross-Coherence on the first cohProjDim channels
-        let eRawS = tokenEmbedding[senderIds] * maskS
-        let eRawC = tokenEmbedding[receiverIds] * maskC
+        let embLookupS = isTokenEmbeddingFrozen ? stopGradient(tokenEmbedding[senderIds]) : tokenEmbedding[senderIds]
+        let embLookupC = isTokenEmbeddingFrozen ? stopGradient(tokenEmbedding[receiverIds]) : tokenEmbedding[receiverIds]
+        let eRawS = embLookupS * maskS
+        let eRawC = embLookupC * maskC
         let eCohS = eRawS[0..., 0..., 0..<cohProjDim]
         let eCohC = eRawC[0..., 0..., 0..<cohProjDim]
         let (ca1RawS, cd1RawS, ca2RawS, _) = swtBranch.decompose(eCohS)
@@ -958,204 +1045,201 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         let alphaArr = MLXArray(relational.alphaRel, [vocabSize, 1])
         let alphaS = alphaArr[senderIds] // [B, T, 1]
         let alphaC = alphaArr[receiverIds]
+        let effAlphaS = if let m = tokenKeepMaskS { alphaS * m } else { alphaS }
+        let effAlphaC = if let m = tokenKeepMaskC { alphaC * m } else { alphaC }
         let rootD = sqrt(Float(d))
         let eNormS = l2NormalizeRows(eRawS) * rootD * maskS
         let eNormC = l2NormalizeRows(eRawC) * rootD * maskC
         let echo = l2NormalizeRows(relational.eEcho.reshaped([1, 1, d])) * rootD
         let topic = l2NormalizeRows(relational.eTopic.reshaped([1, 1, d])) * (0.12 * rootD)
-        let eRelS = (alphaS * eNormS + (1.0 - alphaS) * (gS * echo + (1.0 - gS) * topic) + 0.25 * gS * echo + 0.05 * pe) * maskS
-        let eRelC = (alphaC * eNormC + (1.0 - alphaC) * (gC * echo + (1.0 - gC) * topic) + 0.25 * gC * echo + 0.05 * pe) * maskC
-        let uContS = sum(wMeanS * (1.0 - 0.5 * alphaS) * eRawS, axis: 1)
-        let uContC = sum(wMeanC * (1.0 - 0.5 * alphaC) * eRawC, axis: 1)
+        let eRelS = (effAlphaS * eNormS + (1.0 - effAlphaS) * (gS * echo + (1.0 - gS) * topic) + 0.25 * gS * echo + 0.05 * pe) * maskS
+        let eRelC = (effAlphaC * eNormC + (1.0 - effAlphaC) * (gC * echo + (1.0 - gC) * topic) + 0.25 * gC * echo + 0.05 * pe) * maskC
+        let uContS = sum(wMeanS * (1.0 - 0.8 * alphaS) * eRawS, axis: 1)
+        let uContC = sum(wMeanC * (1.0 - 0.8 * alphaC) * eRawC, axis: 1)
+        let uContent = concatenated([uContS, uContC], axis: -1) // [B, 2D]
 
-        // 4. Wavelet transition kernels derived from swtBranch.convCA2 taps & RG-LRU decay from hawkBranch[0].lambda
-        let diagIdx = MLXArray((0..<d).map { Int32($0 * d + $0) })
-        let nextIdx = MLXArray((0..<d).map { Int32((($0 + 1) % d) * d + $0) })
-        func kernel(_ tap: Int) -> MLXArray {
-            let flat = swtBranch.convCA2.w[tap].reshaped([d * d])
-            return (1.0 + 0.5 * (flat[diagIdx] + flat[nextIdx])).reshaped([1, 1, d])
-        }
-        let k0 = kernel(0)
-        let k1 = kernel(1)
-        let k2 = kernel(2)
-        let (rDecay, rInput): (MLXArray, MLXArray) = if let hb0 = hawkBranch.first {
-            (pow(sigmoid(hb0.lambda), Float(0.25)).reshaped([1, 1, d]),
-             sqrt(maximum(MLXArray(Float(1e-6)), 1.0 - pow(sigmoid(hb0.lambda), Float(0.5)))).reshaped([1, 1, d]))
-        } else {
-            (MLXArray.full([1, 1, d], values: MLXArray(Float(0.85))), MLXArray.full([1, 1, d], values: MLXArray(Float(0.52))))
-        }
+        // 4. Sequence-Level Dual-Stream Subband Filtering & Shared SWT-Griffin Backbone
+        let fStride = DualStreamRelationalWeights.frameStride
+        let frameCount = max(1, (time + fStride - 1) / fStride)
+        let padLen = frameCount * fStride - time
+        let halfD = d / 2
 
-        func buildStream(
-            _ eRel: MLXArray, _ pm: MLXArray, _ wm: MLXArray, _ we: MLXArray, _ wl: MLXArray
-        ) -> (hLL: MLXArray, hHH: MLXArray) {
+        func buildSequenceFrames(_ eRel: MLXArray, _ pm: MLXArray) -> (frameLL: MLXArray, frameHH: MLXArray, fMask: MLXArray) {
             let (ca1, cd1, ca2, cd2) = swtBranch.decompose(eRel)
-            let aFull = broadcast(rDecay, to: [batch, time, d])
-            let h = MLXLinearScan.scan(aFull, rInput * eRel)
-            let hPrev = shiftTime(h)
             let ePrev1 = shiftTimeReplicate(eRel)
             let ePrev2 = shiftTimeReplicate(ePrev1)
-            func channelMix3(_ x: MLXArray) -> MLXArray {
-                let d = x.dim(-1)
-                func roll(_ k: Int) -> MLXArray {
-                    return concatenated([x[0..., 0..., k..<d], x[0..., 0..., 0..<k]], axis: -1)
-                }
-                return 0.6 * roll(7) - 0.4 * roll(11) + 0.5 * roll(4)
-            }
             let ca1Prev = shiftTimeReplicate(ca1)
-            let pBi = channelMix(ePrev1) * k0 * (eRel * k1) * pm
-            let pBi2 = channelMix2(ePrev1) * k2 * (eRel * k0) * pm
-            let pBi3 = channelMix3(ePrev1) * k1 * (eRel * k2) * pm
-            let pSkip = channelMixSkip(ePrev2) * k1 * (eRel * k2) * pm
-            let pTri = channelMix(ca1Prev) * k1 * (cd1 * k2) * pm
-            let pTri2 = channelMix2(ca1Prev) * k0 * (cd1 * k1) * pm
-            let pCD2 = channelMix(ca2) * k0 * (cd2 * k2) * pm
-            let dT = (h - hPrev) * eRel * pm
-            let tau = MLXArray(Float(0.45))
-            let zero = MLXArray(Float(0.0))
-            func soft(_ v: MLXArray) -> MLXArray {
-                return maximum(zero, v - tau) - maximum(zero, -v - tau)
-            }
-            let vLLA = soft(pBi + 0.55 * pSkip + 0.5 * pCD2 + 0.35 * dT)
-            let vLLB = soft(pBi3 + 0.65 * pBi2 + 0.55 * pTri - 0.45 * pSkip + 0.35 * dT)
-            let vHHA = soft(pTri + 0.85 * pBi2 + 0.45 * pSkip + 0.35 * dT)
-            let vHHB = soft(pTri2 + 0.75 * pBi3 + 0.55 * pCD2 - 0.45 * pBi + 0.35 * dT)
 
-            let wMidRaw = maximum(MLXArray(Float(0.0)), wm - 0.35 * (we + wl))
-            let wMid = normalizeOverTime(wMidRaw)
-            let winLL = stacked([
-                pool(we, vLLA), pool(wMid, vLLA), pool(wl, vLLA), pool(wm, vLLA),
-                pool(we, vLLB), pool(wMid, vLLB), pool(wl, vLLB), pool(wm, vLLB)
-            ], axis: 1) // [B, 8, D]
-            let winHH = stacked([
-                pool(we, vHHA), pool(wMid, vHHA), pool(wl, vHHA), pool(wm, vHHA),
-                pool(we, vHHB), pool(wMid, vHHB), pool(wl, vHHB), pool(wm, vHHB)
-            ], axis: 1)
+            let mixPrev = channelMix(ePrev1)
+            let mixPrev2 = channelMix2(ePrev1)
+            let mixSkip = channelMixSkip(ePrev2)
+            let mixCA1Prev = channelMix2(ca1Prev)
+            let mixCA2 = channelMix(ca2)
 
-            func backbone(_ x: MLXArray) -> MLXArray {
-                let fSWT = swtBranch(x)
-                var tFeat = x
-                for block in hawkBranch {
-                    tFeat = block.forward(tFeat).out
-                }
-                return x + 0.25 * fusion(fSWT: fSWT, tFeat: tFeat)
+            let bi1 = mixPrev * eRel * pm
+            let biSkip = mixSkip * eRel * pm
+            let triDetail = mixCA1Prev * cd1 * pm
+
+            let inLL1 = (bi1 + 0.50 * cd2 * mixCA2) * pm
+            let inLL2 = (biSkip + 0.50 * triDetail) * pm
+            let inHH1 = concatenated([cd1 * (0.40 + abs(mixPrev)) * pm, abs(cd1) * abs(bi1) * pm], axis: -1)
+            let inHH2 = (triDetail + 0.65 * cd2 * mixPrev2) * pm
+
+            var seqLL = (mlxSiLU(relational.convRelLL1(inLL1)) + mlxSiLU(relational.convRelLL2(inLL2))) * pm
+            var seqHH = (mlxSiLU(relational.convRelHH1(inHH1)) + mlxSiLU(relational.convRelHH2(inHH2))) * pm
+            var pmPad = pm
+
+            if padLen > 0 {
+                let padD = MLXArray.zeros([batch, padLen, d])
+                let padM = MLXArray.zeros([batch, padLen, 1])
+                seqLL = concatenated([seqLL, padD], axis: 1)
+                seqHH = concatenated([seqHH, padD], axis: 1)
+                pmPad = concatenated([pmPad, padM], axis: 1)
             }
-            return (backbone(winLL), backbone(winHH))
+
+            let seqLL4 = seqLL.reshaped([batch, frameCount, fStride, d])
+            let seqHH4 = seqHH.reshaped([batch, frameCount, fStride, d])
+            let pm4 = pmPad.reshaped([batch, frameCount, fStride, 1])
+            let fCount = sum(pm4, axis: 2) // [B, frameCount, 1]
+            let fMask = (fCount .> 0).asType(.float32) // [B, frameCount, 1]
+            let denom = maximum(fCount, MLXArray(Float(1.0)))
+            let frameLL = (sum(seqLL4, axis: 2) / denom) * fMask
+            let frameHH = (sum(seqHH4, axis: 2) / denom) * fMask
+            return (frameLL, frameHH, fMask)
         }
 
-        let (hLLS, hHHS) = buildStream(eRelS, pairS, wMeanS, wEarlyS, wLateS)
-        let (hLLC, hHHC) = buildStream(eRelC, pairC, wMeanC, wEarlyC, wLateC)
+        let (frameLLS, frameHHS, fMaskS) = buildSequenceFrames(eRelS, pairS)
+        let (frameLLC, frameHHC, fMaskC) = buildSequenceFrames(eRelC, pairC)
 
-        // 5. Subband Bidirectional Cross-Attention over the 8 Dual-Bank temporal windows (0..3 = Bank A, 4..7 = Bank B)
-        let qLLC = matmul(hLLC, relational.wQLL) + relational.bQLL
-        let kLLS = matmul(hLLS, relational.wKLL) + relational.bKLL
-        let vLLS = matmul(hLLS, relational.wVLL) + relational.bVLL
-        let qHHC = matmul(hHHC, relational.wQHH) + relational.bQHH
-        let kHHS = matmul(hHHS, relational.wKHH) + relational.bKHH
-        let vHHS = matmul(hHHS, relational.wVHH) + relational.bVHH
+        let allFrames = concatenated([frameLLS, frameHHS, frameLLC, frameHHC], axis: 0) // [4 * B, frameCount, D]
+        let allMasks = concatenated([fMaskS, fMaskS, fMaskC, fMaskC], axis: 0)
+        let fSWTAll = swtBranch(allFrames)
+        var tFeatAll = allFrames
+        for block in hawkBranch {
+            tFeatAll = block.forward(tFeatAll).out
+        }
+        let hAll = (allFrames + 0.25 * fusion(fSWT: fSWTAll, tFeat: tFeatAll)) * allMasks
+        let hLLS = hAll[0..<batch]
+        let hHHS = hAll[batch..<(2 * batch)]
+        let hLLC = hAll[(2 * batch)..<(3 * batch)]
+        let hHHC = hAll[(3 * batch)..<(4 * batch)]
+
+        // 5. Subband Bidirectional Cross-Attention & Split-Horizon Salience Pooling
         let cohProjLL = matmul(psiCoh, relational.wCohLL) + relational.bCohLL
         let cohProjHH = matmul(psiCoh, relational.wCohHH) + relational.bCohHH
-
         let scale = 1.0 / sqrt(Float(max(1, d)))
-        let attnLL = matmul(softmax(matmul(qLLC, kLLS.transposed(0, 2, 1)) * scale, axis: -1), vLLS)
-        let attnHH = matmul(softmax(matmul(qHHC, kHHS.transposed(0, 2, 1)) * scale, axis: -1), vHHS)
+        let gBar = 0.25 + 0.75 * s6
 
-        func win(_ x: MLXArray, _ i: Int) -> MLXArray {
-            return x[0..., i, 0...] // [B, D]
+        let lenFS = maximum(sum(fMaskS, axis: 1, keepDims: true), MLXArray(Float(1.0)))
+        let lenFC = maximum(sum(fMaskC, axis: 1, keepDims: true), MLXArray(Float(1.0)))
+        let tauFS = (cumsum(fMaskS, axis: 1) / lenFS) * fMaskS
+        let tauFC = (cumsum(fMaskC, axis: 1) / lenFC) * fMaskC
+        let omFS = maximum(MLXArray(Float(0.0)), 1.0 - tauFS)
+        let omFC = maximum(MLXArray(Float(0.0)), 1.0 - tauFC)
+        let wMeanFS = normalizeOverTime(fMaskS)
+        let wEarlyFS = normalizeOverTime(fMaskS * omFS * omFS)
+        let wLateFS = normalizeOverTime(fMaskS * tauFS * tauFS)
+        let wMeanFC = normalizeOverTime(fMaskC)
+        let wEarlyFC = normalizeOverTime(fMaskC * omFC * omFC)
+        let wLateFC = normalizeOverTime(fMaskC * tauFC * tauFC)
+
+        let keyBiasS = (1.0 - fMaskS).transposed(0, 2, 1) * (-1e4)
+        let keyBiasC = (1.0 - fMaskC).transposed(0, 2, 1) * (-1e4)
+        let salBiasS = (1.0 - fMaskS) * (-1e4)
+        let salBiasC = (1.0 - fMaskC) * (-1e4)
+
+        func computeSubbandPhi(
+            hS: MLXArray,
+            hC: MLXArray,
+            wQ: MLXArray,
+            bQ: MLXArray,
+            wK: MLXArray,
+            bK: MLXArray,
+            wV: MLXArray,
+            bV: MLXArray,
+            wPool: MLXArray,
+            cohProj: MLXArray
+        ) -> MLXArray {
+            let qC = (matmul(hC, wQ) + bQ) * fMaskC
+            let kS = (matmul(hS, wK) + bK) * fMaskS
+            let vS = (matmul(hS, wV) + bV) * fMaskS
+            let qS = (matmul(hS, wQ) + bQ) * fMaskS
+            let kC = (matmul(hC, wK) + bK) * fMaskC
+            let vC = (matmul(hC, wV) + bV) * fMaskC
+
+            let attnCS = matmul(softmax(matmul(qC, kS.transposed(0, 2, 1)) * scale + keyBiasS, axis: -1), vS) * fMaskC
+            let attnSC = matmul(softmax(matmul(qS, kC.transposed(0, 2, 1)) * scale + keyBiasC, axis: -1), vC) * fMaskS
+
+            let salRawS = softmax(matmul(hS, wPool) + salBiasS, axis: 1) * fMaskS
+            let salRawC = softmax(matmul(hC, wPool) + salBiasC, axis: 1) * fMaskC
+            let wSalS0 = normalizeOverTime(salRawS[0..., 0..., 0..<1])
+            let wSalS1 = normalizeOverTime(salRawS[0..., 0..., 1..<2])
+            let wSalC0 = normalizeOverTime(salRawC[0..., 0..., 0..<1])
+            let wSalC1 = normalizeOverTime(salRawC[0..., 0..., 1..<2])
+
+            let zS = hS + 0.50 * kS
+            let zC = hC + 0.50 * qC
+
+            let sEarlyPool = pool(wEarlyFS, zS)
+            let sLatePool = pool(wLateFS, zS)
+            let sMeanPool = pool(wMeanFS, zS)
+            let sSal0Pool = pool(wSalS0, zS)
+            let sSal1Pool = pool(wSalS1, zS)
+            let cEarlyPool = pool(wEarlyFC, zC)
+            let cLatePool = pool(wLateFC, zC)
+            let cMeanPool = pool(wMeanFC, zC)
+            let cSal0Pool = pool(wSalC0, zC)
+            let cSal1Pool = pool(wSalC1, zC)
+
+            let interC = (attnCS + 0.50 * (hC * attnCS) - 0.35 * abs(hC - attnCS)) * fMaskC
+            let interS = (attnSC + 0.35 * (hS * attnSC)) * fMaskS
+            let interCEarly = pool(wEarlyFC, interC)
+            let interCLate = pool(wLateFC, interC)
+            let interCMean = pool(wMeanFC, interC)
+            let interSMean = pool(wMeanFS, interS)
+
+            let betaLate = clip01(((lenC2 / lenS2) - 0.62) / 0.12)
+            let betaEarly = 1.0 - betaLate
+
+            let sT4 = 0.40 * sMeanPool + 0.60 * sLatePool + 0.25 * (sLatePool - sEarlyPool) + 0.25 * sSal1Pool
+            let cT4 = 0.20 * cMeanPool + 0.80 * cLatePool + 0.35 * (cLatePool - cEarlyPool) + 0.25 * cSal1Pool
+            let sT2 = 0.70 * sEarlyPool + 0.30 * sMeanPool + 0.25 * (sEarlyPool - sLatePool) + 0.20 * sSal0Pool
+            let cT2 = 0.50 * cMeanPool + 0.50 * cLatePool + 0.30 * (cLatePool - cEarlyPool) + 0.25 * cSal0Pool
+
+            let b0 = betaLate * (0.85 * cT4 + 0.50 * sT4 + 0.45 * abs(sT4 - cT4) + 0.35 * (sT4 * cT4))
+            let b1 = betaLate * (0.85 * cT4 - 0.40 * sT4 + 0.50 * (cLatePool - cEarlyPool) + gBar * (0.75 * interCLate + 0.25 * interCMean))
+            let b2 = betaEarly * (0.85 * cT2 + 0.50 * sT2 + 0.45 * abs(sT2 - cT2) + 0.35 * (sT2 * cT2))
+            let b3 = betaEarly * (0.85 * cT2 - 0.40 * sT2 + 0.45 * (cT2 - sEarlyPool) + gBar * (0.60 * interCEarly + 0.40 * interCMean))
+            let uCross = gBar * (betaLate * interCLate + betaEarly * interCMean) + 0.35 * interSMean + cohProj
+
+            return concatenated([b0, b1, b2, b3, uCross], axis: -1)
         }
-        let gBar = 0.2 + 0.8 * s6
-        let betaLate = clip01((lenC2 - 110.0) / 20.0)
-        let betaEarly = 1.0 - betaLate
 
-        let sLAMean = win(hLLS, 3) + win(kLLS, 3)
-        let sLAEarly = win(hLLS, 0) + win(kLLS, 0)
-        let sLAMid = win(hLLS, 1) + win(kLLS, 1)
-        let sLALate = win(hLLS, 2) + win(kLLS, 2)
-        let cLAMean = win(hLLC, 3) + win(qLLC, 3)
-        let cLAEarly = win(hLLC, 0) + win(qLLC, 0)
-        let cLAMid = win(hLLC, 1) + win(qLLC, 1)
-        let cLALate = win(hLLC, 2) + win(qLLC, 2)
-
-        let sLBMean = win(hLLS, 7) + win(kLLS, 7)
-        let sLBEarly = win(hLLS, 4) + win(kLLS, 4)
-        let sLBMid = win(hLLS, 5) + win(kLLS, 5)
-        let sLBLate = win(hLLS, 6) + win(kLLS, 6)
-        let cLBMean = win(hLLC, 7) + win(qLLC, 7)
-        let cLBEarly = win(hLLC, 4) + win(qLLC, 4)
-        let cLBMid = win(hLLC, 5) + win(qLLC, 5)
-        let cLBLate = win(hLLC, 6) + win(qLLC, 6)
-
-        let sLAT4 = 0.45 * sLAMean + 0.55 * sLALate + 0.20 * (sLALate - sLAEarly)
-        let cLAT4 = 0.25 * cLAMean + 0.75 * cLALate + 0.35 * (cLALate - cLAEarly)
-        let diffLAT4 = 0.50 * abs(sLAT4 - cLAT4) + 0.45 * (cLALate - cLAEarly) + 0.35 * (cLAMid - sLAMid)
-
-        let sLBT4 = 0.45 * sLBMean + 0.55 * sLBLate + 0.20 * (sLBLate - sLBEarly)
-        let cLBT4 = 0.25 * cLBMean + 0.75 * cLBLate + 0.35 * (cLBLate - cLBEarly)
-        let diffLBT4 = 0.50 * abs(sLBT4 - cLBT4) + 0.45 * (cLBLate - cLBEarly) + 0.35 * (cLBMid - sLBMid)
-
-        let sLAT2 = 0.55 * sLAEarly + 0.45 * sLAMid + 0.25 * (sLAEarly - sLALate)
-        let cLAT2 = 0.50 * cLAMean + 0.50 * cLALate + 0.35 * (cLALate - cLAEarly)
-        let diffLAT2 = 0.50 * abs(sLAT2 - cLAT2) + 0.45 * (cLALate - cLAEarly) + 0.35 * (cLAEarly - sLAEarly)
-
-        let sLBT2 = 0.55 * sLBEarly + 0.45 * sLBMid + 0.25 * (sLBEarly - sLBLate)
-        let cLBT2 = 0.50 * cLBMean + 0.50 * cLBLate + 0.35 * (cLBLate - cLBEarly)
-        let diffLBT2 = 0.50 * abs(sLBT2 - cLBT2) + 0.45 * (cLBLate - cLBEarly) + 0.35 * (cLBEarly - sLBEarly)
-
-        let b0L = betaLate * (0.85 * cLAT4 + 0.55 * sLAT4 + diffLAT4 + 0.35 * (sLAT4 * cLAT4) + 0.35 * cLAMid)
-        let b1L = betaLate * (0.85 * cLBT4 - 0.35 * sLBT4 + diffLBT4 + 0.35 * (sLBT4 * cLBT4) + 0.35 * cLBMid)
-        let b2L = betaEarly * (0.85 * cLAT2 + 0.55 * sLAT2 + diffLAT2 + 0.35 * (sLAT2 * cLAT2) + 0.40 * cLAEarly + 0.35 * cLAMid)
-        let b3L = betaEarly * (0.85 * cLBT2 - 0.35 * sLBT2 + diffLBT2 + 0.35 * (sLBT2 * cLBT2) + 0.40 * cLBEarly + 0.35 * cLBMid)
-        let crossL = gBar * (win(attnLL, 3) + win(attnLL, 7)) + 0.45 * (cLALate - cLAEarly) + cohProjLL
-        let phiLL = concatenated([b0L, b1L, b2L, b3L, crossL], axis: -1) // [B, 5D]
-
-        let sHAMean = win(hHHS, 3) + win(kHHS, 3)
-        let sHAEarly = win(hHHS, 0) + win(kHHS, 0)
-        let sHAMid = win(hHHS, 1) + win(kHHS, 1)
-        let sHALate = win(hHHS, 2) + win(kHHS, 2)
-        let cHAMean = win(hHHC, 3) + win(qHHC, 3)
-        let cHAEarly = win(hHHC, 0) + win(qHHC, 0)
-        let cHAMid = win(hHHC, 1) + win(qHHC, 1)
-        let cHALate = win(hHHC, 2) + win(qHHC, 2)
-
-        let sHBMean = win(hHHS, 7) + win(kHHS, 7)
-        let sHBEarly = win(hHHS, 4) + win(kHHS, 4)
-        let sHBMid = win(hHHS, 5) + win(kHHS, 5)
-        let sHBLate = win(hHHS, 6) + win(kHHS, 6)
-        let cHBMean = win(hHHC, 7) + win(qHHC, 7)
-        let cHBEarly = win(hHHC, 4) + win(qHHC, 4)
-        let cHBMid = win(hHHC, 5) + win(qHHC, 5)
-        let cHBLate = win(hHHC, 6) + win(qHHC, 6)
-
-        let sHAT4 = 0.35 * sHAMean + 0.65 * sHALate + 0.20 * (sHALate - sHAEarly)
-        let cHAT4 = 0.85 * cHALate + 0.15 * cHAMean + 0.35 * (cHALate - cHAEarly)
-        let diffHAT4 = 0.50 * abs(sHAT4 - cHAT4) + 0.45 * (cHALate - cHAEarly) + 0.35 * (cHAMid - sHAMid)
-
-        let sHBT4 = 0.35 * sHBMean + 0.65 * sHBLate + 0.20 * (sHBLate - sHBEarly)
-        let cHBT4 = 0.85 * cHBLate + 0.15 * cHBMean + 0.35 * (cHBLate - cHBEarly)
-        let diffHBT4 = 0.50 * abs(sHBT4 - cHBT4) + 0.45 * (cHBLate - cHBEarly) + 0.35 * (cHBMid - sHBMid)
-
-        let sHAT2 = 0.55 * sHAEarly + 0.45 * sHAMid + 0.25 * (sHAEarly - sHALate)
-        let cHAT2 = 0.50 * cHAMean + 0.50 * cHALate + 0.35 * (cHALate - cHAEarly)
-        let diffHAT2 = 0.50 * abs(sHAT2 - cHAT2) + 0.45 * (cHALate - cHAEarly) + 0.35 * (cHAEarly - sHAEarly)
-
-        let sHBT2 = 0.55 * sHBEarly + 0.45 * sHBMid + 0.25 * (sHBEarly - sHBLate)
-        let cHBT2 = 0.50 * cHBMean + 0.50 * cHBLate + 0.35 * (cHBLate - cHBEarly)
-        let diffHBT2 = 0.50 * abs(sHBT2 - cHBT2) + 0.45 * (cHBLate - cHBEarly) + 0.35 * (cHBEarly - sHBEarly)
-
-        let b0H = betaLate * (0.85 * cHAT4 + 0.55 * sHAT4 + diffHAT4 + 0.35 * (sHAT4 * cHAT4) + 0.40 * cHAEarly + 0.35 * cHAMid)
-        let b1H = betaLate * (0.85 * cHBT4 - 0.35 * sHBT4 + diffHBT4 + 0.35 * (sHBT4 * cHBT4) + 0.40 * cHBEarly + 0.35 * cHBMid)
-        let b2H = betaEarly * (0.85 * cHAT2 + 0.55 * sHAT2 + diffHAT2 + 0.35 * (sHAT2 * cHAT2) + 0.50 * cHAEarly + 0.35 * cHAMid)
-        let b3H = betaEarly * (0.85 * cHBT2 - 0.35 * sHBT2 + diffHBT2 + 0.35 * (sHBT2 * cHBT2) + 0.50 * cHBEarly + 0.35 * cHBMid)
-        let crossH = betaEarly * (win(attnHH, 3) + win(attnHH, 7) + 0.50 * cHAEarly) + betaLate * (win(attnHH, 2) + win(attnHH, 6) + 0.55 * cHAEarly) + cohProjHH
-        let phiHH = concatenated([b0H, b1H, b2H, b3H, crossH], axis: -1)
+        let phiLL = computeSubbandPhi(
+            hS: hLLS, hC: hLLC,
+            wQ: relational.wQLL, bQ: relational.bQLL,
+            wK: relational.wKLL, bK: relational.bKLL,
+            wV: relational.wVLL, bV: relational.bVLL,
+            wPool: relational.wPoolLL, cohProj: cohProjLL
+        )
+        let phiHH = computeSubbandPhi(
+            hS: hHHS, hC: hHHC,
+            wQ: relational.wQHH, bQ: relational.bQHH,
+            wK: relational.wKHH, bK: relational.bKHH,
+            wV: relational.wVHH, bV: relational.bVHH,
+            wPool: relational.wPoolHH, cohProj: cohProjHH
+        )
 
         // 6. Latent Projection Layer & LayerNorm
-        let zLL = mlxLayerNorm(matmul(phiLL, relational.wProjLL) + relational.bProjLL, gamma: relational.normLLGamma, beta: relational.normLLBeta)
-        let zHH = mlxLayerNorm(matmul(phiHH, relational.wProjHH) + relational.bProjHH, gamma: relational.normHHGamma, beta: relational.normHHBeta)
+        let phiLLIn = if let m = dropoutMaskLL { phiLL * m } else { phiLL }
+        let phiHHIn = if let m = dropoutMaskHH { phiHH * m } else { phiHH }
+        let zLL = mlxLayerNorm(matmul(phiLLIn, relational.wProjLL) + relational.bProjLL, gamma: relational.normLLGamma, beta: relational.normLLBeta)
+        let zHH = mlxLayerNorm(matmul(phiHHIn, relational.wProjHH) + relational.bProjHH, gamma: relational.normHHGamma, beta: relational.normHHBeta)
         let zRel = concatenated([zLL, zHH], axis: -1) // [B, 1024]
 
-        let half = latentDim / 2
+        let half = relational.latentDim / 2
         let zContent = mlxLayerNorm(
-            matmul(concatenated([uContS, uContC], axis: -1), relational.wContent) + relational.bContent,
+            matmul(uContent, relational.wContent) + relational.bContent,
             gamma: MLXArray.ones([half]),
             beta: MLXArray.zeros([half])
         )
@@ -1164,7 +1248,7 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         let logitsTopoT4 = matmul(zRel, relational.wTopoT4) + relational.bTopoT4
         let logitsArchT2 = matmul(zRel, relational.wArchT2) + relational.bArchT2
         let logitsTopoT2 = matmul(zRel, relational.wTopoT2) + relational.bTopoT2
-        return (phiLL, phiHH, zRel, zContent, logitsArchT4, logitsTopoT4, logitsArchT2, logitsTopoT2)
+        return (phiLL, phiHH, zRel, zContent, uContent, logitsArchT4, logitsTopoT4, logitsArchT2, logitsTopoT2)
     }
 
     /// Chunked MLX GPU extraction of the pre-projection subband interaction tensors `(phiLL: [B × 5D], phiHH: [B × 5D])`.
@@ -1231,8 +1315,8 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         let pe = MLXArray(HawkConditionalDecoder.positionalEncoding(time: time, dim: dim), [1, time, dim])
         var zRelOut: [Float] = []
         var zContOut: [Float] = []
-        zRelOut.reserveCapacity(batch * latentDim)
-        zContOut.reserveCapacity(batch * latentDim / 2)
+        zRelOut.reserveCapacity(batch * relational.latentDim)
+        zContOut.reserveCapacity(batch * (relational.latentDim / 2))
         var start = 0
         while start < batch {
             let cur = min(chunk, batch - start)
@@ -1446,12 +1530,23 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
             items.append((bp + "bMLPDown", MLXArray(hb.bMLPDown, [d])))
         }
 
-        let half = lDim / 2
         let cohDim = DualStreamRelationalWeights.coherenceDim
         let rel = w.relational
+        let relDim = rel.latentDim
+        let relHalf = relDim / 2
         items += [
             ("relational.eEcho", MLXArray(rel.eEcho, [d])),
             ("relational.eTopic", MLXArray(rel.eTopic, [d])),
+            ("relational.convRelLL1.w", MLXArray(rel.convRelLL1.w, [3, d, d])),
+            ("relational.convRelLL1.b", MLXArray(rel.convRelLL1.b, [d])),
+            ("relational.convRelLL2.w", MLXArray(rel.convRelLL2.w, [3, d, d])),
+            ("relational.convRelLL2.b", MLXArray(rel.convRelLL2.b, [d])),
+            ("relational.convRelHH1.w", MLXArray(rel.convRelHH1.w, [3, 2 * d, d])),
+            ("relational.convRelHH1.b", MLXArray(rel.convRelHH1.b, [d])),
+            ("relational.convRelHH2.w", MLXArray(rel.convRelHH2.w, [3, d, d])),
+            ("relational.convRelHH2.b", MLXArray(rel.convRelHH2.b, [d])),
+            ("relational.wPoolLL", MLXArray(rel.wPoolLL, [d, 2])),
+            ("relational.wPoolHH", MLXArray(rel.wPoolHH, [d, 2])),
             ("relational.wQLL", MLXArray(rel.wQLL, [d, d])),
             ("relational.bQLL", MLXArray(rel.bQLL, [d])),
             ("relational.wKLL", MLXArray(rel.wKLL, [d, d])),
@@ -1468,23 +1563,23 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
             ("relational.bVHH", MLXArray(rel.bVHH, [d])),
             ("relational.wCohHH", MLXArray(rel.wCohHH, [cohDim, d])),
             ("relational.bCohHH", MLXArray(rel.bCohHH, [d])),
-            ("relational.wProjLL", MLXArray(rel.wProjLL, [5 * d, half])),
-            ("relational.bProjLL", MLXArray(rel.bProjLL, [half])),
-            ("relational.normLLGamma", MLXArray(rel.normLLGamma, [half])),
-            ("relational.normLLBeta", MLXArray(rel.normLLBeta, [half])),
-            ("relational.wProjHH", MLXArray(rel.wProjHH, [5 * d, half])),
-            ("relational.bProjHH", MLXArray(rel.bProjHH, [half])),
-            ("relational.normHHGamma", MLXArray(rel.normHHGamma, [half])),
-            ("relational.normHHBeta", MLXArray(rel.normHHBeta, [half])),
-            ("relational.wContent", MLXArray(rel.wContent, [2 * d, half])),
-            ("relational.bContent", MLXArray(rel.bContent, [half])),
-            ("relational.wArchT4", MLXArray(rel.wArchT4, [lDim, 6])),
+            ("relational.wProjLL", MLXArray(rel.wProjLL, [5 * d, relHalf])),
+            ("relational.bProjLL", MLXArray(rel.bProjLL, [relHalf])),
+            ("relational.normLLGamma", MLXArray(rel.normLLGamma, [relHalf])),
+            ("relational.normLLBeta", MLXArray(rel.normLLBeta, [relHalf])),
+            ("relational.wProjHH", MLXArray(rel.wProjHH, [5 * d, relHalf])),
+            ("relational.bProjHH", MLXArray(rel.bProjHH, [relHalf])),
+            ("relational.normHHGamma", MLXArray(rel.normHHGamma, [relHalf])),
+            ("relational.normHHBeta", MLXArray(rel.normHHBeta, [relHalf])),
+            ("relational.wContent", MLXArray(rel.wContent, [2 * d, relHalf])),
+            ("relational.bContent", MLXArray(rel.bContent, [relHalf])),
+            ("relational.wArchT4", MLXArray(rel.wArchT4, [relDim, 6])),
             ("relational.bArchT4", MLXArray(rel.bArchT4, [6])),
-            ("relational.wTopoT4", MLXArray(rel.wTopoT4, [lDim, 5])),
+            ("relational.wTopoT4", MLXArray(rel.wTopoT4, [relDim, 5])),
             ("relational.bTopoT4", MLXArray(rel.bTopoT4, [5])),
-            ("relational.wArchT2", MLXArray(rel.wArchT2, [lDim, 6])),
+            ("relational.wArchT2", MLXArray(rel.wArchT2, [relDim, 6])),
             ("relational.bArchT2", MLXArray(rel.bArchT2, [6])),
-            ("relational.wTopoT2", MLXArray(rel.wTopoT2, [lDim, 5])),
+            ("relational.wTopoT2", MLXArray(rel.wTopoT2, [relDim, 5])),
             ("relational.bTopoT2", MLXArray(rel.bTopoT2, [5]))
         ]
         relational.alphaRel = rel.alphaRel
@@ -1645,10 +1740,16 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         let rel = DualStreamRelationalWeights(
             vocabSize: vocabSize,
             dim: dim,
-            latentDim: latentDim,
+            latentDim: relational.latentDim,
             alphaRel: relational.alphaRel,
             eEcho: vals(relational.eEcho),
             eTopic: vals(relational.eTopic),
+            convRelLL1: Conv1D3Weights(inDim: dim, outDim: dim, w: vals(relational.convRelLL1.w), b: vals(relational.convRelLL1.b)),
+            convRelLL2: Conv1D3Weights(inDim: dim, outDim: dim, w: vals(relational.convRelLL2.w), b: vals(relational.convRelLL2.b)),
+            convRelHH1: Conv1D3Weights(inDim: 2 * dim, outDim: dim, w: vals(relational.convRelHH1.w), b: vals(relational.convRelHH1.b)),
+            convRelHH2: Conv1D3Weights(inDim: dim, outDim: dim, w: vals(relational.convRelHH2.w), b: vals(relational.convRelHH2.b)),
+            wPoolLL: vals(relational.wPoolLL),
+            wPoolHH: vals(relational.wPoolHH),
             wQLL: vals(relational.wQLL),
             bQLL: vals(relational.bQLL),
             wKLL: vals(relational.wKLL),

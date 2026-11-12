@@ -15,7 +15,10 @@ struct Step5DualStreamRelationalTests {
     static func makeWeights(seed: UInt64) -> (SWTHawkWeights, TextVocabulary) {
         let vocab = TextVocabulary(texts: texts)
         var w = SWTHawkWeights.makeRandom(
-            vocabSize: vocab.count, dim: 32, latentDim: 1024, mlpDim: 64,
+            vocabSize: vocab.count, dim: 32,
+            latentDim: SWTHawkShape.latentDim,
+            relationalLatentDim: SWTHawkShape.relationalLatentDim,
+            mlpDim: 64,
             encoderLayers: 1, decoderLayers: 1, serializedVocabulary: vocab.serialize(), seed: seed
         )
         w.relational.alphaRel = vocab.computeRelationalTokenGate(trainTexts: texts)
@@ -53,7 +56,7 @@ struct Step5DualStreamRelationalTests {
         let c = vocab.encode(Self.texts[1])
         let z1 = model.encodeRelational(senderTokenIDs: s, receiverTokenIDs: c)
         let z2 = model.encodeRelational(senderTokenIDs: s, receiverTokenIDs: Array(c.reversed()))
-        #expect(z1.count == 1024)
+        #expect(z1.count == w.relational.latentDim)
         var diff: Float = 0.0
         for i in 0..<z1.count {
             diff += (z1[i] - z2[i]) * (z1[i] - z2[i])

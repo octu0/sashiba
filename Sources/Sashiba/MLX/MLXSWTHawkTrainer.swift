@@ -54,9 +54,9 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
     /// Cached Nyquist harmonic basis `[1, T, latentDim]` keyed by sequence length `T`.
     private var cachedPhi: [Int: MLXArray] = [:]
 
-    /// MLX buffer cache limit at the default width.
-    public static let cacheLimitBytes = 24 << 30
-    public static let minCacheLimitBytes = 6 << 30
+    /// MLX buffer cache limit (128 MB cap to prevent unbounded CUDA buffer caching).
+    public static let cacheLimitBytes = 128 * 1024 * 1024
+    public static let minCacheLimitBytes = 128 * 1024 * 1024
 
     /// Adam step counter for bias correction on the learning rate.
     private var adamSteps = 0
@@ -65,8 +65,7 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
         self.model = model
         self.optimizer = ArrayLRAdam(learningRate: learningRate)
         self.rng = SplitMix64(seed: seed)
-        let scaled = Self.cacheLimitBytes / max(1, model.dim / 64)
-        MLX.Memory.cacheLimit = max(Self.minCacheLimitBytes, scaled)
+        MLX.Memory.cacheLimit = Self.cacheLimitBytes
     }
 
     public func updateLearningRate(_ lr: Float) {
@@ -344,14 +343,15 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
         let zFullAll = cpuModel.encode(tokens: fullTokens, batch: numDocs, time: seqLen)
         let zSumAll = cpuModel.encode(tokens: summaryTokens, batch: numDocs, time: seqLen)
 
-        // Store the principal document latent vectors (scaled by 0.01) into columns of decoder.layers[0].wH0
+        // Store the principal document latent vectors (scaled by 1/128 power-of-2) into columns of decoder.layers[0].wH0
         if !model.decoder.layers.isEmpty {
             var wH0Vals = model.decoder.layers[0].wH0.asArray(Float.self)
             let colsToStore = min(d, prototypeCount ?? numDocs)
+            let protoScale: Float = 1.0 / 128.0
             for col in 0..<colsToStore {
                 let zOff = col * lDim
                 for r in 0..<lDim {
-                    wH0Vals[r * d + col] = zFullAll[zOff + r] * 0.01
+                    wH0Vals[r * d + col] = zFullAll[zOff + r] * protoScale
                 }
             }
             model.decoder.layers[0].wH0 = MLXArray(wH0Vals, [lDim, d])

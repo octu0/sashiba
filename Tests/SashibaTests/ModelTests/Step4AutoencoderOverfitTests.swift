@@ -5,12 +5,12 @@ import MLX
 
 @Suite("Step 4: SWT-Griffin Relational Dynamics Engine & Subband CFM Verification")
 struct Step4AutoencoderOverfitTests {
-    @Test("Step 4.1: SafeTensors save and load round-trip preserves SWTHawkWeights and 1024-D latent output")
+    @Test("Step 4.1: SafeTensors save and load round-trip preserves SWTHawkWeights and 512-D latent output")
     func safeTensorsRoundTrip() throws {
         let weights = SWTHawkWeights.makeRandom(
             vocabSize: 32,
             dim: 16,
-            latentDim: 1024,
+            latentDim: SWTHawkShape.latentDim,
             encoderLayers: 2,
             decoderLayers: 2,
             serializedVocabulary: "a\nb\nc",
@@ -30,7 +30,7 @@ struct Step4AutoencoderOverfitTests {
         let weights = SWTHawkWeights.makeRandom(
             vocabSize: 16,
             dim: 16,
-            latentDim: 1024,
+            latentDim: SWTHawkShape.latentDim,
             mlpDim: 32,
             encoderLayers: 1,
             decoderLayers: 1,
@@ -57,8 +57,8 @@ struct Step4AutoencoderOverfitTests {
         #expect(trainer.weights.tokenEmbedding != weights.tokenEmbedding)
     }
 
-    @Test("Step 4.3: Overfit Test — Multi-turn interpersonal dialogue logs reconstruct via MLXSWTHawkTrainer from z ∈ R^1024")
-    func overfitDialogueLogsFrom1024DLatent() {
+    @Test("Step 4.3: Overfit Test — Multi-turn interpersonal dialogue logs reconstruct via MLXSWTHawkTrainer from z ∈ R^512")
+    func overfitDialogueLogsFrom512DLatent() {
         let sampleDialogues = [
             "初配信の弾き語りで歌っていたアコギのコード進行、今でもすごく印象に残っています。先週話していた新曲のAメロの転調、すごく綺麗に響いていましたね。制作が佳境に入ると連絡がゆっくりになるのも理解しているので、どうか喉と指先を大切にしてください。完成した曲を聴ける日を楽しみにお待ちしています。",
             "最初のコラボ企画で話していたレトロゲームのRTA挑戦、ずっと楽しみにしてたよ。先週の練習配信で言ってたボス戦の乱数調整、ちゃんとメモして覚えてるよ。連戦で疲れてるときは配信時間が短くなっても全然大丈夫だから、まずはしっかり睡眠をとってね。また次の挑戦枠で一緒に盛り上がろう。"
@@ -86,7 +86,7 @@ struct Step4AutoencoderOverfitTests {
         let weights = SWTHawkWeights.makeRandom(
             vocabSize: vocab.count,
             dim: 32,
-            latentDim: 1024,
+            latentDim: SWTHawkShape.latentDim,
             mlpDim: 64,
             encoderLayers: 1,
             decoderLayers: 1,
@@ -148,7 +148,7 @@ struct Step4AutoencoderOverfitTests {
         let weights = SWTHawkWeights.makeRandom(
             vocabSize: vocab.count,
             dim: 32,
-            latentDim: 1024,
+            latentDim: SWTHawkShape.latentDim,
             mlpDim: 64,
             encoderLayers: 1,
             decoderLayers: 1,
@@ -169,15 +169,16 @@ struct Step4AutoencoderOverfitTests {
         let zB = cpuModel.encode(tokens: idsB, batch: 1, time: seqLen)
         let zEarly = cpuModel.encode(tokens: idsEarly, batch: 1, time: seqLen)
 
+        let half = weights.latentDim / 2
         var llDiffSq: Float = 0.0
         var hhDiffSq: Float = 0.0
         var hhEarlySq: Float = 0.0
-        for c in 0..<512 {
+        for c in 0..<half {
             let dLL = zA[c] - zB[c]
-            let dHH = zA[512 + c] - zB[512 + c]
+            let dHH = zA[half + c] - zB[half + c]
             llDiffSq += dLL * dLL
             hhDiffSq += dHH * dHH
-            hhEarlySq += zEarly[512 + c] * zEarly[512 + c]
+            hhEarlySq += zEarly[half + c] * zEarly[half + c]
         }
         #expect(sqrtf(llDiffSq) < 1e-4)
         #expect(sqrtf(hhDiffSq) > 1.0)
@@ -244,7 +245,7 @@ struct Step4AutoencoderOverfitTests {
         let weights = SWTHawkWeights.makeRandom(
             vocabSize: vocab.count,
             dim: 32,
-            latentDim: 1024,
+            latentDim: SWTHawkShape.latentDim,
             mlpDim: 64,
             encoderLayers: 1,
             decoderLayers: 1,

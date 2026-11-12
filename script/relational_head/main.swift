@@ -11,9 +11,9 @@ struct RelationalHeadCLI {
     var predictionsPath: String = ".tmp/relational_head_predictions_A.json"
     var steps: Int = 300
     var maxSeqLen: Int = 512
-    var foldEpochs: Int = 12
+    var foldEpochs: Int = 15
     var relBatch: Int = 32
-    var relLR: Float = 1e-3
+    var relLR: Float = 1.4e-3
     var skipFolds: Bool = false
 
     static func parse(_ args: [String]) -> RelationalHeadCLI {
@@ -77,6 +77,8 @@ let tasks: [HeadTask] = [
     HeadTask(name: "topology_t2", useEarlyText: true, classNames: topologyNames) { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
 ]
 
+MLX.Memory.cacheLimit = 128 * 1024 * 1024
+MLX.Memory.clearCache()
 let cli = RelationalHeadCLI.parse(CommandLine.arguments)
 let config = DatasetConfiguration.load(from: cli.dataPath)
 let trainCasesAll = config.relationalDialogueCases.filter { !$0.isZeroShotUnseen }
@@ -314,6 +316,7 @@ if !cli.skipFolds {
         let line = String(format: "fold %d: %d categories, train %d, test %d, %.1fs", fold, foldCats.count, foldTrain.count, foldTest.count, Date().timeIntervalSince(start))
         foldLog.append(line)
         print("[fold \(fold)] done (\(line))")
+        MLX.Memory.clearCache()
     }
 
     let allTest = allCases.indices.filter { foldOfCategory[allCases[$0].group] != nil }
@@ -359,7 +362,7 @@ func perClassList(_ rs: [EvalResult]) -> String {
 
 var report = "# 関係性分類の汎化評価（Phase 5.1: Dual-Stream 純ニューラル `z_rel`）\n\n"
 report += "- 入力: `(senderTokenIDs, receiverTokenIDs)` の2配列のみ（連結しない Dual-Stream。$T_4$ は受信側全文、$T_2$ は受信側前半）\n"
-report += "- `neural`: `z_rel = [z_LL^rel(512); z_HH^rel(512)]`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
+report += "- `neural`: `z_rel = [z_LL^rel(\(weights.relational.latentDim / 2)); z_HH^rel(\(weights.relational.latentDim / 2))] ∈ R^\(weights.relational.latentDim)`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
 report += "- `char_ngram`: 文字 1-gram / 2-gram のハッシュ特徴（`[送信側 ; 受信側]` 連結、比較用ベースライン）\n\n"
 report += "## (A) シナリオ分割: train → unseen_test\n\n"
 report += "学習 `\(trainIndices.count)` 件、評価 `\(unseenIndices.count)` 件。`neural` は学習時に保存された校正ヘッドをそのまま適用（再学習なし）。\n\n"

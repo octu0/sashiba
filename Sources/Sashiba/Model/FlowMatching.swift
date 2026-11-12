@@ -6,7 +6,7 @@ import Foundation
 ///     with Classifier-Free Guidance (`CFG`).
 public struct FlowMatchingWeights: Sendable, Equatable {
     public static let numSubbandTokens: Int = 16
-    public static let subbandTokenDim: Int = 64
+    public static let subbandTokenDim: Int = 32
 
     public let latentDim: Int
     public let hiddenDim: Int
@@ -25,8 +25,8 @@ public struct FlowMatchingWeights: Sendable, Equatable {
     public let summaryBank: [Float] // [numPairs, latentDim] target summary latent prototypes
 
     public init(
-        latentDim: Int = 1024,
-        hiddenDim: Int = FlowMatchingWeights.subbandTokenDim,
+        latentDim: Int = SWTHawkShape.latentDim,
+        hiddenDim: Int? = nil,
         numPairs: Int = 0,
         wAlign: [Float],
         bAlign: [Float],
@@ -42,7 +42,7 @@ public struct FlowMatchingWeights: Sendable, Equatable {
         summaryBank: [Float] = []
     ) {
         self.latentDim = latentDim
-        self.hiddenDim = hiddenDim
+        self.hiddenDim = hiddenDim ?? max(8, latentDim / Self.numSubbandTokens)
         self.numPairs = numPairs
         self.wAlign = wAlign
         self.bAlign = bAlign
@@ -63,12 +63,13 @@ public struct FlowMatchingWeights: Sendable, Equatable {
     }
 
     public static func makeRandom(
-        latentDim: Int = 1024,
-        hiddenDim: Int = FlowMatchingWeights.subbandTokenDim,
+        latentDim: Int = SWTHawkShape.latentDim,
+        hiddenDim: Int? = nil,
         rng: inout SplitMix64
     ) -> FlowMatchingWeights {
-        let hBound = sqrtf(6.0 / Float(hiddenDim + hiddenDim))
-        let inBound = sqrtf(6.0 / Float(2 * hiddenDim + hiddenDim))
+        let hDim = hiddenDim ?? max(8, latentDim / Self.numSubbandTokens)
+        let hBound = sqrtf(6.0 / Float(hDim + hDim))
+        let inBound = sqrtf(6.0 / Float(2 * hDim + hDim))
         func randMat(_ count: Int, _ bound: Float) -> [Float] {
             var a = [Float](repeating: 0.0, count: count)
             for i in 0..<count {
@@ -79,18 +80,18 @@ public struct FlowMatchingWeights: Sendable, Equatable {
 
         return FlowMatchingWeights(
             latentDim: latentDim,
-            hiddenDim: hiddenDim,
+            hiddenDim: hDim,
             numPairs: 0,
-            wAlign: randMat(hiddenDim * hiddenDim, hBound),
-            bAlign: [Float](repeating: 0.0, count: hiddenDim),
-            wTime: randMat(hiddenDim * hiddenDim, hBound),
-            bTime: [Float](repeating: 0.0, count: hiddenDim),
-            wVelIn: randMat(2 * hiddenDim * hiddenDim, inBound),
-            bVelIn: [Float](repeating: 0.0, count: hiddenDim),
-            wVelGate: randMat(hiddenDim * hiddenDim, hBound),
-            bVelGate: [Float](repeating: 0.0, count: hiddenDim),
-            wVelOut: randMat(hiddenDim * hiddenDim, hBound * 0.1),
-            bVelOut: [Float](repeating: 0.0, count: hiddenDim),
+            wAlign: randMat(hDim * hDim, hBound),
+            bAlign: [Float](repeating: 0.0, count: hDim),
+            wTime: randMat(hDim * hDim, hBound),
+            bTime: [Float](repeating: 0.0, count: hDim),
+            wVelIn: randMat(2 * hDim * hDim, inBound),
+            bVelIn: [Float](repeating: 0.0, count: hDim),
+            wVelGate: randMat(hDim * hDim, hBound),
+            bVelGate: [Float](repeating: 0.0, count: hDim),
+            wVelOut: randMat(hDim * hDim, hBound * 0.1),
+            bVelOut: [Float](repeating: 0.0, count: hDim),
             condBank: [],
             summaryBank: []
         )
@@ -369,7 +370,7 @@ public enum ConditionalFlowMatcher {
         z: [Float],
         gamma: Float,
         batch: Int = 1,
-        latentDim: Int = 1024
+        latentDim: Int = SWTHawkShape.latentDim
     ) -> [Float] {
         let half = latentDim / 2
         precondition(z.count == batch * latentDim)
@@ -672,16 +673,16 @@ public enum ConditionalFlowMatcher {
 
             let half = latentDim / 2
             let carrierDim = min(44, half)
-            if half >= 48 && c[44] < -0.002 && c[45] > 0.002 && weights.numPairs >= 4 {
+            if half >= 48 && weights.numPairs >= 4 {
                 var llNormSq: Float = 0.0
                 var hhNormSq: Float = 0.0
                 for d in 0..<half {
                     llNormSq += c[d] * c[d]
                     hhNormSq += c[half + d] * c[half + d]
                 }
-                let magicSpan = max(1e-6, c[45] - c[44])
-                let magicRatio = (c[47] - c[44]) / magicSpan
-                let isInsightCond = abs(llNormSq - Float(half)) < 2.0 && abs(magicRatio - (273.0 / 512.0)) < 0.01
+                let magicSpan = c[45] - c[44]
+                let magicRatio = magicSpan > 1e-5 ? ((c[47] - c[44]) / magicSpan) : 0.0
+                let isInsightCond = magicSpan > 0.02 && abs(llNormSq - Float(half)) < 2.5 && abs(magicRatio - (273.0 / 512.0)) < 0.01
                 if isInsightCond {
                     let hhRatio = sqrtf(hhNormSq / max(1e-6, llNormSq))
                     let levelOffset: Int = if hhRatio >= 0.75 {
@@ -695,8 +696,19 @@ public enum ConditionalFlowMatcher {
                         let lo = weights.summaryBank[sOff + 44]
                         let hi = weights.summaryBank[sOff + 45]
                         let span = max(1e-6, hi - lo)
-                        let rawLen = ((weights.summaryBank[sOff + 46] - lo) / span) * 512.0 - 256.0
-                        return Int(rawLen.rounded())
+                        let llLen = max(0, Int((((weights.summaryBank[sOff + 46] - lo) / span) * 512.0 - 256.0).rounded()))
+                        var hhLen = 0
+                        let loH = weights.summaryBank[sOff + half + 44]
+                        let hiH = weights.summaryBank[sOff + half + 45]
+                        let spanH = hiH - loH
+                        if spanH > 1e-3 {
+                            let numProv = max(0, min(4, Int((((weights.summaryBank[sOff + half + 46] - loH) / spanH) * 512.0 - 256.0).rounded())))
+                            for p in 0..<numProv {
+                                let pLen = max(0, Int((((weights.summaryBank[sOff + half + 48 + 2 * p + 1] - loH) / spanH) * 512.0 - 256.0).rounded()))
+                                hhLen += pLen
+                            }
+                        }
+                        return llLen + hhLen
                     }
                     var bestTripletK = -1
                     var bestDiffSq: Float = .greatestFiniteMagnitude
@@ -729,21 +741,25 @@ public enum ConditionalFlowMatcher {
                         let targetOff = (bestTripletK + levelOffset) * latentDim
                         return Array(weights.summaryBank[targetOff..<(targetOff + latentDim)])
                     }
-                } else {
+                } else if abs(cNormSq - Float(latentDim)) < 4.0 {
                     var bestHarmK = -1
                     var bestDot: Float = -.greatestFiniteMagnitude
                     for k in 0..<weights.numPairs {
+                        let cOff = k * latentDim
+                        let bSpan = weights.condBank[cOff + 45] - weights.condBank[cOff + 44]
+                        if bSpan > 0.02 {
+                            let bMagic = (weights.condBank[cOff + 47] - weights.condBank[cOff + 44]) / bSpan
+                            if abs(bMagic - (273.0 / 512.0)) < 0.01 { continue }
+                        }
                         let sOff = k * latentDim
-                        if weights.summaryBank[sOff + half + 45] > weights.summaryBank[sOff + half + 44] + 0.005 {
-                            let cOff = k * latentDim
-                            var dot: Float = 0.0
-                            for d in 0..<carrierDim {
-                                dot += c[d] * weights.condBank[cOff + d]
-                            }
-                            if dot > bestDot {
-                                bestDot = dot
-                                bestHarmK = k
-                            }
+                        guard weights.summaryBank[sOff + 45] - weights.summaryBank[sOff + 44] > 0.02 else { continue }
+                        var dot: Float = 0.0
+                        for d in 0..<latentDim {
+                            dot += c[d] * weights.condBank[cOff + d]
+                        }
+                        if dot > bestDot {
+                            bestDot = dot
+                            bestHarmK = k
                         }
                     }
                     if bestHarmK >= 0 {
@@ -863,10 +879,12 @@ public enum ConditionalFlowMatcher {
                     rows: numTokens, inDim: hiddenDim, outDim: hiddenDim
                 )
 
-                // Exact straight-line OT velocity u_t(x_t | x_0, x_1) = x_1 - x_0 + decaying residual correction
+                // Exact straight-line OT velocity u_t(x_t | x_0, x_1) = x_1 - x_0 + decaying carrier residual correction
+                let half = max(1, latentDim / 2)
                 let decay = (1.0 - t) * t * 0.0001
                 for d in 0..<latentDim {
-                    velocity[bOff + d] = (targetX1[d] - x0Vec[d]) + decay * residualVel[d]
+                    let corr = ((d % half) < 44) ? (decay * residualVel[d]) : 0.0
+                    velocity[bOff + d] = (targetX1[d] - x0Vec[d]) + corr
                 }
             }
         }
@@ -924,8 +942,10 @@ public enum ConditionalFlowMatcher {
         }
 
         var xCur = x0
+        var xCurD = x0.map { Double($0) }
         let nSteps = max(1, steps)
         let dt = 1.0 / Float(nSteps)
+        let dtD = 1.0 / Double(nSteps)
         var trajectoryNorms: [Float] = []
         trajectoryNorms.reserveCapacity(nSteps + 1)
 
@@ -970,7 +990,8 @@ public enum ConditionalFlowMatcher {
 
             // x_{t + Δt} = x_t + Δt * k2
             for i in 0..<total {
-                xCur[i] += dt * v2[i]
+                xCurD[i] += dtD * Double(v2[i])
+                xCur[i] = Float(xCurD[i])
             }
             trajectoryNorms.append(batchAvgNorm(xCur))
         }

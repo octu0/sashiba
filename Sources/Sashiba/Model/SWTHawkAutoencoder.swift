@@ -40,7 +40,8 @@ public struct SplitMix64: RandomNumberGenerator, Sendable {
 /// Default architecture dimensions for the Phase 2 SWT-Griffin Text Autoencoder (`Section 2`).
 public enum SWTHawkShape {
     public static let defaultDim: Int = 128
-    public static let latentDim: Int = 1024
+    public static let latentDim: Int = 512
+    public static let relationalLatentDim: Int = 128
     public static let encoderLayers: Int = 2
     public static let decoderLayers: Int = 2
     public static let numQueries: Int = 8
@@ -106,7 +107,7 @@ public struct SWTHawkWeights: Sendable, Equatable {
         } else {
             var relRng = SplitMix64(seed: 1777)
             self.relational = DualStreamRelationalWeights.makeRandom(
-                vocabSize: vocabSize, dim: dim, latentDim: latentDim, rng: &relRng
+                vocabSize: vocabSize, dim: dim, latentDim: SWTHawkShape.relationalLatentDim, rng: &relRng
             )
         }
     }
@@ -119,6 +120,7 @@ public struct SWTHawkWeights: Sendable, Equatable {
         vocabSize: Int,
         dim: Int = SWTHawkShape.defaultDim,
         latentDim: Int = SWTHawkShape.latentDim,
+        relationalLatentDim: Int = SWTHawkShape.relationalLatentDim,
         mlpDim: Int? = nil,
         encoderLayers: Int = SWTHawkShape.encoderLayers,
         decoderLayers: Int = SWTHawkShape.decoderLayers,
@@ -155,7 +157,9 @@ public struct SWTHawkWeights: Sendable, Equatable {
             numLayers: decoderLayers, mlpDim: m, rng: &rng
         )
         let fm = FlowMatchingWeights.makeRandom(latentDim: latentDim, rng: &rng)
-        let rel = DualStreamRelationalWeights.makeRandom(vocabSize: vocabSize, dim: dim, latentDim: latentDim, rng: &rng)
+        let rel = DualStreamRelationalWeights.makeRandom(
+            vocabSize: vocabSize, dim: dim, latentDim: relationalLatentDim, rng: &rng
+        )
 
         return SWTHawkWeights(
             vocabSize: vocabSize,
@@ -314,12 +318,21 @@ public struct SWTHawkWeights: Sendable, Equatable {
             ]
         }
 
-        let half = latentDim / 2
         let cohDim = DualStreamRelationalWeights.coherenceDim
         tensors += [
             ("rel.alphaRel", T(shape: [vocabSize], values: relational.alphaRel)),
             ("rel.eEcho", T(shape: [dim], values: relational.eEcho)),
             ("rel.eTopic", T(shape: [dim], values: relational.eTopic)),
+            ("rel.convRelLL1.w", T(shape: [3, dim, dim], values: relational.convRelLL1.w)),
+            ("rel.convRelLL1.b", T(shape: [dim], values: relational.convRelLL1.b)),
+            ("rel.convRelLL2.w", T(shape: [3, dim, dim], values: relational.convRelLL2.w)),
+            ("rel.convRelLL2.b", T(shape: [dim], values: relational.convRelLL2.b)),
+            ("rel.convRelHH1.w", T(shape: [3, 2 * dim, dim], values: relational.convRelHH1.w)),
+            ("rel.convRelHH1.b", T(shape: [dim], values: relational.convRelHH1.b)),
+            ("rel.convRelHH2.w", T(shape: [3, dim, dim], values: relational.convRelHH2.w)),
+            ("rel.convRelHH2.b", T(shape: [dim], values: relational.convRelHH2.b)),
+            ("rel.wPoolLL", T(shape: [dim, 2], values: relational.wPoolLL)),
+            ("rel.wPoolHH", T(shape: [dim, 2], values: relational.wPoolHH)),
             ("rel.wQLL", T(shape: [dim, dim], values: relational.wQLL)),
             ("rel.bQLL", T(shape: [dim], values: relational.bQLL)),
             ("rel.wKLL", T(shape: [dim, dim], values: relational.wKLL)),
@@ -336,23 +349,23 @@ public struct SWTHawkWeights: Sendable, Equatable {
             ("rel.bVHH", T(shape: [dim], values: relational.bVHH)),
             ("rel.wCohHH", T(shape: [cohDim, dim], values: relational.wCohHH)),
             ("rel.bCohHH", T(shape: [dim], values: relational.bCohHH)),
-            ("rel.wProjLL", T(shape: [5 * dim, half], values: relational.wProjLL)),
-            ("rel.bProjLL", T(shape: [half], values: relational.bProjLL)),
-            ("rel.normLLGamma", T(shape: [half], values: relational.normLLGamma)),
-            ("rel.normLLBeta", T(shape: [half], values: relational.normLLBeta)),
-            ("rel.wProjHH", T(shape: [5 * dim, half], values: relational.wProjHH)),
-            ("rel.bProjHH", T(shape: [half], values: relational.bProjHH)),
-            ("rel.normHHGamma", T(shape: [half], values: relational.normHHGamma)),
-            ("rel.normHHBeta", T(shape: [half], values: relational.normHHBeta)),
-            ("rel.wContent", T(shape: [2 * dim, half], values: relational.wContent)),
-            ("rel.bContent", T(shape: [half], values: relational.bContent)),
-            ("rel.wArchT4", T(shape: [latentDim, 6], values: relational.wArchT4)),
+            ("rel.wProjLL", T(shape: [5 * dim, relational.latentDim / 2], values: relational.wProjLL)),
+            ("rel.bProjLL", T(shape: [relational.latentDim / 2], values: relational.bProjLL)),
+            ("rel.normLLGamma", T(shape: [relational.latentDim / 2], values: relational.normLLGamma)),
+            ("rel.normLLBeta", T(shape: [relational.latentDim / 2], values: relational.normLLBeta)),
+            ("rel.wProjHH", T(shape: [5 * dim, relational.latentDim / 2], values: relational.wProjHH)),
+            ("rel.bProjHH", T(shape: [relational.latentDim / 2], values: relational.bProjHH)),
+            ("rel.normHHGamma", T(shape: [relational.latentDim / 2], values: relational.normHHGamma)),
+            ("rel.normHHBeta", T(shape: [relational.latentDim / 2], values: relational.normHHBeta)),
+            ("rel.wContent", T(shape: [2 * dim, relational.latentDim / 2], values: relational.wContent)),
+            ("rel.bContent", T(shape: [relational.latentDim / 2], values: relational.bContent)),
+            ("rel.wArchT4", T(shape: [relational.latentDim, 6], values: relational.wArchT4)),
             ("rel.bArchT4", T(shape: [6], values: relational.bArchT4)),
-            ("rel.wTopoT4", T(shape: [latentDim, 5], values: relational.wTopoT4)),
+            ("rel.wTopoT4", T(shape: [relational.latentDim, 5], values: relational.wTopoT4)),
             ("rel.bTopoT4", T(shape: [5], values: relational.bTopoT4)),
-            ("rel.wArchT2", T(shape: [latentDim, 6], values: relational.wArchT2)),
+            ("rel.wArchT2", T(shape: [relational.latentDim, 6], values: relational.wArchT2)),
             ("rel.bArchT2", T(shape: [6], values: relational.bArchT2)),
-            ("rel.wTopoT2", T(shape: [latentDim, 5], values: relational.wTopoT2)),
+            ("rel.wTopoT2", T(shape: [relational.latentDim, 5], values: relational.wTopoT2)),
             ("rel.bTopoT2", T(shape: [5], values: relational.bTopoT2))
         ]
 
@@ -360,6 +373,7 @@ public struct SWTHawkWeights: Sendable, Equatable {
             "vocabSize": "\(vocabSize)",
             "dim": "\(dim)",
             "latentDim": "\(latentDim)",
+            "relationalLatentDim": "\(relational.latentDim)",
             "mlpDim": "\(mlpDim)",
             "encoderLayers": "\(hawkBranch.count)",
             "decoderLayers": "\(decoder.layers.count)",
@@ -551,7 +565,7 @@ public struct SWTHawkWeights: Sendable, Equatable {
 
         var fmWeights: FlowMatchingWeights? = nil
         if tensors["cfm.wAlign"] != nil {
-            let fmH = Int(metadata["cfmHiddenDim"] ?? "") ?? FlowMatchingWeights.subbandTokenDim
+            let fmH = Int(metadata["cfmHiddenDim"] ?? "") ?? max(8, latentDim / FlowMatchingWeights.numSubbandTokens)
             let fmPairs = Int(metadata["cfmNumPairs"] ?? "") ?? 0
             let cBank = (fmPairs > 0 && tensors["cfm.condBank"] != nil) ? (try vals("cfm.condBank")) : []
             let sBank = (fmPairs > 0 && tensors["cfm.summaryBank"] != nil) ? (try vals("cfm.summaryBank")) : []
@@ -578,13 +592,68 @@ public struct SWTHawkWeights: Sendable, Equatable {
         if tensors["rel.wQLL"] != nil {
             let calHeads = RelationalCalibratedHeads.deserialize(metadata["calibratedHeads"] ?? "")
             let telemetry = RelationalAuditTelemetry.deserialize(metadata["auditTelemetry"] ?? "")
+            let defSeq = DualStreamRelationalWeights.makeDefaultSequenceFilters(dim: dim)
+            let cLL1: Conv1D3Weights = if tensors["rel.convRelLL1.w"] != nil, tensors["rel.convRelLL1.b"] != nil,
+                let w = try? vals("rel.convRelLL1.w"), w.count == 3 * dim * dim,
+                let b = try? vals("rel.convRelLL1.b"), b.count == dim
+            {
+                Conv1D3Weights(inDim: dim, outDim: dim, w: w, b: b)
+            } else {
+                defSeq.convRelLL1
+            }
+            let cLL2: Conv1D3Weights = if tensors["rel.convRelLL2.w"] != nil, tensors["rel.convRelLL2.b"] != nil,
+                let w = try? vals("rel.convRelLL2.w"), w.count == 3 * dim * dim,
+                let b = try? vals("rel.convRelLL2.b"), b.count == dim
+            {
+                Conv1D3Weights(inDim: dim, outDim: dim, w: w, b: b)
+            } else {
+                defSeq.convRelLL2
+            }
+            let cHH1: Conv1D3Weights = if tensors["rel.convRelHH1.w"] != nil, tensors["rel.convRelHH1.b"] != nil,
+                let w = try? vals("rel.convRelHH1.w"), w.count == 3 * 2 * dim * dim,
+                let b = try? vals("rel.convRelHH1.b"), b.count == dim
+            {
+                Conv1D3Weights(inDim: 2 * dim, outDim: dim, w: w, b: b)
+            } else {
+                defSeq.convRelHH1
+            }
+            let cHH2: Conv1D3Weights = if tensors["rel.convRelHH2.w"] != nil, tensors["rel.convRelHH2.b"] != nil,
+                let w = try? vals("rel.convRelHH2.w"), w.count == 3 * dim * dim,
+                let b = try? vals("rel.convRelHH2.b"), b.count == dim
+            {
+                Conv1D3Weights(inDim: dim, outDim: dim, w: w, b: b)
+            } else {
+                defSeq.convRelHH2
+            }
+            let wPoolLL: [Float] = if tensors["rel.wPoolLL"] != nil,
+                let w = try? vals("rel.wPoolLL"), w.count == dim * 2
+            {
+                w
+            } else {
+                defSeq.wPoolLL
+            }
+            let wPoolHH: [Float] = if tensors["rel.wPoolHH"] != nil,
+                let w = try? vals("rel.wPoolHH"), w.count == dim * 2
+            {
+                w
+            } else {
+                defSeq.wPoolHH
+            }
+            let relLatentDim = Int(metadata["relationalLatentDim"] ?? "")
+                ?? ((try? vals("rel.bProjLL").count).map { $0 * 2 } ?? SWTHawkShape.relationalLatentDim)
             relWeights = DualStreamRelationalWeights(
                 vocabSize: vocabSize,
                 dim: dim,
-                latentDim: latentDim,
+                latentDim: relLatentDim,
                 alphaRel: try vals("rel.alphaRel"),
                 eEcho: try vals("rel.eEcho"),
                 eTopic: try vals("rel.eTopic"),
+                convRelLL1: cLL1,
+                convRelLL2: cLL2,
+                convRelHH1: cHH1,
+                convRelHH2: cHH2,
+                wPoolLL: wPoolLL,
+                wPoolHH: wPoolHH,
                 wQLL: try vals("rel.wQLL"),
                 bQLL: try vals("rel.bQLL"),
                 wKLL: try vals("rel.wKLL"),
@@ -1133,20 +1202,21 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
                 zRel: zRelT4, isEarlyT2: false, weights: weights.relational
             )
 
-            // Subband-orthogonal Latent Harmonization in z_rel: preserve z_LL^rel [0..<512] exactly, harmonize z_HH^rel [512..<1024]
-            let half = weights.latentDim / 2
+            // Subband-orthogonal Latent Harmonization in z_rel: preserve z_LL^rel [0..<relHalf] exactly, harmonize z_HH^rel [relHalf..<relDim]
+            let relDim = weights.relational.latentDim
+            let relHalf = relDim / 2
             let zHarmProto = DualStreamRelationalEngine.targetPrototype(
-                archetype: .trueSupporter, topology: .deepAffection, latentDim: weights.latentDim
+                archetype: .trueSupporter, topology: .deepAffection, latentDim: relDim
             )
             var zRelHarmonized = zRelT4
-            var deltaZRel = [Float](repeating: 0.0, count: weights.latentDim)
-            for i in half..<weights.latentDim {
+            var deltaZRel = [Float](repeating: 0.0, count: relDim)
+            for i in relHalf..<relDim {
                 let d = zHarmProto[i] - zRelT4[i]
                 deltaZRel[i] = d
                 zRelHarmonized[i] = zRelT4[i] + d
             }
             var llErrSq: Float = 0.0
-            for i in 0..<half {
+            for i in 0..<relHalf {
                 let e = zRelHarmonized[i] - zRelT4[i]
                 llErrSq += e * e
             }

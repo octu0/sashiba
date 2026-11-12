@@ -109,6 +109,7 @@ func evaluateSyntacticFluency(_ text: String) -> (score: Float, hasGarbleOrOscil
 
 // MARK: - Main Phase 5 (Part 1–4: 72 Categories / 2,000 Scenarios) Verification Pipeline
 
+MLXSWTHawkAutoencoder.configureLowMemoryCache()
 let cli = VerifyLatentSpaceCLI.parse(CommandLine.arguments)
 let weightsURL = URL(fileURLWithPath: cli.weightsPath)
 let weights = try SWTHawkWeights.load(from: weightsURL)
@@ -248,14 +249,14 @@ let unseenReconPct = Float(exactUnseenReconstructions) / Float(max(1, unseenCase
 print("[Test 1] Train Reconstruction: \(exactTrainDocs)/\(numDocs) (\(fmt("%.2f", trainReconPct))%) | Unseen Zero-Shot Reconstruction: \(exactUnseenReconstructions)/\(unseenCases.count) (\(fmt("%.2f", unseenReconPct))%) | Max LL Orthogonality Error: \(fmt("%.4f", max(maxOrthogonalityLLErrTrain, maxOrthogonalityLLErrUnseen)))")
 
 var report = "# SWT-Griffin Relational Dynamics Engine (Phase 5: 全\(distinctCategories)カテゴリ・通算\(allCases.count)シナリオ規模) 検証レポート\n\n"
-report += "- **総パラメータ数**: `\(weights.parameterCount)` (`D = \(weights.dim)`, `Griffin Layers L = \(weights.hawkBranch.count)`, `z = [z_LL(512); z_HH(512)] ∈ R^1024`, `Vocab V = \(vocab.count)`)\n"
+report += "- **総パラメータ数**: `\(weights.parameterCount)` (`D = \(weights.dim)`, `Griffin Layers L = \(weights.hawkBranch.count)`, `z_ae = [z_LL(\(halfDim)); z_HH(\(halfDim))] ∈ R^\(latentDim)`, `z_rel = [z_LL^rel(\(weights.relational.latentDim / 2)); z_HH^rel(\(weights.relational.latentDim / 2))] ∈ R^\(weights.relational.latentDim)`, `Vocab V = \(vocab.count)`)\n"
 report += "- **総シナリオ数**: **`\(allCases.count)` シナリオ**（全 `\(distinctCategories)` カテゴリ：Part 1 [基本関係性1〜12] + Part 2 [配信・コミュニティ深層人間模様13〜32] + Part 3 [嗜好・デート・金銭感覚・旅行計画の価値観すり合わせ33〜52] + Part 4 [ジェネレーションギャップ明暗・つかず離れず・優しさの真意・距離感バグ・キープ扱い53〜72]）\n"
 report += "- **学習対話ケース数 (`split = train`, 80%)**: **`\(trainCases.count)` シナリオ**（+ $(T_1 \\dots T_2) \\times (T_3 \\dots T_4)$ フェーズ組み換え拡張、基礎対話コーパス総文字数 `\(totalCorpusChars)` 文字）\n"
 report += "- **未学習評価スイート (`split = unseen_test`, 20%)**: **`\(unseenCases.count)` シナリオ**（全 `\(distinctCategories)` カテゴリ網羅 — 学習時一切不使用）\n\n"
 report += "---\n\n"
 
 report += "## Test 1: ベースライン＆未学習データの主成分空間分布（Subband Orthogonality）\n\n"
-report += "同一の文脈共有度（$T_1 \\dots T_2$）に対して後半（$T_3 \\dots T_4$）の感情反応を変化させた際、低周波サブバンド $z_{\\text{LL}} \\in \\mathbb{R}^{512}$ が変化せず完全直交分離（$\\|z_{\\text{LL}}^{(A)} - z_{\\text{LL}}^{(B)}\\|_2 = 0.0000$）していることを全 `\(allCases.count)` シナリオで検証する。\n\n"
+report += "同一の文脈共有度（$T_1 \\dots T_2$）に対して後半（$T_3 \\dots T_4$）の感情反応を変化させた際、低周波サブバンド $z_{\\text{LL}} \\in \\mathbb{R}^{\(halfDim)}$ が変化せず完全直交分離（$\\|z_{\\text{LL}}^{(A)} - z_{\\text{LL}}^{(B)}\\|_2 = 0.0000$）していることを全 `\(allCases.count)` シナリオで検証する。\n\n"
 report += "- **学習アンカードキュメント (`\(numDocs)`件) 再構成一致率**: **`\(fmt("%.2f", avgTrainTokAcc))%` (`\(exactTrainDocs)/\(numDocs)` 完全一致)**\n"
 report += "- **未学習データ (`\(unseenCases.count)`件) ゼロショット再構成一致率**: **`100.00%` (`\(exactUnseenReconstructions)/\(unseenCases.count)` 完全一致・文字化け `0` 件)**\n"
 report += "- **学習ケース (`\(trainCases.count)`件) 低周波直交分離誤差 $\\max \\|z_{\\text{LL}}^{(A)} - z_{\\text{LL}}^{(B)}\\|_2$**: **`\(fmt("%.4f", maxOrthogonalityLLErrTrain))`**\n"
@@ -662,7 +663,7 @@ func tokensOf(_ text: String) -> [Int] {
 }
 
 var audit = "# SWT-Griffin Relational Dynamics Engine (Phase 5.1) 独立監査レポート（Anti-Cheat Audit）\n\n"
-audit += "本レポートの全指標は、`(senderTokenIDs: [Int], receiverTokenIDs: [Int])` のみを入力とする純ニューラル出力 `z_rel ∈ R^1024` と、学習時に train 分割のみで校正された分類ヘッドから算出している。\n\n"
+audit += "本レポートの全指標は、`(senderTokenIDs: [Int], receiverTokenIDs: [Int])` のみを入力とする純ニューラル出力 `z_rel ∈ R^\(weights.relational.latentDim)` と、学習時に train 分割のみで校正された分類ヘッドから算出している。\n\n"
 
 // ---------------- Audit 1 ----------------
 let freshPairs: [(label: String, sender: String, receiver: String)] = [

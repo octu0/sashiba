@@ -153,7 +153,7 @@ public struct AttentionPoolingWeights: Sendable, Equatable {
 
     public init(
         dim: Int,
-        latentDim: Int = 1024,
+        latentDim: Int = SWTHawkShape.latentDim,
         numQueries: Int = 8,
         numHeads: Int = 4,
         qPool: [Float],
@@ -194,7 +194,7 @@ public struct AttentionPoolingWeights: Sendable, Equatable {
 
     public static func makeRandom(
         dim: Int,
-        latentDim: Int = 1024,
+        latentDim: Int = SWTHawkShape.latentDim,
         numQueries: Int = 8,
         numHeads: Int = 4,
         l2Normalize: Bool = false,
@@ -253,6 +253,45 @@ public enum SubbandClauseSplitter {
     public static let calibrationScale: Float = 256.0
     public static let llMagic: Float = 17.0
     public static let hhMagic: Float = 23.0
+    public static let latticeScale: Float = 1.0 / 1024.0
+    public static let slotSubScale: Double = 128.0
+    public static let packedSlotScale: Float = 1.0 / 131_072.0
+
+    public static func slotCountForTokens(_ tokenCount: Int) -> Int {
+        let n = max(0, tokenCount)
+        return (n / 4) * 3 + (n % 4)
+    }
+
+    public static func maxTokensForSlots(_ slots: Int) -> Int {
+        let s = max(0, slots)
+        return (s / 3) * 4 + min(2, s % 3)
+    }
+
+    public static func packTokens16(_ tokens: ArraySlice<Int>, count: Int) -> [Int] {
+        let n = max(0, min(count, tokens.count))
+        let sc = slotCountForTokens(n)
+        var out = [Int](repeating: 0, count: sc)
+        var g = 0
+        var i = 0
+        let base = tokens.startIndex
+        while i < n {
+            let rem = n - i
+            let t0 = max(0, min(4095, tokens[base + i]))
+            let t1 = rem >= 2 ? max(0, min(4095, tokens[base + i + 1])) : 0
+            let t2 = rem >= 3 ? max(0, min(4095, tokens[base + i + 2])) : 0
+            let t3 = rem >= 4 ? max(0, min(4095, tokens[base + i + 3])) : 0
+            out[g] = t0 | ((t1 & 0xF) << 12)
+            if rem >= 2 {
+                out[g + 1] = ((t1 >> 4) & 0xFF) | ((t2 & 0xFF) << 8)
+            }
+            if rem >= 3 {
+                out[g + 2] = ((t2 >> 8) & 0xF) | (t3 << 4)
+            }
+            i += 4
+            g += 3
+        }
+        return out
+    }
 
     public struct ProvisoSegment: Sendable, Equatable {
         public let anchorSentenceIndex: Int
@@ -542,16 +581,33 @@ public enum SubbandClauseSplitter {
     ) -> [Float] {
         let half = latentDim / 2
         precondition(half >= 128)
-        let unitGamma = [Float](repeating: 1.0, count: half)
-        let zeroBeta = [Float](repeating: 0.0, count: half)
 
-        var rawLL = [Float](repeating: 0.0, count: half)
+        func normalizeCarrier(_ rawCar: [Float], into vec: inout [Float], count: Int, targetTotalSq: Float) {
+            var tailSq: Float = 0.0
+            for i in count..<half { tailSq += vec[i] * vec[i] }
+            var sum: Float = 0.0
+            for i in 0..<count { sum += rawCar[i] }
+            let mean = sum / Float(max(1, count))
+            var sq: Float = 0.0
+            var centered = [Float](repeating: 0.0, count: count)
+            for i in 0..<count {
+                let v = rawCar[i] - mean
+                centered[i] = v
+                sq += v * v
+            }
+            let scale = sqrtf(max(1.0, targetTotalSq - tailSq) / max(sq, 1e-6))
+            for i in 0..<count { vec[i] = centered[i] * scale }
+        }
+
+        let carDim = min(44, half)
+        var zLL = [Float](repeating: 0.0, count: half)
+        var rawLLCar = [Float](repeating: 0.0, count: carDim)
         let firstSent = split.llSentences.first ?? split.llTokens
         let llCarrier: [Float] = if split.isModulated {
             modulatedCarrier(
                 tokens: split.hhCarrierSeedTokens,
                 salt: 0,
-                dim: min(44, half),
+                dim: carDim,
                 amplitude: 24000.0,
                 cosineWithReference: split.llAffinity,
                 envelopeAsymmetry: 0.0
@@ -560,37 +616,38 @@ public enum SubbandClauseSplitter {
             modulatedCarrier(
                 tokens: [],
                 salt: 0,
-                dim: min(44, half),
+                dim: carDim,
                 amplitude: 24000.0,
                 cosineWithReference: 0.96,
                 envelopeAsymmetry: 0.0
             )
         } else {
-            corePrincipleCarrier(tokens: firstSent, salt: 0, dim: min(44, half), amplitude: 2400.0)
+            corePrincipleCarrier(tokens: firstSent, salt: 0, dim: carDim, amplitude: 2400.0)
         }
-        for c in 0..<min(44, half) {
-            rawLL[c] = llCarrier[c] + neuralLL[c] * 0.25
+        for c in 0..<carDim {
+            rawLLCar[c] = llCarrier[c] + neuralLL[c] * 0.25
         }
-        rawLL[44] = -calibrationScale
-        rawLL[45] = +calibrationScale
-        let maxLLCap = half - headerDim
+        zLL[44] = -calibrationScale * latticeScale
+        zLL[45] = +calibrationScale * latticeScale
+        let maxLLSlots = half - headerDim
+        let maxLLCap = maxTokensForSlots(maxLLSlots)
         let llCount = min(maxLLCap, split.llTokens.count)
-        rawLL[46] = Float(llCount)
-        rawLL[47] = llMagic
-        for t in 0..<llCount {
-            rawLL[headerDim + t] = Float(split.llTokens[t])
+        let llPacked = packTokens16(split.llTokens[0..<llCount], count: llCount)
+        zLL[46] = Float(llCount) * latticeScale
+        zLL[47] = llMagic * latticeScale
+        for s in 0..<llPacked.count {
+            zLL[headerDim + s] = Float(llPacked[s]) * packedSlotScale
         }
-
-        let zLL = SWTHawkAutoencoder.layerNorm(x: rawLL, gamma: unitGamma, beta: zeroBeta, rows: 1, dim: half)
+        normalizeCarrier(rawLLCar, into: &zLL, count: carDim, targetTotalSq: Float(half))
 
         var zHH = [Float](repeating: 0.0, count: half)
         if !split.provisos.isEmpty {
-            var rawHH = [Float](repeating: 0.0, count: half)
+            var rawHHCar = [Float](repeating: 0.0, count: carDim)
             let hhCarrier: [Float] = if split.isModulated {
                 modulatedCarrier(
                     tokens: split.hhCarrierSeedTokens,
                     salt: 0x7777_7777,
-                    dim: min(44, half),
+                    dim: carDim,
                     amplitude: 24000.0,
                     cosineWithReference: split.polarity,
                     envelopeAsymmetry: 0.45
@@ -599,36 +656,33 @@ public enum SubbandClauseSplitter {
                 corePrincipleCarrier(
                     tokens: split.hhCarrierSeedTokens,
                     salt: 0x7777_7777,
-                    dim: min(44, half),
+                    dim: carDim,
                     amplitude: 2400.0 * split.polarity
                 )
             }
-            for c in 0..<min(44, half) {
-                rawHH[c] = hhCarrier[c] + neuralHH[c] * 0.25
+            for c in 0..<carDim {
+                rawHHCar[c] = hhCarrier[c] + neuralHH[c] * 0.25
             }
-            rawHH[44] = -calibrationScale
-            rawHH[45] = +calibrationScale
+            zHH[44] = -calibrationScale * latticeScale
+            zHH[45] = +calibrationScale * latticeScale
             let numProv = min(4, split.provisos.count)
-            rawHH[46] = Float(numProv)
-            rawHH[47] = hhMagic
+            zHH[46] = Float(numProv) * latticeScale
+            zHH[47] = hhMagic * latticeScale
             var writeCursor = provisoHeaderDim
             for p in 0..<numProv {
                 let seg = split.provisos[p]
-                let avail = max(0, half - writeCursor)
-                let segLen = min(avail, seg.tokens.count)
-                rawHH[48 + 2 * p] = Float(seg.anchorSentenceIndex)
-                rawHH[48 + 2 * p + 1] = Float(segLen)
-                for t in 0..<segLen {
-                    rawHH[writeCursor + t] = Float(seg.tokens[t])
+                let availSlots = max(0, half - writeCursor)
+                let segLen = min(maxTokensForSlots(availSlots), seg.tokens.count)
+                let segPacked = packTokens16(seg.tokens[0..<segLen], count: segLen)
+                zHH[48 + 2 * p] = Float(seg.anchorSentenceIndex) * latticeScale
+                zHH[48 + 2 * p + 1] = Float(segLen) * latticeScale
+                for s in 0..<segPacked.count {
+                    zHH[writeCursor + s] = Float(segPacked[s]) * packedSlotScale
                 }
-                writeCursor += segLen
+                writeCursor += segPacked.count
             }
-            let zHHUnit = SWTHawkAutoencoder.layerNorm(x: rawHH, gamma: unitGamma, beta: zeroBeta, rows: 1, dim: half)
-            if split.isModulated && abs(split.hhEnergyGain - 1.0) > 1e-6 {
-                zHH = zHHUnit.map { $0 * split.hhEnergyGain }
-            } else {
-                zHH = zHHUnit
-            }
+            let gain = split.isModulated ? split.hhEnergyGain : 1.0
+            normalizeCarrier(rawHHCar, into: &zHH, count: carDim, targetTotalSq: max(1.0, Float(half) * gain * gain))
         }
 
         return zLL + zHH

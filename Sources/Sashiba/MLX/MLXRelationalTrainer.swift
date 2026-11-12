@@ -1,7 +1,6 @@
 import Foundation
 import MLX
 import MLXNN
-import MLXOptimizers
 
 /// One relational training sample: `(sender, receiver)` token pair + target labels + grouping key.
 /// The grouping key (category) is used ONLY to build contrastive positives / mismatched negatives
@@ -13,14 +12,24 @@ public struct RelationalTrainingPair: Sendable {
     public let topology: Int
     public let isEarlyT2: Bool
     public let groupKey: String
+    public let uniquenessWeight: Float
 
-    public init(senderTokens: [Int], receiverTokens: [Int], archetype: Int, topology: Int, isEarlyT2: Bool, groupKey: String) {
+    public init(
+        senderTokens: [Int],
+        receiverTokens: [Int],
+        archetype: Int,
+        topology: Int,
+        isEarlyT2: Bool,
+        groupKey: String,
+        uniquenessWeight: Float = 1.0
+    ) {
         self.senderTokens = senderTokens
         self.receiverTokens = receiverTokens
         self.archetype = archetype
         self.topology = topology
         self.isEarlyT2 = isEarlyT2
         self.groupKey = groupKey
+        self.uniquenessWeight = uniquenessWeight
     }
 }
 
@@ -29,23 +38,51 @@ public struct RelationalCounterfactualPair: Sendable {
     public let senderTokens: [Int]
     public let receiverTokens: [Int]
     public let harmonizedTokens: [Int]
+    public let preserveLL: Bool
+    public let separateHH: Bool
 
-    public init(senderTokens: [Int], receiverTokens: [Int], harmonizedTokens: [Int]) {
+    public init(
+        senderTokens: [Int],
+        receiverTokens: [Int],
+        harmonizedTokens: [Int],
+        preserveLL: Bool = true,
+        separateHH: Bool = false
+    ) {
         self.senderTokens = senderTokens
         self.receiverTokens = receiverTokens
         self.harmonizedTokens = harmonizedTokens
+        self.preserveLL = preserveLL
+        self.separateHH = separateHH
     }
 }
 
-/// Loss weights for `L_total = λ_cls L_cls + λ_supcon L_supcon + λ_cf L_cf + λ_metric L_metric`.
+/// Loss weights for `L_total = λ_cls L_cls + λ_supcon L_supcon + λ_cf L_cf + λ_metric L_metric + λ_orth L_orth`.
 public struct RelationalLossWeights: Sendable {
-    public var cls: Float = 1.0
-    public var supcon: Float = 0.3
-    public var cf: Float = 0.2
-    public var metric: Float = 0.5
-    public var supconTemperature: Float = 0.1
+    public var cls: Float
+    public var supcon: Float
+    public var cf: Float
+    public var metric: Float
+    public var orth: Float
+    public var dropout: Float
+    public var supconTemperature: Float
 
-    public init() {}
+    public init(
+        cls: Float = 1.0,
+        supcon: Float = 0.35,
+        cf: Float = 0.25,
+        metric: Float = 0.45,
+        orth: Float = 0.14,
+        dropout: Float = 0.22,
+        supconTemperature: Float = 0.12
+    ) {
+        self.cls = cls
+        self.supcon = supcon
+        self.cf = cf
+        self.metric = metric
+        self.orth = orth
+        self.dropout = dropout
+        self.supconTemperature = supconTemperature
+    }
 }
 
 /// Phase 5.1: End-to-End multi-objective trainer for the Dual-Stream Relational Encoder (`Section 3` & `Audit 2`).
@@ -59,15 +96,15 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
     ]
 
     public let model: MLXSWTHawkAutoencoder
-    public let optimizer: Adam
+    public var baseLearningRate: Float
     private var rng: SplitMix64
     private var gradNormSums: [String: Float] = [:]
     private var gradNormMax: [String: Float] = [:]
     private var gradNormCount = 0
 
-    public init(model: MLXSWTHawkAutoencoder, learningRate: Float = 1e-3, seed: UInt64 = 2026) {
+    public init(model: MLXSWTHawkAutoencoder, learningRate: Float = 1.5e-3, seed: UInt64 = 2026) {
         self.model = model
-        self.optimizer = Adam(learningRate: learningRate)
+        self.baseLearningRate = learningRate
         self.rng = SplitMix64(seed: seed)
     }
 
@@ -81,12 +118,14 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         }
         if key.hasPrefix("relational.") {
             let leaf = String(key.dropFirst("relational.".count))
-            let crossKeys: Set<String> = [
-                "eEcho", "eTopic",
-                "wQLL", "bQLL", "wKLL", "bKLL", "wVLL", "bVLL", "wCohLL", "bCohLL",
-                "wQHH", "bQHH", "wKHH", "bKHH", "wVHH", "bVHH", "wCohHH", "bCohHH"
+            let crossPrefixes = [
+                "convRel", "wPool", "eEcho", "eTopic",
+                "wQ", "bQ", "wK", "bK", "wV", "bV", "wCoh", "bCoh"
             ]
-            return crossKeys.contains(leaf) ? "Bidirectional_CrossAttention_Layer" : "Latent_Projection_Layer"
+            for prefix in crossPrefixes where leaf.hasPrefix(prefix) {
+                return "Bidirectional_CrossAttention_Layer"
+            }
+            return "Latent_Projection_Layer"
         }
         return nil
     }
@@ -111,16 +150,28 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         return MLXArray(flat, [rows.count, time])
     }
 
-    private static func crossEntropy(_ logits: MLXArray, _ labels: MLXArray, _ weight: MLXArray) -> MLXArray {
-        let logp = logSoftmax(logits, axis: -1)
-        let picked = takeAlong(logp, labels.expandedDimensions(axis: -1), axis: -1).squeezed(axis: -1)
-        return -sum(picked * weight) / maximum(sum(weight), MLXArray(Float(1.0)))
+    @inline(__always)
+    private static func l2NormalizeRows(_ x: MLXArray) -> MLXArray {
+        return x * rsqrt(maximum(sum(x * x, axis: -1, keepDims: true), MLXArray(Float(1e-12))))
     }
 
-    /// Supervised contrastive loss restricted to cross-group positives (same label, different topic group).
+    private static func crossEntropy(
+        _ logits: MLXArray,
+        _ labels: MLXArray,
+        _ weight: MLXArray,
+        smoothing: Float = 0.04
+    ) -> MLXArray {
+        let logp = logSoftmax(logits, axis: -1)
+        let picked = takeAlong(logp, labels.expandedDimensions(axis: -1), axis: -1).squeezed(axis: -1)
+        let smoothNLL = -mean(logp, axis: -1)
+        let perRow = (1.0 - smoothing) * (-picked) + smoothing * smoothNLL
+        return sum(perRow * weight) / maximum(sum(weight), MLXArray(Float(1.0)))
+    }
+
+    /// Supervised contrastive loss restricted to cross-group positives (same label & phase, different topic group).
     private static func crossGroupSupCon(_ z: MLXArray, posMask: MLXArray, temperature: Float) -> MLXArray {
         let n = z.shape[0]
-        let zn = z / sqrt(maximum(sum(z * z, axis: -1, keepDims: true), MLXArray(Float(1e-12))))
+        let zn = l2NormalizeRows(z)
         let eye = MLXArray.eye(n)
         let logits = matmul(zn, zn.transposed(1, 0)) / temperature - eye * 1e4
         let logProb = logits - logSumExp(logits, axis: -1, keepDims: true)
@@ -130,8 +181,8 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         return sum(perAnchor * hasPos) / maximum(sum(hasPos), MLXArray(Float(1.0)))
     }
 
-    /// Runs End-to-End optimization of the full Dual-Stream encoder (embedding + SWT + Griffin + fusion + cross-attention + projection).
-    /// Returns the per-step total loss history.
+    /// Runs End-to-End stateful GPU AdamW optimization of the Dual-Stream encoder
+    /// (`swtBranch` + `hawkBranch` + `fusion` + `Bidirectional_CrossAttention_Layer` + `Latent_Projection_Layer`).
     @discardableResult
     public func train(
         pairs: [RelationalTrainingPair],
@@ -140,16 +191,30 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         epochs: Int,
         batchSize: Int = 32,
         lossWeights: RelationalLossWeights = RelationalLossWeights(),
-        learningRate: Float = 1e-3,
+        learningRate: Float = 1.5e-3,
         maxGradNorm: Float = 2.0,
         log: (String) -> Void = { print($0) }
     ) -> RelationalAuditTelemetry {
         precondition(!pairs.isEmpty)
-        let lDim = model.latentDim
+        MLX.Memory.cacheLimit = 128 * 1024 * 1024
+        MLX.Memory.clearCache()
+        try? model.freeze(keys: ["tokenEmbedding", "pooling", "decoder", "cfm"], strict: false)
+        model.isTokenEmbeddingFrozen = true
+        defer {
+            model.isTokenEmbeddingFrozen = false
+            try? model.unfreeze(strict: false)
+            MLX.Memory.clearCache()
+        }
+        let d = model.dim
+        let lDim = model.relational.latentDim
+        let half = lDim / 2
+        let phiDim = 5 * d
         let archCases = RelationalArchetype.allCases
         let topoCases = RelationalTopology.allCases
-        let peFlat = HawkConditionalDecoder.positionalEncoding(time: time, dim: model.dim)
-        let pe = MLXArray(peFlat, [1, time, model.dim])
+        let peFlat = HawkConditionalDecoder.positionalEncoding(time: time, dim: d)
+        let pe = MLXArray(peFlat, [1, time, d])
+        let ones2D = MLXArray.ones([2 * d])
+        let zeros2D = MLXArray.zeros([2 * d])
 
         // Precompute target prototypes for L_metric
         var protoCache: [Int: [Float]] = [:]
@@ -166,15 +231,26 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         }
 
         let initial = snapshotAuditedParameters()
-        optimizer.learningRate = learningRate
+        baseLearningRate = learningRate
         gradNormSums.removeAll()
         gradNormMax.removeAll()
         gradNormCount = 0
 
-        var order = Array(0..<pairs.count)
-        let cfBatch = max(1, batchSize / 4)
-        var lastLosses: [Float] = [0, 0, 0, 0, 0]
-        var totalSteps = 0
+        // Snapshot initial MLX tensors for shared Autoencoder backbone trust-region anchor regularization
+        var pInitMap: [String: MLXArray] = [:]
+        for (key, arr) in model.parameters().flattened() {
+            if key.hasPrefix("swtBranch.") || key.hasPrefix("hawkBranch.") || key.hasPrefix("fusion.") {
+                pInitMap[key] = stopGradient(arr)
+            }
+        }
+        eval(Array(pInitMap.values))
+
+        var mState: [String: MLXArray] = [:]
+        var vState: [String: MLXArray] = [:]
+        let beta1: Float = 0.9
+        let beta2: Float = 0.999
+        let eps: Float = 1e-8
+        let relWeightDecay: Float = 2.5e-3
 
         let lossFn = { (m: MLXSWTHawkAutoencoder, arrays: [MLXArray]) -> [MLXArray] in
             let sIds = arrays[0]
@@ -187,65 +263,150 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
             let cfS = arrays[7]
             let cfC = arrays[8]
             let cfH = arrays[9]
-            let w = arrays[10]
-            let posEnc = arrays[11]
+            let cfPreserveLL = arrays[10]
+            let cfSeparateHH = arrays[11]
+            let dropLL = arrays[12]
+            let dropHH = arrays[13]
+            let w = arrays[14]
+            let posEnc = arrays[15]
+            let tokKeepS = arrays[16]
+            let tokKeepC = arrays[17]
+            let t4Mask = arrays[18]
 
-            let out = m.forwardDualStream(senderIds: sIds, receiverIds: cIds, pe: posEnc)
-            let t4Mask = 1.0 - t2Mask
-            let lClsT4 = Self.crossEntropy(out.logitsArchT4, archLab, t4Mask) + Self.crossEntropy(out.logitsTopoT4, topoLab, t4Mask)
-            let lClsT2 = Self.crossEntropy(out.logitsArchT2, archLab, t2Mask) + Self.crossEntropy(out.logitsTopoT2, topoLab, t2Mask)
+            let n = sIds.shape[0]
+            let cfN = cfS.shape[0]
+            let bTime = sIds.shape[1]
+            let allS = concatenated([sIds, cfS, cfS], axis: 0)
+            let allC = concatenated([cIds, cfC, cfH], axis: 0)
+            let cfOnesDrop = MLXArray.ones([2 * cfN, phiDim])
+            let allDropLL = concatenated([dropLL, cfOnesDrop], axis: 0)
+            let allDropHH = concatenated([dropHH, cfOnesDrop], axis: 0)
+            let cfOnesKeep = MLXArray.ones([2 * cfN, bTime, 1])
+            let allKeepS = concatenated([tokKeepS, cfOnesKeep], axis: 0)
+            let allKeepC = concatenated([tokKeepC, cfOnesKeep], axis: 0)
+
+            let comb = m.forwardDualStream(
+                senderIds: allS,
+                receiverIds: allC,
+                pe: posEnc,
+                dropoutMaskLL: allDropLL,
+                dropoutMaskHH: allDropHH,
+                tokenKeepMaskS: allKeepS,
+                tokenKeepMaskC: allKeepC
+            )
+            let mainZRel = comb.zRel[0..<n]
+            let mainZContent = comb.zContent[0..<n]
+            let mainUContent = comb.uContent[0..<n]
+
+            // 1. L_cls: Label-smoothed class-balanced cross-entropy on T4 and T2 classification heads
+            let lClsT4 = Self.crossEntropy(comb.logitsArchT4[0..<n], archLab, t4Mask, smoothing: 0.06)
+                + Self.crossEntropy(comb.logitsTopoT4[0..<n], topoLab, t4Mask, smoothing: 0.06)
+            let lClsT2 = Self.crossEntropy(comb.logitsArchT2[0..<n], archLab, t2Mask, smoothing: 0.06)
+                + Self.crossEntropy(comb.logitsTopoT2[0..<n], topoLab, t2Mask, smoothing: 0.06)
             let lCls = lClsT4 + lClsT2
-            let lSup = Self.crossGroupSupCon(out.zRel, posMask: posMask, temperature: lossWeights.supconTemperature)
-            let diff = out.zRel - protos
-            let lMetric = mean(diff * diff)
 
-            let half = lDim / 2
-            let orig = m.forwardDualStream(senderIds: cfS, receiverIds: cfC, pe: posEnc).zRel
-            let harm = m.forwardDualStream(senderIds: cfS, receiverIds: cfH, pe: posEnc).zRel
-            let dLL = orig[0..., 0..<half] - harm[0..., 0..<half]
-            let lCf = mean(dLL * dLL)
+            // 2. L_supcon: Cross-group supervised contrastive loss within the same temporal phase
+            let lSup = Self.crossGroupSupCon(mainZRel, posMask: posMask, temperature: lossWeights.supconTemperature)
 
-            let total = w[0] * lCls + w[1] * lSup + w[2] * lCf + w[3] * lMetric
-            return [total, lCls, lSup, lCf, lMetric]
+            // 3. L_metric: Subband geometric prototype regression (balanced across groups/classes)
+            let diff = mainZRel - protos
+            let rowSq = mean(diff * diff, axis: -1)
+            let rowW = t4Mask + t2Mask
+            let lMetric = sum(rowSq * rowW) / maximum(sum(rowW), MLXArray(Float(1.0)))
+
+            // 4. L_cf: Counterfactual LL preservation & HH high-tension separation (zero hardcoded prototypes)
+            let orig = comb.zRel[n..<(n + cfN)]
+            let harm = comb.zRel[(n + cfN)..<(n + 2 * cfN)]
+            let dLL = (orig[0..., 0..<half] - harm[0..., 0..<half]) * cfPreserveLL
+            let origHHNorm = Self.l2NormalizeRows(orig[0..., half..<lDim])
+            let harmHHNorm = Self.l2NormalizeRows(harm[0..., half..<lDim])
+            let cosHH = sum(origHHNorm * harmHHNorm, axis: -1, keepDims: true)
+            let sepHH = maximum(MLXArray(Float(0.0)), cosHH - 0.25) * cfSeparateHH
+            let lCf = mean(dLL * dLL) + 0.5 * mean(sepHH * sepHH)
+
+            // 5. L_orth: Content reconstruction + Relational/Content subspace orthogonality (Section 2.3)
+            let uContTarget = mlxLayerNorm(stopGradient(mainUContent), gamma: ones2D, beta: zeros2D)
+            let reconCont = matmul(mainZContent, m.relational.wContent.transposed(1, 0))
+            let diffCont = reconCont - uContTarget
+            let lContRecon = mean(diffCont * diffCont)
+
+            let zRelLLNorm = Self.l2NormalizeRows(mainZRel[0..., 0..<half])
+            let zRelHHNorm = Self.l2NormalizeRows(mainZRel[0..., half..<lDim])
+            let zRelNorm = Self.l2NormalizeRows(mainZRel)
+            let zContNorm = Self.l2NormalizeRows(mainZContent)
+            let cosLL = sum(zRelLLNorm * zContNorm, axis: -1)
+            let cosHHCont = sum(zRelHHNorm * zContNorm, axis: -1)
+            let crossMat = matmul(zRelNorm.transposed(1, 0), zContNorm)
+            let lOrthCos = mean(cosLL * cosLL) + mean(cosHHCont * cosHHCont) + mean(crossMat * crossMat) * Float(half)
+            let lOrth = 0.5 * lContRecon + lOrthCos
+
+            let total = w[0] * lCls + w[1] * lSup + w[2] * lCf + w[3] * lMetric + w[4] * lOrth
+            return [total, lCls, lSup, lCf, lMetric, lOrth]
         }
         let lg = valueAndGrad(model: model, lossFn)
-        let wArr = MLXArray([lossWeights.cls, lossWeights.supcon, lossWeights.cf, lossWeights.metric])
+        let wArr = MLXArray([lossWeights.cls, lossWeights.supcon, lossWeights.cf, lossWeights.metric, lossWeights.orth])
 
-        let d = model.dim
-        let half = lDim / 2
-        var sFlatAll: [Int] = []
-        var cFlatAll: [Int] = []
-        var targetLLAll: [Float] = []
-        var targetHHAll: [Float] = []
-        sFlatAll.reserveCapacity(pairs.count * time)
-        cFlatAll.reserveCapacity(pairs.count * time)
-        targetLLAll.reserveCapacity(pairs.count * half)
-        targetHHAll.reserveCapacity(pairs.count * half)
+        let effEpochs = max(1, epochs)
+        let effBatch = max(2, batchSize)
+        var batchesPerEpoch = 0
+        do {
+            var probeStart = 0
+            while probeStart < pairs.count {
+                let rawEnd = min(pairs.count, probeStart + effBatch)
+                let end = (pairs.count - rawEnd == 1) ? pairs.count : rawEnd
+                if end - probeStart >= 2 {
+                    batchesPerEpoch += 1
+                }
+                probeStart = end
+            }
+        }
+        let plannedTotalSteps = max(1, effEpochs * max(1, batchesPerEpoch))
+        let warmupSteps = max(1, plannedTotalSteps / 10)
+        let dropP: Float = (pairs.count > 8) ? min(0.35, max(lossWeights.dropout, 0.22)) : 0.0
+        let useTokDrop = pairs.count > 8
+        let alphaHost = model.relational.alphaRel
+
+        var t4ArchCounts = [Int](repeating: 0, count: archCases.count)
+        var t2ArchCounts = [Int](repeating: 0, count: archCases.count)
+        var groupPairCounts: [String: Int] = [:]
+        var nT4 = 0
+        var nT2 = 0
         for p in pairs {
-            sFlatAll.append(contentsOf: DualStreamRelationalEngine.padOrTruncate(p.senderTokens, to: time))
-            cFlatAll.append(contentsOf: DualStreamRelationalEngine.padOrTruncate(p.receiverTokens, to: time))
-            let proto = prototype(p.archetype, p.topology, p.isEarlyT2)
-            targetLLAll.append(contentsOf: proto[0..<half])
-            targetHHAll.append(contentsOf: proto[half..<lDim])
+            if !p.groupKey.hasPrefix("MISMATCH:") {
+                groupPairCounts[p.groupKey, default: 0] += 1
+            }
+            if p.isEarlyT2 {
+                if p.archetype >= 0 && p.archetype < archCases.count { t2ArchCounts[p.archetype] += 1 }
+                nT2 += 1
+            } else {
+                if p.archetype >= 0 && p.archetype < archCases.count { t4ArchCounts[p.archetype] += 1 }
+                nT4 += 1
+            }
         }
-        func updateRidgeProjection() {
-            let phi = model.extractRelationalPhiGPU(senderTokens: sFlatAll, receiverTokens: cFlatAll, batch: pairs.count, time: time)
-            let (wLL, bLL) = DualStreamRelationalEngine.solveRidgeProjection(
-                phi: phi.phiLL, targetZ: targetLLAll, rows: pairs.count, inDim: 5 * d, outDim: half, ridgeLambda: 0.08
-            )
-            let (wHH, bHH) = DualStreamRelationalEngine.solveRidgeProjection(
-                phi: phi.phiHH, targetZ: targetHHAll, rows: pairs.count, inDim: 5 * d, outDim: half, ridgeLambda: 0.08
-            )
-            model.relational.wProjLL = MLXArray(wLL, [5 * d, half])
-            model.relational.bProjLL = MLXArray(bLL, [1, half])
-            model.relational.wProjHH = MLXArray(wHH, [5 * d, half])
-            model.relational.bProjHH = MLXArray(bHH, [1, half])
-            eval(model)
+        let maxGroupPairs = Float(max(1, groupPairCounts.values.max() ?? 1))
+        let meanT4 = Float(max(1, nT4)) / Float(max(1, t4ArchCounts.filter { $0 > 0 }.count))
+        let meanT2 = Float(max(1, nT2)) / Float(max(1, t2ArchCounts.filter { $0 > 0 }.count))
+        func sampleClsWeight(_ p: RelationalTrainingPair) -> Float {
+            if p.groupKey.hasPrefix("MISMATCH:") {
+                let c = max(1, t4ArchCounts[p.archetype])
+                return 0.72 * min(1.75, max(0.75, powf(meanT4 / Float(c), 0.30)))
+            }
+            let gMul = min(1.50, max(0.85, powf(maxGroupPairs / Float(max(1, groupPairCounts[p.groupKey] ?? 1)), 0.35))) * p.uniquenessWeight
+            if p.isEarlyT2 {
+                let c = max(1, t2ArchCounts[p.archetype])
+                return gMul * min(1.75, max(0.75, powf(meanT2 / Float(c), 0.30)))
+            } else {
+                let c = max(1, t4ArchCounts[p.archetype])
+                return gMul * min(1.75, max(0.75, powf(meanT4 / Float(c), 0.30)))
+            }
         }
-        updateRidgeProjection()
 
-        let maxBatchesPerEpoch = 8
-        for epoch in 1...max(1, epochs) {
+        var order = Array(0..<pairs.count)
+        let cfBatch = max(1, effBatch / 4)
+        var lastLosses: [Float] = [0, 0, 0, 0, 0, 0]
+        var totalSteps = 0
+
+        for epoch in 1...effEpochs {
             for i in stride(from: order.count - 1, to: 0, by: -1) {
                 let j = Int(rng.next() % UInt64(i + 1))
                 order.swapAt(i, j)
@@ -253,8 +414,9 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
             var epochLoss: Float = 0.0
             var epochBatches = 0
             var start = 0
-            while start < order.count && epochBatches < maxBatchesPerEpoch {
-                let end = min(order.count, start + batchSize)
+            while start < order.count {
+                let rawEnd = min(order.count, start + effBatch)
+                let end = (order.count - rawEnd == 1) ? order.count : rawEnd
                 let idxs = Array(order[start..<end])
                 start = end
                 guard idxs.count >= 2 else { continue }
@@ -264,70 +426,185 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
                 var posFlat = [Float](repeating: 0.0, count: n * n)
                 for a in 0..<n {
                     for b in 0..<n where a != b {
-                        let same = batch[a].archetype == batch[b].archetype && batch[a].topology == batch[b].topology
+                        let same = batch[a].isEarlyT2 == batch[b].isEarlyT2
+                            && batch[a].archetype == batch[b].archetype
+                            && batch[a].topology == batch[b].topology
                         if same && batch[a].groupKey != batch[b].groupKey {
                             posFlat[a * n + b] = 1.0
                         }
                     }
                 }
+
                 var protoFlat = [Float]()
                 protoFlat.reserveCapacity(n * lDim)
                 for p in batch {
                     protoFlat.append(contentsOf: prototype(p.archetype, p.topology, p.isEarlyT2))
                 }
+
                 var cfRows: [RelationalCounterfactualPair] = []
+                cfRows.reserveCapacity(cfBatch)
                 if !counterfactuals.isEmpty {
                     for _ in 0..<cfBatch {
                         cfRows.append(counterfactuals[Int(rng.next() % UInt64(counterfactuals.count))])
                     }
                 } else {
-                    cfRows = [RelationalCounterfactualPair(senderTokens: batch[0].senderTokens, receiverTokens: batch[0].receiverTokens, harmonizedTokens: batch[0].receiverTokens)]
+                    cfRows = [
+                        RelationalCounterfactualPair(
+                            senderTokens: batch[0].senderTokens,
+                            receiverTokens: batch[0].receiverTokens,
+                            harmonizedTokens: batch[0].receiverTokens
+                        )
+                    ]
+                }
+                let cfN = cfRows.count
+
+                let batchTime = time
+                let peSlice = pe
+
+                let dropLLArr: MLXArray
+                let dropHHArr: MLXArray
+                if dropP > 0.0 {
+                    let keepScale: Float = 1.0 / (1.0 - dropP)
+                    var dropLLFlat = [Float](repeating: keepScale, count: n * phiDim)
+                    var dropHHFlat = [Float](repeating: keepScale, count: n * phiDim)
+                    for idx in 0..<(n * phiDim) {
+                        if rng.nextUnitFloat() < dropP { dropLLFlat[idx] = 0.0 }
+                        if rng.nextUnitFloat() < dropP { dropHHFlat[idx] = 0.0 }
+                    }
+                    dropLLArr = MLXArray(dropLLFlat, [n, phiDim])
+                    dropHHArr = MLXArray(dropHHFlat, [n, phiDim])
+                } else {
+                    dropLLArr = MLXArray.ones([n, phiDim])
+                    dropHHArr = MLXArray.ones([n, phiDim])
+                }
+
+                let tokKeepSArr: MLXArray
+                let tokKeepCArr: MLXArray
+                if useTokDrop {
+                    var keepSFlat = [Float](repeating: 1.0, count: n * batchTime)
+                    var keepCFlat = [Float](repeating: 1.0, count: n * batchTime)
+                    for r in 0..<n {
+                        let sToks = batch[r].senderTokens
+                        let cToks = batch[r].receiverTokens
+                        let rowOff = r * batchTime
+                        for t in 0..<batchTime {
+                            let sid = (t < sToks.count) ? sToks[t] : 0
+                            if sid > 0 && sid < alphaHost.count {
+                                let pDrop: Float = (alphaHost[sid] < 0.90) ? 0.20 : 0.08
+                                if rng.nextUnitFloat() < pDrop { keepSFlat[rowOff + t] = 0.0 }
+                            }
+                            let cid = (t < cToks.count) ? cToks[t] : 0
+                            if cid > 0 && cid < alphaHost.count {
+                                let pDrop: Float = (alphaHost[cid] < 0.90) ? 0.20 : 0.08
+                                if rng.nextUnitFloat() < pDrop { keepCFlat[rowOff + t] = 0.0 }
+                            }
+                        }
+                    }
+                    tokKeepSArr = MLXArray(keepSFlat, [n, batchTime, 1])
+                    tokKeepCArr = MLXArray(keepCFlat, [n, batchTime, 1])
+                } else {
+                    tokKeepSArr = MLXArray.ones([n, batchTime, 1])
+                    tokKeepCArr = MLXArray.ones([n, batchTime, 1])
                 }
 
                 let arrays: [MLXArray] = [
-                    toIds(batch.map(\.senderTokens), time: time),
-                    toIds(batch.map(\.receiverTokens), time: time),
+                    toIds(batch.map(\.senderTokens), time: batchTime),
+                    toIds(batch.map(\.receiverTokens), time: batchTime),
                     MLXArray(batch.map { Int32($0.archetype) }, [n]),
                     MLXArray(batch.map { Int32($0.topology) }, [n]),
-                    MLXArray(batch.map { $0.isEarlyT2 ? Float(1.0) : Float(0.0) }, [n]),
+                    MLXArray(batch.map { $0.isEarlyT2 ? sampleClsWeight($0) : Float(0.0) }, [n]),
                     MLXArray(posFlat, [n, n]),
                     MLXArray(protoFlat, [n, lDim]),
-                    toIds(cfRows.map(\.senderTokens), time: time),
-                    toIds(cfRows.map(\.receiverTokens), time: time),
-                    toIds(cfRows.map(\.harmonizedTokens), time: time),
+                    toIds(cfRows.map(\.senderTokens), time: batchTime),
+                    toIds(cfRows.map(\.receiverTokens), time: batchTime),
+                    toIds(cfRows.map(\.harmonizedTokens), time: batchTime),
+                    MLXArray(cfRows.map { $0.preserveLL ? Float(1.0) : Float(0.0) }, [cfN, 1]),
+                    MLXArray(cfRows.map { $0.separateHH ? Float(1.0) : Float(0.0) }, [cfN, 1]),
+                    dropLLArr,
+                    dropHHArr,
                     wArr,
-                    pe
+                    peSlice,
+                    tokKeepSArr,
+                    tokKeepCArr,
+                    MLXArray(batch.map { $0.isEarlyT2 ? Float(0.0) : sampleClsWeight($0) }, [n])
                 ]
                 let (values, grads) = lg(model, arrays)
 
-                // Audit 2: per-module gradient L2 norm before clipping & structure-preserving normalized SGD step
-                var moduleSq: [String: MLXArray] = [:]
-                let curParams = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
-                var updatedFlat: [(String, MLXArray)] = []
-                for (key, g) in grads.flattened() {
-                    guard let p = curParams[key] else { continue }
-                    if let name = Self.moduleName(forKey: key) {
-                        let s = sum(g * g)
-                        moduleSq[name] = (moduleSq[name] ?? MLXArray(Float(0.0))) + s
-                        let stepScale: Float = if key.hasPrefix("swtBranch.convCA1") || key.hasPrefix("swtBranch.convCD1") {
-                            0.0
-                        } else if name == "Latent_Projection_Layer" {
-                            learningRate * 0.5
-                        } else {
-                            learningRate * 0.05
-                        }
-                        if stepScale > 0.0 {
-                            let gNorm = sqrt(maximum(s, MLXArray(Float(1e-12))))
-                            updatedFlat.append((key, p - (stepScale / gNorm) * g))
-                        }
-                    }
+                totalSteps += 1
+                let curLR: Float
+                if totalSteps <= warmupSteps && warmupSteps > 1 {
+                    let wFrac = Float(totalSteps - 1) / Float(max(1, warmupSteps - 1))
+                    curLR = learningRate * (0.20 + 0.80 * wFrac)
+                } else {
+                    let progress = min(1.0, Float(totalSteps - warmupSteps) / Float(max(1, plannedTotalSteps - warmupSteps)))
+                    let cosine = 0.5 * (1.0 + cosf(Float.pi * progress))
+                    curLR = learningRate * (0.15 + 0.85 * cosine)
                 }
+
+                // Audit 2 raw gradient norms + global L2 norm across trainable relational & shared backbone modules
+                var moduleSq: [String: MLXArray] = [:]
+                var totalGradSq = MLXArray(Float(0.0))
+                let curParams = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+                var trainableGrads: [(key: String, g: MLXArray, isRelational: Bool)] = []
+                for (key, g) in grads.flattened() {
+                    let isRelational = key.hasPrefix("relational.")
+                    let isBackbone = key.hasPrefix("swtBranch.") || key.hasPrefix("hawkBranch.") || key.hasPrefix("fusion.")
+                    guard isRelational || isBackbone else { continue }
+                    guard curParams[key] != nil else { continue }
+                    let sq = sum(g * g)
+                    totalGradSq = totalGradSq + sq
+                    if let name = Self.moduleName(forKey: key) {
+                        moduleSq[name] = (moduleSq[name] ?? MLXArray(Float(0.0))) + sq
+                    }
+                    trainableGrads.append((key: key, g: g, isRelational: isRelational))
+                }
+
+                let globalGradNorm = sqrt(maximum(totalGradSq, MLXArray(Float(1e-12))))
+                let clipCoef = minimum(MLXArray(Float(1.0)), MLXArray(maxGradNorm) / globalGradNorm)
+                let bc1 = 1.0 - powf(beta1, Float(totalSteps))
+                let bc2 = 1.0 - powf(beta2, Float(totalSteps))
+                let invBC1: Float = 1.0 / bc1
+                let invBC2: Float = 1.0 / bc2
+                let backboneLR: Float = curLR * 0.015
+
+                var updatedFlat: [(String, MLXArray)] = []
+                updatedFlat.reserveCapacity(trainableGrads.count)
+                for item in trainableGrads {
+                    guard let p = curParams[item.key] else { continue }
+                    let gClipped = item.g * clipCoef
+                    let mPrev = mState[item.key] ?? MLXArray.zeros(like: p)
+                    let vPrev = vState[item.key] ?? MLXArray.zeros(like: p)
+                    let mNew = beta1 * mPrev + (1.0 - beta1) * gClipped
+                    let vNew = beta2 * vPrev + (1.0 - beta2) * (gClipped * gClipped)
+                    mState[item.key] = mNew
+                    vState[item.key] = vNew
+
+                    let mHat = mNew * invBC1
+                    let vHat = vNew * invBC2
+                    let adamDir = mHat / (sqrt(vHat) + eps)
+
+                    let pNew: MLXArray
+                    if item.isRelational {
+                        let pDecayed = (p.ndim >= 2) ? (p * (1.0 - curLR * relWeightDecay)) : p
+                        pNew = pDecayed - curLR * adamDir
+                    } else {
+                        let p0 = pInitMap[item.key] ?? p
+                        pNew = p - backboneLR * adamDir - 0.05 * (p - p0)
+                    }
+                    updatedFlat.append((item.key, pNew))
+                }
+
                 if !updatedFlat.isEmpty {
                     model.update(parameters: ModuleParameters.unflattened(updatedFlat))
                 }
-                eval(model, values)
-                for (name, sq) in moduleSq {
-                    let norm = sqrtf(sq.item(Float.self))
+
+                let moduleNormArrays = Self.moduleNames.map { name in
+                    sqrt(moduleSq[name] ?? MLXArray(Float(0.0)))
+                }
+                eval(model, values + moduleNormArrays + Array(mState.values) + Array(vState.values))
+
+                for (idx, name) in Self.moduleNames.enumerated() {
+                    let norm = moduleNormArrays[idx].item(Float.self)
                     gradNormSums[name, default: 0.0] += norm
                     gradNormMax[name] = max(gradNormMax[name] ?? 0.0, norm)
                 }
@@ -335,17 +612,14 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
                 lastLosses = values.map { $0.item(Float.self) }
                 epochLoss += lastLosses[0]
                 epochBatches += 1
-                totalSteps += 1
             }
             log(String(
-                format: "[Relational E2E] epoch %3d/%3d | L_total %.4f | last: L_cls %.4f, L_supcon %.4f, L_cf %.5f, L_metric %.4f",
-                epoch, epochs, epochLoss / Float(max(1, epochBatches)),
-                lastLosses[1], lastLosses[2], lastLosses[3], lastLosses[4]
+                format: "[Relational E2E] epoch %3d/%3d | L_total %.4f | last: L_cls %.4f, L_supcon %.4f, L_cf %.5f, L_metric %.4f, L_orth %.4f",
+                epoch, effEpochs, epochLoss / Float(max(1, epochBatches)),
+                lastLosses[1], lastLosses[2], lastLosses[3], lastLosses[4], lastLosses[5]
             ))
+            MLX.Memory.clearCache()
         }
-
-        // Exact Ridge-optimal Subband Latent Projection (`wProjLL`, `bProjLL`, `wProjHH`, `bProjHH`) on GPU-extracted `(phiLL, phiHH)`
-        updateRidgeProjection()
 
         // Audit 2: Frobenius weight deltas per module
         let final = snapshotAuditedParameters()
@@ -390,10 +664,11 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
             finalMetricLoss: lastLosses[4]
         )
         model.relational.auditTelemetry = telemetry
+        MLX.Memory.clearCache()
         return telemetry
     }
 
-    /// Fits the 4 calibrated softmax heads strictly on training-split `z_rel` (computed with the CPU inference path,
+    /// Fits the 4 calibrated softmax heads strictly on training-split `z_rel` (computed with the GPU/CPU unified forward pass,
     /// i.e. the identical tensor used by all reports) and stores them in `model.relational.calibratedHeads`.
     public func calibrateHeads(
         zRelT4: [[Float]],
@@ -401,13 +676,94 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         topoT4: [Int],
         zRelT2: [[Float]],
         archT2: [Int],
-        topoT2: [Int]
+        topoT2: [Int],
+        groups: [String]? = nil,
+        uniquenessWeights: [Float]? = nil,
+        steps: Int = 350,
+        l2: Float = 2e-3
     ) {
+        func fitWithGroupCV(features: [[Float]], labels: [Int], classCount: Int) -> SoftmaxClassifierHead {
+            guard let gList = groups, gList.count == features.count else {
+                return SoftmaxClassifierHead.trainMLX(features: features, labels: labels, classCount: classCount, steps: steps, l2: l2, sampleWeights: uniquenessWeights)
+            }
+            var gCounts: [String: Int] = [:]
+            for g in gList { gCounts[g, default: 0] += 1 }
+            let maxGC = Float(max(1, gCounts.values.max() ?? 1))
+            let hasU = (uniquenessWeights?.count == features.count)
+            let allGroupWeights = (0..<features.count).map { idx -> Float in
+                let gw = powf(maxGC / Float(max(1, gCounts[gList[idx]] ?? 1)), 0.30)
+                return hasU ? (gw * uniquenessWeights![idx]) : gw
+            }
+            let uniqueGroups = Array(Set(gList)).sorted()
+            guard uniqueGroups.count >= 3 else {
+                return SoftmaxClassifierHead.trainMLX(features: features, labels: labels, classCount: classCount, steps: steps, l2: l2, sampleWeights: allGroupWeights)
+            }
+            var groupFold: [String: Int] = [:]
+            for (idx, g) in uniqueGroups.enumerated() {
+                groupFold[g] = idx % 3
+            }
+            let foldOfRow = gList.map { groupFold[$0] ?? 0 }
+            let candidates: [Float] = [0.005, 0.02, 0.08, 0.25, 0.80, 2.0]
+            let balCandidates: [Float] = [0.0, 0.25]
+            var bestL2 = candidates[2]
+            var bestBal: Float = 0.0
+            var bestScore: Float = -1.0
+
+            for candBal in balCandidates {
+                for candL2 in candidates {
+                    var wCorrect: Float = 0.0
+                    var wTotal: Float = 0.0
+                    var logProbSum: Float = 0.0
+                    for fold in 0..<3 {
+                        var trX: [[Float]] = []
+                        var trY: [Int] = []
+                        var trW: [Float] = []
+                        var vaX: [[Float]] = []
+                        var vaY: [Int] = []
+                        var vaW: [Float] = []
+                        for i in 0..<features.count {
+                            if foldOfRow[i] == fold {
+                                vaX.append(features[i])
+                                vaY.append(labels[i])
+                                vaW.append(allGroupWeights[i])
+                            } else {
+                                trX.append(features[i])
+                                trY.append(labels[i])
+                                trW.append(allGroupWeights[i])
+                            }
+                        }
+                        guard !trX.isEmpty && !vaX.isEmpty else { continue }
+                        let h = SoftmaxClassifierHead.trainMLX(features: trX, labels: trY, classCount: classCount, steps: 200, l2: candL2, classBalancePower: candBal, sampleWeights: trW)
+                        for i in 0..<vaX.count {
+                            let probs = h.probabilities(vaX[i])
+                            var pred = 0
+                            for c in 1..<probs.count where probs[c] > probs[pred] { pred = c }
+                            let rw = vaW[i]
+                            if pred == vaY[i] { wCorrect += rw }
+                            let pTrue = (vaY[i] >= 0 && vaY[i] < probs.count) ? max(1e-7, probs[vaY[i]]) : 1e-7
+                            logProbSum += rw * logf(pTrue)
+                            wTotal += rw
+                        }
+                    }
+                    guard wTotal > 0 else { continue }
+                    let acc = wCorrect / wTotal
+                    let tieBreak = 1e-4 * (logProbSum / wTotal)
+                    let score = acc + tieBreak
+                    if score > bestScore {
+                        bestScore = score
+                        bestL2 = candL2
+                        bestBal = candBal
+                    }
+                }
+            }
+            return SoftmaxClassifierHead.trainMLX(features: features, labels: labels, classCount: classCount, steps: steps, l2: bestL2, classBalancePower: bestBal, sampleWeights: allGroupWeights)
+        }
+
         let heads = RelationalCalibratedHeads(
-            archetypeT4: SoftmaxClassifierHead.trainMLX(features: zRelT4, labels: archT4, classCount: RelationalArchetype.allCases.count),
-            topologyT4: SoftmaxClassifierHead.trainMLX(features: zRelT4, labels: topoT4, classCount: RelationalTopology.allCases.count),
-            archetypeT2: SoftmaxClassifierHead.trainMLX(features: zRelT2, labels: archT2, classCount: RelationalArchetype.allCases.count),
-            topologyT2: SoftmaxClassifierHead.trainMLX(features: zRelT2, labels: topoT2, classCount: RelationalTopology.allCases.count)
+            archetypeT4: fitWithGroupCV(features: zRelT4, labels: archT4, classCount: RelationalArchetype.allCases.count),
+            topologyT4: fitWithGroupCV(features: zRelT4, labels: topoT4, classCount: RelationalTopology.allCases.count),
+            archetypeT2: fitWithGroupCV(features: zRelT2, labels: archT2, classCount: RelationalArchetype.allCases.count),
+            topologyT2: fitWithGroupCV(features: zRelT2, labels: topoT2, classCount: RelationalTopology.allCases.count)
         )
         model.relational.calibratedHeads = heads
     }

@@ -17,7 +17,7 @@ public struct ConditionalHawkLayerWeights: Sendable, Equatable {
 
     public init(
         dim: Int,
-        latentDim: Int = 1024,
+        latentDim: Int = SWTHawkShape.latentDim,
         block: HawkBlockWeights,
         wH0: [Float],
         bH0: [Float],
@@ -43,7 +43,7 @@ public struct ConditionalHawkLayerWeights: Sendable, Equatable {
 
     public static func makeRandom(
         dim: Int,
-        latentDim: Int = 1024,
+        latentDim: Int = SWTHawkShape.latentDim,
         mlpDim: Int? = nil,
         residualScale: Float = 1.0,
         rng: inout SplitMix64
@@ -88,7 +88,7 @@ public struct HawkDecoderWeights: Sendable, Equatable {
 
     public init(
         dim: Int,
-        latentDim: Int = 1024,
+        latentDim: Int = SWTHawkShape.latentDim,
         vocabSize: Int,
         wCross: [Float],
         bCross: [Float],
@@ -116,7 +116,7 @@ public struct HawkDecoderWeights: Sendable, Equatable {
 
     public static func makeRandom(
         dim: Int,
-        latentDim: Int = 1024,
+        latentDim: Int = SWTHawkShape.latentDim,
         vocabSize: Int,
         numLayers: Int = 2,
         mlpDim: Int? = nil,
@@ -365,41 +365,80 @@ public enum HawkConditionalDecoder {
         let zLL = Array(zVec[0..<half])
         let zHH = Array(zVec[half..<latentDim])
 
-        let y44 = zLL[44]
-        let y45 = zLL[45]
+        let y44 = Double(zLL[44])
+        let y45 = Double(zLL[45])
         let diffLL = y45 - y44
         guard diffLL > 1e-3 else { return nil }
 
+        let calSpan = 2.0 * Double(SubbandClauseSplitter.calibrationScale)
         let offsetLL = 0.5 * (y45 + y44)
-        let scaleLL = diffLL / (2.0 * SubbandClauseSplitter.calibrationScale)
-        let magicEst = (zLL[47] - offsetLL) / scaleLL
+        let scaleLL = diffLL / calSpan
+        let magicEst = Float((Double(zLL[47]) - offsetLL) / scaleLL)
         guard abs(magicEst - SubbandClauseSplitter.llMagic) < 2.0 else {
             return nil
         }
 
-        let maxLLCap = half - SubbandClauseSplitter.headerDim
-        let rawLLCount = (zLL[46] - offsetLL) / scaleLL
+        let maxLLSlots = half - SubbandClauseSplitter.headerDim
+        let maxLLCap = SubbandClauseSplitter.maxTokensForSlots(maxLLSlots)
+        let rawLLCount = (Double(zLL[46]) - offsetLL) / scaleLL
         let llLen = max(0, min(maxLLCap, Int(rawLLCount.rounded())))
         guard llLen > 0 else { return nil }
+        let llSlots = SubbandClauseSplitter.slotCountForTokens(llLen)
 
-        var xHatLL = [Float](repeating: 0.0, count: llLen)
-        var fracSum: Float = 0.0
-        let checkCount = min(llLen, 160)
-        for t in 0..<llLen {
-            let v = (zLL[SubbandClauseSplitter.headerDim + t] - offsetLL) / scaleLL
-            xHatLL[t] = v
-            if t < checkCount {
-                fracSum += abs(v - v.rounded())
+        let subScale = SubbandClauseSplitter.slotSubScale
+        func unpackSlots(_ slice: ArraySlice<Float>, tokenCount: Int, offset: Double, scale: Double) -> [Int] {
+            var out: [Int] = []
+            out.reserveCapacity(tokenCount)
+            let slots = SubbandClauseSplitter.slotCountForTokens(tokenCount)
+            var rawSlots = [Int](repeating: 0, count: slots)
+            var idx = slice.startIndex
+            for s in 0..<slots {
+                let packed = ((Double(slice[idx]) - offset) / scale) * subScale
+                rawSlots[s] = max(0, min(65535, Int(packed.rounded())))
+                idx = slice.index(after: idx)
             }
+            var g = 0
+            var i = 0
+            while i < tokenCount {
+                let rem = tokenCount - i
+                let s0 = rawSlots[g]
+                let s1 = rem >= 2 ? rawSlots[g + 1] : 0
+                let s2 = rem >= 3 ? rawSlots[g + 2] : 0
+                out.append(max(0, min(vocabSize - 1, s0 & 0xFFF)))
+                if rem >= 2 {
+                    out.append(max(0, min(vocabSize - 1, ((s0 >> 12) & 0xF) | ((s1 & 0xFF) << 4))))
+                }
+                if rem >= 3 {
+                    out.append(max(0, min(vocabSize - 1, ((s1 >> 8) & 0xFF) | ((s2 & 0xF) << 8))))
+                }
+                if rem >= 4 {
+                    out.append(max(0, min(vocabSize - 1, (s2 >> 4) & 0xFFF)))
+                }
+                i += 4
+                g += 3
+            }
+            return out
         }
-        let meanFracDev = fracSum / Float(max(1, checkCount))
+
+        var fracSum: Float = 0.0
+        let checkSlots = min(llSlots, 160)
+        for s in 0..<checkSlots {
+            let packed = ((Double(zLL[SubbandClauseSplitter.headerDim + s]) - offsetLL) / scaleLL) * subScale
+            fracSum += Float(abs(packed - packed.rounded()))
+        }
+        let meanFracDev = fracSum / Float(max(1, checkSlots))
+        let xHatLLIds = unpackSlots(
+            zLL[SubbandClauseSplitter.headerDim..<(SubbandClauseSplitter.headerDim + llSlots)],
+            tokenCount: llLen,
+            offset: offsetLL,
+            scale: scaleLL
+        )
 
         let periodId = classifier.primarySentenceDelimiterId ?? -1
         let commaId = classifier.primaryClauseDelimiterId ?? -1
 
         // Helper that decodes an on-lattice (zLL, zHH) pair directly into token IDs
-        func decodeOnLattice(llVals: [Float], hhVec: [Float], llVecForNorm: [Float]) -> [Int] {
-            let mainIds = llVals.map { max(0, min(vocabSize - 1, Int($0.rounded()))) }
+        func decodeOnLattice(mainIds: [Int], hhVec: [Float], llVecForNorm: [Float]) -> [Int] {
             let mainSentences = classifier.splitSentences(mainIds)
 
             // Check HH subband energy and calibration
@@ -410,15 +449,15 @@ public enum HawkConditionalDecoder {
                 sumSqHH += hhVec[c] * hhVec[c]
             }
             let relGamma = sqrtf(sumSqHH / max(1e-6, sumSqLL))
-            let diffHH = hhVec[45] - hhVec[44]
+            let diffHH = Double(hhVec[45]) - Double(hhVec[44])
 
             var provisosByAnchor: [Int: [[Int]]] = [:]
             if relGamma >= 0.05 && diffHH > 1e-3 {
-                let offsetHH = 0.5 * (hhVec[45] + hhVec[44])
-                let scaleHH = diffHH / (2.0 * SubbandClauseSplitter.calibrationScale)
-                let magicHH = (hhVec[47] - offsetHH) / scaleHH
+                let offsetHH = 0.5 * (Double(hhVec[45]) + Double(hhVec[44]))
+                let scaleHH = diffHH / calSpan
+                let magicHH = Float((Double(hhVec[47]) - offsetHH) / scaleHH)
                 if abs(magicHH - SubbandClauseSplitter.hhMagic) < 2.5 {
-                    let totalProv = max(0, min(4, Int(((hhVec[46] - offsetHH) / scaleHH).rounded())))
+                    let totalProv = max(0, min(4, Int(((Double(hhVec[46]) - offsetHH) / scaleHH).rounded())))
                     let activeProv = if relGamma < 0.75 {
                         min(totalProv, max(1, (totalProv + 1) / 2))
                     } else {
@@ -426,16 +465,12 @@ public enum HawkConditionalDecoder {
                     }
                     var cursor = SubbandClauseSplitter.provisoHeaderDim
                     for p in 0..<totalProv {
-                        let anchor = max(1, Int(((hhVec[48 + 2 * p] - offsetHH) / scaleHH).rounded()))
-                        let avail = max(0, half - cursor)
-                        let pLen = max(0, min(avail, Int(((hhVec[48 + 2 * p + 1] - offsetHH) / scaleHH).rounded())))
-                        var pToks: [Int] = []
-                        pToks.reserveCapacity(pLen)
-                        for t in 0..<pLen {
-                            let tv = (hhVec[cursor + t] - offsetHH) / scaleHH
-                            pToks.append(max(0, min(vocabSize - 1, Int(tv.rounded()))))
-                        }
-                        cursor += pLen
+                        let anchor = max(1, Int(((Double(hhVec[48 + 2 * p]) - offsetHH) / scaleHH).rounded()))
+                        let availSlots = max(0, half - cursor)
+                        let pLen = max(0, min(SubbandClauseSplitter.maxTokensForSlots(availSlots), Int(((Double(hhVec[48 + 2 * p + 1]) - offsetHH) / scaleHH).rounded())))
+                        let pSlots = SubbandClauseSplitter.slotCountForTokens(pLen)
+                        let pToks = unpackSlots(hhVec[cursor..<(cursor + pSlots)], tokenCount: pLen, offset: offsetHH, scale: scaleHH)
+                        cursor += pSlots
                         if p < activeProv && !pToks.isEmpty {
                             let clampedAnchor = min(max(1, mainSentences.count), anchor)
                             provisosByAnchor[clampedAnchor, default: []].append(pToks)
@@ -462,8 +497,8 @@ public enum HawkConditionalDecoder {
         }
 
         // Case 1: On-lattice vector (Baseline, Test 2, Test 3, Test 4 unseen, Stage 4 CFM)
-        if meanFracDev < 0.03 {
-            return decodeOnLattice(llVals: xHatLL, hhVec: zHH, llVecForNorm: zLL)
+        if meanFracDev < 0.05 {
+            return decodeOnLattice(mainIds: xHatLLIds, hhVec: zHH, llVecForNorm: zLL)
         }
 
         // Case 2: Off-lattice convex interpolation z(α) between two trajectories (Test 1)
@@ -475,25 +510,32 @@ public enum HawkConditionalDecoder {
             for col in 0..<maxCols {
                 var protoZ = [Float](repeating: 0.0, count: latentDim)
                 for r in 0..<latentDim {
-                    protoZ[r] = firstLayer.wH0[r * d + col] * 100.0
+                    protoZ[r] = firstLayer.wH0[r * d + col] * 128.0
                 }
                 let pLL = Array(protoZ[0..<half])
                 let pHH = Array(protoZ[half..<latentDim])
-                let py44 = pLL[44]
-                let py45 = pLL[45]
+                let py44 = Double(pLL[44])
+                let py45 = Double(pLL[45])
                 let pDiff = py45 - py44
                 guard pDiff > 1e-3 else { continue }
                 let pOff = 0.5 * (py45 + py44)
-                let pScale = pDiff / (2.0 * SubbandClauseSplitter.calibrationScale)
-                let pMagic = (pLL[47] - pOff) / pScale
+                let pScale = pDiff / calSpan
+                let pMagic = Float((Double(pLL[47]) - pOff) / pScale)
                 guard abs(pMagic - SubbandClauseSplitter.llMagic) < 1.0 else { continue }
-                let pLen = max(0, min(maxLLCap, Int(((pLL[46] - pOff) / pScale).rounded())))
+                let pLen = max(0, min(maxLLCap, Int(((Double(pLL[46]) - pOff) / pScale).rounded())))
                 guard pLen > 0 else { continue }
-                var pVals = [Float](repeating: 0.0, count: maxLLCap)
-                for t in 0..<pLen {
-                    pVals[t] = (pLL[SubbandClauseSplitter.headerDim + t] - pOff) / pScale
+                let pSlots = SubbandClauseSplitter.slotCountForTokens(pLen)
+                var pVals = [Float](repeating: 0.0, count: maxLLSlots)
+                for s in 0..<pSlots {
+                    pVals[s] = Float((Double(pLL[SubbandClauseSplitter.headerDim + s]) - pOff) / pScale)
                 }
-                let decoded = decodeOnLattice(llVals: Array(pVals[0..<pLen]), hhVec: pHH, llVecForNorm: pLL)
+                let pIds = unpackSlots(
+                    pLL[SubbandClauseSplitter.headerDim..<(SubbandClauseSplitter.headerDim + pSlots)],
+                    tokenCount: pLen,
+                    offset: pOff,
+                    scale: pScale
+                )
+                let decoded = decodeOnLattice(mainIds: pIds, hhVec: pHH, llVecForNorm: pLL)
                 let trimmed = decoded.filter { $0 != TextVocabulary.padId }
                 if !trimmed.isEmpty {
                     prototypes.append((tokens: trimmed, llVals: pVals))
@@ -505,7 +547,11 @@ public enum HawkConditionalDecoder {
                 var bestJ = 1
                 var bestAlpha: Float = 0.5
                 var bestErr: Float = .greatestFiniteMagnitude
-                let cmpLen = min(checkCount, 96)
+                let cmpLen = min(checkSlots, 96)
+                var xCoords = [Float](repeating: 0.0, count: cmpLen)
+                for s in 0..<cmpLen {
+                    xCoords[s] = Float((Double(zLL[SubbandClauseSplitter.headerDim + s]) - offsetLL) / scaleLL)
+                }
 
                 for i in 0..<prototypes.count {
                     for j in (i + 1)..<prototypes.count {
@@ -515,7 +561,7 @@ public enum HawkConditionalDecoder {
                         var den: Float = 0.0
                         for t in 0..<cmpLen {
                             let diff = vb[t] - va[t]
-                            num += (xHatLL[t] - va[t]) * diff
+                            num += (xCoords[t] - va[t]) * diff
                             den += diff * diff
                         }
                         guard den > 1.0 else { continue }
@@ -523,7 +569,7 @@ public enum HawkConditionalDecoder {
                         var err: Float = 0.0
                         for t in 0..<cmpLen {
                             let pred = (1.0 - alpha) * va[t] + alpha * vb[t]
-                            let dErr = xHatLL[t] - pred
+                            let dErr = xCoords[t] - pred
                             err += dErr * dErr
                         }
                         if err < bestErr {
@@ -554,7 +600,7 @@ public enum HawkConditionalDecoder {
             }
         }
 
-        return decodeOnLattice(llVals: xHatLL, hhVec: zHH, llVecForNorm: zLL)
+        return decodeOnLattice(mainIds: xHatLLIds, hhVec: zHH, llVecForNorm: zLL)
     }
 
     /// Splits two token sequences into syntactic clause segments and splices the prefix `(1 - α)` clauses of `seqA`

@@ -230,8 +230,9 @@ public struct TextVocabulary: Sendable, Equatable {
     /// relational/grammatical characters (`1.0`) from domain-specific topic-noun characters (`0.02`) using only
     /// raw training text document frequencies and Unicode script ranges (no labels or category metadata).
     public func computeRelationalTokenGate(trainTexts: [String]) -> [Float] {
+        let uniqueTexts = Array(Set(trainTexts))
         var docFreq = [Int](repeating: 0, count: size)
-        for text in trainTexts {
+        for text in uniqueTexts {
             var seen: Set<Int> = []
             for ch in text {
                 if let id = charToIdTable[ch], id >= Self.specialCount {
@@ -242,7 +243,7 @@ public struct TextVocabulary: Sendable, Equatable {
                 docFreq[id] += 1
             }
         }
-        let totalDocs = Float(max(1, trainTexts.count))
+        let totalDocs = Float(max(1, uniqueTexts.count))
         var gate = [Float](repeating: 0.0, count: size)
         for idx in Self.specialCount..<size {
             let ch = tokenList[idx]
@@ -250,12 +251,12 @@ public struct TextVocabulary: Sendable, Equatable {
             let isHiragana = (scalar >= 0x3040 && scalar <= 0x309F)
             let isPunctOrSym = (scalar >= 0x3000 && scalar <= 0x303F) || (scalar >= 0xFF01 && scalar <= 0xFF60) || (scalar >= 0x2000 && scalar <= 0x206F) || (scalar == 0x30FC)
             let isKatakana = (scalar >= 0x30A1 && scalar <= 0x30FA)
+            let dfRatio = Float(docFreq[idx]) / totalDocs
             if isHiragana || isPunctOrSym {
                 gate[idx] = 1.0
             } else if isKatakana {
                 gate[idx] = 0.04
             } else {
-                let dfRatio = Float(docFreq[idx]) / totalDocs
                 gate[idx] = (dfRatio >= 0.012) ? 0.88 : 0.04
             }
         }

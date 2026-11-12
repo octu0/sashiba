@@ -3,16 +3,16 @@ import Testing
 import MLX
 @testable import Sashiba
 
-@Suite("Step 3: SWT-Hawk Encoder, Time-Frequency Fusion & 1024-D Bottleneck Verification")
+@Suite("Step 3: SWT-Hawk Encoder, Time-Frequency Fusion & 512-D Bottleneck Verification")
 struct Step3EncoderBottleneckTests {
-    @Test("Step 3.1: Arbitrary sequence lengths T (37, 128, 256) always compress to fixed z: (B, 1024)")
+    @Test("Step 3.1: Arbitrary sequence lengths T (37, 128, 256) always compress to fixed z: (B, 512)")
     func encoderFixedLatentDimensionAcrossSequenceLengths() {
         let batch = 2
         let vocabSize = 64
         let weights = SWTHawkWeights.makeRandom(
             vocabSize: vocabSize,
             dim: 32,
-            latentDim: 1024,
+            latentDim: SWTHawkShape.latentDim,
             encoderLayers: 2,
             decoderLayers: 1,
             seed: 707
@@ -25,7 +25,7 @@ struct Step3EncoderBottleneckTests {
                 tokens[i] = 4 + (i % (vocabSize - 4))
             }
             let z = model.encode(tokens: tokens, batch: batch, time: seqLen)
-            #expect(z.count == batch * 1024)
+            #expect(z.count == batch * weights.latentDim)
             let sumSq = z.withUnsafeBufferPointer { ptr in
                 VectorOperations.sumOfSquares(ptr: ptr.baseAddress!, count: z.count)
             }
@@ -33,13 +33,13 @@ struct Step3EncoderBottleneckTests {
         }
     }
 
-    @Test("Step 3.2: High-frequency single-token negation/exception spike changes z ∈ R^(B × 1024)")
+    @Test("Step 3.2: High-frequency single-token negation/exception spike changes z ∈ R^(B × 512)")
     func encoderSensitivityToLocalExceptionToken() {
         let vocabSize = 32
         let weights = SWTHawkWeights.makeRandom(
             vocabSize: vocabSize,
             dim: 32,
-            latentDim: 1024,
+            latentDim: SWTHawkShape.latentDim,
             seed: 808
         )
         let model = SWTHawkAutoencoder(weights: weights)
@@ -53,7 +53,7 @@ struct Step3EncoderBottleneckTests {
         let zB = model.encode(tokens: seqB, batch: 1, time: seqLen)
 
         var diffSq: Float = 0.0
-        for d in 0..<1024 {
+        for d in 0..<weights.latentDim {
             let diff = zA[d] - zB[d]
             diffSq += diff * diff
         }
@@ -68,7 +68,7 @@ struct Step3EncoderBottleneckTests {
         let weights = SWTHawkWeights.makeRandom(
             vocabSize: vocabSize,
             dim: 16,
-            latentDim: 1024,
+            latentDim: SWTHawkShape.latentDim,
             encoderLayers: 1,
             decoderLayers: 1,
             seed: 909
