@@ -255,9 +255,13 @@ public struct TextVocabulary: Sendable, Equatable {
             if isHiragana || isPunctOrSym {
                 gate[idx] = 1.0
             } else if isKatakana {
-                gate[idx] = 0.04
+                gate[idx] = (dfRatio >= 0.015 && docFreq[idx] >= 3) ? 0.35 : 0.08
+            } else if dfRatio >= 0.012 && docFreq[idx] >= 3 {
+                gate[idx] = 0.90
+            } else if dfRatio >= 0.003 && docFreq[idx] >= 2 {
+                gate[idx] = 0.32
             } else {
-                gate[idx] = (dfRatio >= 0.012) ? 0.88 : 0.04
+                gate[idx] = 0.08
             }
         }
         return gate

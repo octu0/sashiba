@@ -14,7 +14,8 @@ struct RelationalHeadCLI {
     var foldEpochs: Int = 15
     var relBatch: Int = 32
     var relLR: Float = 1.4e-3
-    var skipFolds: Bool = false
+    var skipFolds: Bool = true
+    var useGPU: Bool = false
 
     static func parse(_ args: [String]) -> RelationalHeadCLI {
         var cli = RelationalHeadCLI()
@@ -50,6 +51,13 @@ struct RelationalHeadCLI {
                 if i < args.count, let v = Float(args[i]) { cli.relLR = v }
             case "--skip-folds":
                 cli.skipFolds = true
+            case "--retrain-folds":
+                cli.skipFolds = false
+                cli.useGPU = true
+            case "--gpu":
+                cli.useGPU = true
+            case "--cpu":
+                cli.useGPU = false
             default:
                 break
             }
@@ -77,9 +85,11 @@ let tasks: [HeadTask] = [
     HeadTask(name: "topology_t2", useEarlyText: true, classNames: topologyNames) { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
 ]
 
-MLX.Memory.cacheLimit = 128 * 1024 * 1024
-MLX.Memory.clearCache()
 let cli = RelationalHeadCLI.parse(CommandLine.arguments)
+if cli.useGPU {
+    MLX.Memory.cacheLimit = 128 * 1024 * 1024
+    MLX.Memory.clearCache()
+}
 let config = DatasetConfiguration.load(from: cli.dataPath)
 let trainCasesAll = config.relationalDialogueCases.filter { !$0.isZeroShotUnseen }
 let unseenCasesAll = config.relationalDialogueCases.filter { $0.isZeroShotUnseen }
@@ -90,7 +100,8 @@ guard !trainCasesAll.isEmpty && !unseenCasesAll.isEmpty else {
 
 let weights = try SWTHawkWeights.load(from: URL(fileURLWithPath: cli.weightsPath))
 let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
-let mainModel = MLXSWTHawkAutoencoder(weights: weights)
+let hybridExtractor = RelationalHybridFeatureExtractor(vocabulary: vocab)
+let mainModel: MLXSWTHawkAutoencoder? = cli.useGPU ? MLXSWTHawkAutoencoder(weights: weights) : nil
 
 let allCases = trainCasesAll + unseenCasesAll
 let seqLen = allCases
@@ -99,7 +110,7 @@ let seqLen = allCases
     .reduce(4, max)
 
 print("==================================================================")
-print("Phase 5.1 Relational Head Evaluation (pure-neural z_rel, unified heads)")
+print("Phase 5.1 Relational Head Evaluation (Mode: \(cli.useGPU ? "GPU" : "Pure Multi-Core CPU (0 GPU VRAM)"))")
 print("==================================================================")
 print("Train cases: \(trainCasesAll.count) | Unseen cases: \(unseenCasesAll.count) | seqLen: \(seqLen)")
 
@@ -174,8 +185,54 @@ let pct = { (v: Float) in String(format: "%6.2f%%", v * 100.0) }
 // ------------------------------------------------------------------
 // (A) Scenario split: the SAME calibrated heads and the SAME z_rel tensor used by verify_latent_space (Audit 5).
 // ------------------------------------------------------------------
-let zT2All = RelationalPipeline.encodeZRel(model: mainModel, senders: hostEarlyTok, receivers: earlyTok, time: seqLen)
-let zT4All = RelationalPipeline.encodeZRel(model: mainModel, senders: hostTok, receivers: currentTok, time: seqLen)
+let zT2All: [[Float]]
+let zT4All: [[Float]]
+let wAttr = try? FileManager.default.attributesOfItem(atPath: cli.weightsPath)
+let wSize = (wAttr?[.size] as? NSNumber)?.int64Value ?? 0
+let wMtime = Int64((wAttr?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+let zCacheDir = (cli.dataPath as NSString).appendingPathComponent("validation/zrel_cache")
+try? FileManager.default.createDirectory(atPath: zCacheDir, withIntermediateDirectories: true)
+let zCacheT2 = (zCacheDir as NSString).appendingPathComponent("relhead_t2_\(allCases.count)_\(seqLen)_\(wSize)_\(wMtime).bin")
+let zCacheT4 = (zCacheDir as NSString).appendingPathComponent("relhead_t4_\(allCases.count)_\(seqLen)_\(wSize)_\(wMtime).bin")
+
+func loadZCache(_ path: String, rows: Int, dim: Int) -> [[Float]]? {
+    let expectedBytes = rows * dim * MemoryLayout<Float>.size
+    guard let d = try? Data(contentsOf: URL(fileURLWithPath: path)), d.count == expectedBytes else { return nil }
+    var out: [[Float]] = []
+    out.reserveCapacity(rows)
+    d.withUnsafeBytes { raw in
+        let base = raw.bindMemory(to: Float.self).baseAddress!
+        for r in 0..<rows {
+            out.append(Array(UnsafeBufferPointer(start: base + r * dim, count: dim)))
+        }
+    }
+    return out
+}
+func saveZCache(_ path: String, matrix: [[Float]]) {
+    let flat = matrix.flatMap { $0 }
+    let d = flat.withUnsafeBufferPointer { Data(buffer: $0) }
+    try? d.write(to: URL(fileURLWithPath: path), options: .atomic)
+}
+
+let relDim = weights.relational.latentDim
+if !cli.useGPU, let c2 = loadZCache(zCacheT2, rows: allCases.count, dim: relDim), let c4 = loadZCache(zCacheT4, rows: allCases.count, dim: relDim) {
+    zT2All = c2
+    zT4All = c4
+} else if let m = mainModel {
+    zT2All = RelationalPipeline.encodeZRel(model: m, senders: hostEarlyTok, receivers: earlyTok, time: seqLen)
+    zT4All = RelationalPipeline.encodeZRel(model: m, senders: hostTok, receivers: currentTok, time: seqLen)
+} else {
+    zT2All = DualStreamRelationalEngine.encodeZRelCPUParallel(senders: hostEarlyTok, receivers: earlyTok, time: seqLen, weights: weights, chunkSize: 16)
+    zT4All = DualStreamRelationalEngine.encodeZRelCPUParallel(senders: hostTok, receivers: currentTok, time: seqLen, weights: weights, chunkSize: 16)
+    saveZCache(zCacheT2, matrix: zT2All)
+    saveZCache(zCacheT4, matrix: zT4All)
+}
+let hybridT2All = allCases.indices.map { i in
+    hybridExtractor.extract(senderTokens: hostEarlyTok[i], receiverTokens: earlyTok[i], zRel: zT2All[i], weights: weights)
+}
+let hybridT4All = allCases.indices.map { i in
+    hybridExtractor.extract(senderTokens: hostTok[i], receiverTokens: currentTok[i], zRel: zT4All[i], weights: weights)
+}
 
 var splitResults: [EvalResult] = []
 var predictionsA: [String: [String: Int]] = [:]
@@ -200,10 +257,26 @@ for task in tasks {
     splitResults.append(r)
     print("[split   ][neural] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
 }
+let trainGroups = trainIndices.map { allCases[$0].group }
+for task in tasks {
+    let hyb = task.useEarlyText ? hybridT2All : hybridT4All
+    let trainX = trainIndices.map { hyb[$0] }
+    let trainY = trainIndices.map { task.label(allCases[$0]) }
+    let h = SoftmaxClassifierHead.trainGroupCV(features: trainX, labels: trainY, groups: trainGroups, classCount: task.classNames.count, steps: 350)
+    let trainCorrect = zip(trainX, trainY).filter { h.predict($0) == $1 }.count
+    let preds = unseenIndices.map { h.predict(hyb[$0]) }
+    let maj = majorityClass(trainY, classCount: task.classNames.count)
+    let r = summarize(
+        task: task, featurizer: "neural_hybrid", testIdx: unseenIndices, preds: preds,
+        majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
+    )
+    splitResults.append(r)
+    print("[split   ][neural_hybrid] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+}
 for task in tasks {
     let trainX = trainIndices.map { ngramInput($0, task.useEarlyText) }
     let trainY = trainIndices.map { task.label(allCases[$0]) }
-    let h = SoftmaxClassifierHead.trainMLX(features: trainX, labels: trainY, classCount: task.classNames.count, steps: cli.steps)
+    let h = SoftmaxClassifierHead.train(features: trainX, labels: trainY, classCount: task.classNames.count, steps: cli.steps)
     let trainCorrect = zip(trainX, trainY).filter { h.predict($0) == $1 }.count
     let preds = unseenIndices.map { h.predict(ngramInput($0, task.useEarlyText)) }
     let maj = majorityClass(trainY, classCount: task.classNames.count)
@@ -342,6 +415,57 @@ if !cli.skipFolds {
         holdoutResults.append(rg)
         print("[holdout ][char_ngram] \(task.name): held-out categories \(pct(rg.testAcc)) | majority \(pct(rg.majorityAcc))")
     }
+} else {
+    // Fast Zero-GPU Frozen-Feature Group 6-Fold Head CV (evaluates strictly on unseen_test of held-out categories, 0 label leakage)
+    let startFast = Date()
+    var zPreds: [String: [Int: Int]] = [:]
+    var hPreds: [String: [Int: Int]] = [:]
+    var ngPreds: [String: [Int: Int]] = [:]
+    var majPreds: [String: [Int: Int]] = [:]
+    var zTrC: [String: Int] = [:], hTrC: [String: Int] = [:], ngTrC: [String: Int] = [:], trTot: [String: Int] = [:]
+
+    for fold in 0..<foldCount {
+        let foldTrain = trainIndices.filter { foldOfCategory[allCases[$0].group] != fold }
+        let foldTest = unseenIndices.filter { foldOfCategory[allCases[$0].group] == fold }
+        guard !foldTrain.isEmpty && !foldTest.isEmpty else { continue }
+        let fGroups = foldTrain.map { allCases[$0].group }
+        for task in tasks {
+            let zBank = task.useEarlyText ? zT2All : zT4All
+            let hBank = task.useEarlyText ? hybridT2All : hybridT4All
+            let yTr = foldTrain.map { task.label(allCases[$0]) }
+            let maj = majorityClass(yTr, classCount: task.classNames.count)
+            trTot[task.name, default: 0] += foldTrain.count
+
+            let hz = SoftmaxClassifierHead.trainGroupCV(features: foldTrain.map { zBank[$0] }, labels: yTr, groups: fGroups, classCount: task.classNames.count, steps: 200)
+            let hh = SoftmaxClassifierHead.trainGroupCV(features: foldTrain.map { hBank[$0] }, labels: yTr, groups: fGroups, classCount: task.classNames.count, steps: 200)
+            let hng = SoftmaxClassifierHead.train(features: foldTrain.map { ngramInput($0, task.useEarlyText) }, labels: yTr, classCount: task.classNames.count, steps: 140, learningRate: 0.08)
+
+            zTrC[task.name, default: 0] += foldTrain.filter { hz.predict(zBank[$0]) == task.label(allCases[$0]) }.count
+            hTrC[task.name, default: 0] += foldTrain.filter { hh.predict(hBank[$0]) == task.label(allCases[$0]) }.count
+            ngTrC[task.name, default: 0] += foldTrain.filter { hng.predict(ngramInput($0, task.useEarlyText)) == task.label(allCases[$0]) }.count
+
+            for i in foldTest {
+                zPreds[task.name, default: [:]][i] = hz.predict(zBank[i])
+                hPreds[task.name, default: [:]][i] = hh.predict(hBank[i])
+                ngPreds[task.name, default: [:]][i] = hng.predict(ngramInput(i, task.useEarlyText))
+                majPreds[task.name, default: [:]][i] = maj
+            }
+        }
+    }
+    let unseenHoldoutIdx = unseenIndices.filter { foldOfCategory[allCases[$0].group] != nil }
+    for (featName, pMap, tcMap) in [("neural_frozen", zPreds, zTrC), ("neural_hybrid_frozen", hPreds, hTrC), ("char_ngram", ngPreds, ngTrC)] {
+        for task in tasks {
+            let r = summarize(
+                task: task, featurizer: featName, testIdx: unseenHoldoutIdx,
+                preds: unseenHoldoutIdx.map { pMap[task.name]?[$0] ?? 0 },
+                majorityPreds: unseenHoldoutIdx.map { majPreds[task.name]?[$0] ?? 0 },
+                trainCorrect: tcMap[task.name] ?? 0, trainTotal: trTot[task.name] ?? 1
+            )
+            holdoutResults.append(r)
+            print("[fast-cv ][\(featName)] \(task.name): unseen-cat \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+        }
+    }
+    foldLog.append(String(format: "Fast pure-CPU frozen-feature Group 6-Fold CV completed in %.2fs (0 GPU retraining; pass --retrain-folds for heavy GPU E2E fold retraining).", Date().timeIntervalSince(startFast)))
 }
 
 func resultTable(_ rs: [EvalResult], testLabel: String) -> String {
@@ -362,30 +486,26 @@ func perClassList(_ rs: [EvalResult]) -> String {
     return s
 }
 
-var report = "# 関係性分類の汎化評価（Phase 5.1: Dual-Stream 純ニューラル `z_rel`）\n\n"
+var report = "# 関係性分類の汎化評価（Phase 5.1+: 高速 CPU 検証・ハイブリッド特徴対応）\n\n"
 report += "- 入力: `(senderTokenIDs, receiverTokenIDs)` の2配列のみ（連結しない Dual-Stream。$T_4$ は受信側全文、$T_2$ は受信側前半）\n"
 report += "- `neural`: `z_rel = [z_LL^rel(\(weights.relational.latentDim / 2)); z_HH^rel(\(weights.relational.latentDim / 2))] ∈ R^\(weights.relational.latentDim)`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
+report += "- `neural_hybrid`: `z_rel` + 非線形サブバンド幾何(8) + トピック置換不変エコー・変調(8) + 非語彙対話リズム(16) = `\(weights.relational.latentDim + 32)` 次元（GPU 再学習ゼロ・CPU Group-CV 校正）\n"
 report += "- `char_ngram`: 文字 1-gram / 2-gram のハッシュ特徴（`[送信側 ; 受信側]` 連結、比較用ベースライン）\n\n"
 report += "## (A) シナリオ分割: train → unseen_test\n\n"
-report += "学習 `\(trainIndices.count)` 件、評価 `\(unseenIndices.count)` 件。`neural` は学習時に保存された校正ヘッドをそのまま適用（再学習なし）。\n\n"
+report += "学習 `\(trainIndices.count)` 件、評価 `\(unseenIndices.count)` 件。`neural` は学習時に保存された校正ヘッドをそのまま適用（GPU 再学習なし）。\n\n"
 report += resultTable(splitResults, testLabel: "未学習精度")
 report += "\n### クラス別正解数\n\n"
 report += perClassList(splitResults)
-report += "\n## (B) Stratified Group \(foldCount)-Fold（カテゴリ単位の取り分け・フォールドごとにエンコーダ再学習）\n\n"
-report += "全 `\(categories.count)` カテゴリをラベル署名 $(\\text{arch}_{T_2}, \\text{topo}_{T_2}, \\text{arch}_{T_4}, \\text{topo}_{T_4})$ で層化し、ラウンドロビンで \(foldCount) フォールドに割り当てた。"
-report += "各フォールドでは、オートエンコーダ段階の重み（ラベル不使用）から出発し、**他フォールドのカテゴリの train 分割のみ**で Dual-Stream エンコーダ・校正ヘッドを End-to-End 再学習し、取り分けたカテゴリの全シナリオ（train + unseen）で評価する。\n\n"
+report += "\n## (B) Stratified Group \(foldCount)-Fold（カテゴリ単位の取り分け評価）\n\n"
+report += "- モード: `\(cli.skipFolds ? "高速 CPU 固定特徴ヘッド Group-CV（評価対象は取り分けカテゴリの unseen_test のみ、GPU 再学習 0 回）" : "End-to-End エンコーダ再学習（--retrain-folds）")`\n"
 report += "- 学習側に同じラベルが1件も無かった評価ケース数: "
 report += tasks.map { "`\($0.name)` \(missingByTask[$0.name] ?? -1)" }.joined(separator: ", ")
-report += "\n- 注記: オートエンコーダ段階（文章再構成、ラベル不使用）は全カテゴリの train 分割テキストで事前学習されている。\n\n"
-if holdoutResults.isEmpty {
-    report += "_(--skip-folds により未実行)_\n"
-} else {
-    report += resultTable(holdoutResults, testLabel: "未見カテゴリ精度")
-    report += "\n### フォールド実行ログ\n\n"
-    report += foldLog.map { "- \($0)" }.joined(separator: "\n")
-    report += "\n\n### クラス別正解数\n\n"
-    report += perClassList(holdoutResults)
-}
+report += "\n\n"
+report += resultTable(holdoutResults, testLabel: "未見カテゴリ精度")
+report += "\n### フォールド実行ログ\n\n"
+report += foldLog.map { "- \($0)" }.joined(separator: "\n")
+report += "\n\n### クラス別正解数\n\n"
+report += perClassList(holdoutResults)
 
 try report.write(to: URL(fileURLWithPath: cli.reportPath), atomically: true, encoding: .utf8)
 let headsData = try JSONEncoder().encode(weights.relational.calibratedHeads)

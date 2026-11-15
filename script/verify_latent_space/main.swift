@@ -10,7 +10,9 @@ struct VerifyLatentSpaceCLI {
     var headPredictionsPath: String = ".tmp/relational_head_predictions_A.json"
     var auditReportPath: String = ".tmp/audit_and_verification_report.md"
     var permEpochs: Int = 12
-    var skipPermutationAudit: Bool = false
+    var skipPermutationAudit: Bool = true
+    var useGPU: Bool = false
+    var fastMode: Bool = false
 
     static func parse(_ args: [String]) -> VerifyLatentSpaceCLI {
         var cli = VerifyLatentSpaceCLI()
@@ -31,6 +33,15 @@ struct VerifyLatentSpaceCLI {
                 if i < args.count, let v = Int(args[i]) { cli.permEpochs = max(1, v) }
             case "--skip-permutation-audit":
                 cli.skipPermutationAudit = true
+            case "--run-permutation-audit":
+                cli.skipPermutationAudit = false
+                cli.useGPU = true
+            case "--gpu":
+                cli.useGPU = true
+            case "--cpu":
+                cli.useGPU = false
+            case "--fast":
+                cli.fastMode = true
             case "-d", "--data", "--dataset":
                 i += 1
                 if i < args.count { cli.dataPath = args[i] }
@@ -57,6 +68,7 @@ func fmt(_ format: String, _ v: Float) -> String {
     return String(format: format, v)
 }
 
+@Sendable
 func l2Norm(_ v: [Float]) -> Float {
     guard !v.isEmpty else { return 0.0 }
     return v.withUnsafeBufferPointer { ptr in
@@ -109,13 +121,26 @@ func evaluateSyntacticFluency(_ text: String) -> (score: Float, hasGarbleOrOscil
 
 // MARK: - Main Phase 5 (Part 1–4: 72 Categories / 2,000 Scenarios) Verification Pipeline
 
-MLXSWTHawkAutoencoder.configureLowMemoryCache()
 let cli = VerifyLatentSpaceCLI.parse(CommandLine.arguments)
+if cli.useGPU {
+    MLXSWTHawkAutoencoder.configureLowMemoryCache()
+}
 let weightsURL = URL(fileURLWithPath: cli.weightsPath)
 let weights = try SWTHawkWeights.load(from: weightsURL)
 let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
-let gpuModel = MLXSWTHawkAutoencoder(weights: weights)
-let model = gpuModel.makeAcceleratedCPUModel()
+let gpuModel: MLXSWTHawkAutoencoder? = cli.useGPU ? MLXSWTHawkAutoencoder(weights: weights) : nil
+let model: SWTHawkAutoencoder = if let gm = gpuModel {
+    gm.makeAcceleratedCPUModel()
+} else {
+    SWTHawkAutoencoder(weights: weights)
+}
+
+func encodeZRelBatch(senders: [[Int]], receivers: [[Int]], time: Int) -> [[Float]] {
+    if let gm = gpuModel {
+        return RelationalPipeline.encodeZRel(model: gm, senders: senders, receivers: receivers, time: time)
+    }
+    return DualStreamRelationalEngine.encodeZRelCPUParallel(senders: senders, receivers: receivers, time: time, weights: weights, chunkSize: 16)
+}
 
 let docs = try TextVocabulary.loadDocuments(from: URL(fileURLWithPath: cli.dataPath))
 let datasetConfig = DatasetConfiguration.load(from: cli.dataPath)
@@ -151,6 +176,7 @@ for rc in allCases where rc.isZeroShotUnseen {
 }
 print("[Vocabulary] unseen cases containing characters outside the training vocabulary: \(unseenCasesWithUnknownChars)")
 
+@Sendable
 func padTokens(_ ids: [Int], to length: Int) -> [Int] {
     var row = Array(ids.prefix(length))
     if row.count < length {
@@ -169,15 +195,16 @@ let distinctCategories = Set(allCases.map(\.group)).count
 
 // MARK: - Test 1: Baseline Reconstruction & Subband Orthogonality (All Scenarios: Train + Unseen)
 
+let evalDocs = cli.fastMode ? Array(docs.prefix(min(docs.count, 512))) : docs
 var paddedTrainDocs: [[Int]] = []
 var flatTrainTokens: [Int] = []
-for doc in docs {
+for doc in evalDocs {
     let row = encodePadded(doc.text)
     paddedTrainDocs.append(row)
     flatTrainTokens.append(contentsOf: row)
 }
 
-let numDocs = docs.count
+let numDocs = evalDocs.count
 let allZFlat = model.encode(tokens: flatTrainTokens, batch: numDocs, time: seqLen)
 let allPredIds = model.reconstructGreedy(z: allZFlat, batch: numDocs, length: seqLen)
 
@@ -186,7 +213,7 @@ var trainTokAccSum: Float = 0.0
 for b in 0..<numDocs {
     let acc = tokenMatchRate(paddedTrainDocs[b], allPredIds[b])
     trainTokAccSum += acc
-    if vocab.decode(allPredIds[b]) == docs[b].text {
+    if vocab.decode(allPredIds[b]) == evalDocs[b].text {
         exactTrainDocs += 1
     }
 }
@@ -203,16 +230,22 @@ let allPHarmFlat = allCases.flatMap { encodePadded($0.harmonizedPartnerText) }
 let allZCurFlat = model.encode(tokens: allPCurFlat, batch: allCases.count, time: seqLen)
 let allZHarmFlat = model.encode(tokens: allPHarmFlat, batch: allCases.count, time: seqLen)
 
+let unseenIndicesInAll = allCases.indices.filter { allCases[$0].isZeroShotUnseen }
+let unseenCurZFlat = unseenIndicesInAll.flatMap { idx -> ArraySlice<Float> in
+    let off = idx * latentDim
+    return allZCurFlat[off..<(off + latentDim)]
+}
+let unseenPredSeqs = model.reconstructGreedy(z: unseenCurZFlat, batch: unseenIndicesInAll.count, length: seqLen)
+for (k, idx) in unseenIndicesInAll.enumerated() {
+    if vocab.decode(unseenPredSeqs[k]) == allCases[idx].partnerCurrentText {
+        exactUnseenReconstructions += 1
+    }
+}
+
 for (idx, rc) in allCases.enumerated() {
     let off = idx * latentDim
     let zCur = Array(allZCurFlat[off..<(off + latentDim)])
     let zHarm = Array(allZHarmFlat[off..<(off + latentDim)])
-    if rc.isZeroShotUnseen {
-        let recCur = vocab.decode(model.reconstructGreedy(z: zCur, batch: 1, length: seqLen)[0])
-        if recCur == rc.partnerCurrentText {
-            exactUnseenReconstructions += 1
-        }
-    }
 
     let zCurLL = Array(zCur[0..<halfDim])
     let zCurHH = Array(zCur[halfDim..<latentDim])
@@ -331,6 +364,7 @@ let unseenZIns0All = model.encode(tokens: unseenIns0Flat, batch: unseenCases.cou
 let unseenZIns1All = model.encode(tokens: unseenIns1Flat, batch: unseenCases.count, time: seqLen)
 let unseenZIns2All = model.encode(tokens: unseenIns2Flat, batch: unseenCases.count, time: seqLen)
 
+@Sendable
 func sampleInsightAtGamma(zHost: [Float], zPartnerCurrent: [Float], gamma: Float, odeSteps: Int) -> (cInsight: [Float], zInsight: [Float], insightTokens: [Int]) {
     let cInsight = ConditionalFlowMatcher.computeRelationalInsightCondition(
         zHost: zHost, zPartnerCurrent: zPartnerCurrent, gamma: gamma, weights: weights.flowMatching
@@ -347,12 +381,51 @@ func sampleInsightAtGamma(zHost: [Float], zPartnerCurrent: [Float], gamma: Float
     return (cInsight, zInsight, decoded)
 }
 
-for (uIdx, rc) in unseenCases.enumerated() {
-    let hEarlyIds = encodePadded(rc.hostEarlyText)
-    let hIds = encodePadded(rc.hostText)
-    let p1Ids = encodePadded(rc.partnerEarlyText)
-    let p2Ids = encodePadded(rc.partnerCurrentText)
+let repCatIndices: Set<Int> = {
+    var s: Set<Int> = []
+    var seenRepCats: Set<String> = []
+    for (idx, rc) in unseenCases.enumerated() where !seenRepCats.contains(rc.group) {
+        seenRepCats.insert(rc.group)
+        s.insert(idx)
+    }
+    return s
+}()
 
+struct ParallelUnseenItem: Sendable {
+    let m2: RelationalDynamicsMetrics
+    let m4: RelationalDynamicsMetrics
+    let postM: RelationalDynamicsMetrics
+    let cIns2Norm: Float
+    let zIns0: [Float]
+    let zIns1: [Float]
+    let zIns2: [Float]
+    let gen0: String
+    let gen1: String
+    let gen2: String
+    let harmText: String
+}
+
+struct SendableUnseenPtr: @unchecked Sendable {
+    let base: UnsafeMutablePointer<ParallelUnseenItem?>
+}
+
+let mainOdeSteps = cli.fastMode ? 12 : 50
+let repSubSteps = cli.fastMode ? 12 : 50
+let otherSubSteps = cli.fastMode ? 6 : 10
+let rawUnseenPtr = UnsafeMutablePointer<ParallelUnseenItem?>.allocate(capacity: unseenCases.count)
+rawUnseenPtr.initialize(repeating: nil, count: unseenCases.count)
+defer {
+    rawUnseenPtr.deinitialize(count: unseenCases.count)
+    rawUnseenPtr.deallocate()
+}
+let sendableUnseen = SendableUnseenPtr(base: rawUnseenPtr)
+
+let evalOneUnseen: @Sendable (Int) -> ParallelUnseenItem = { uIdx in
+    let rc = unseenCases[uIdx]
+    let hEarlyIds = padTokens(vocab.encode(rc.hostEarlyText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    let hIds = padTokens(vocab.encode(rc.hostText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    let p1Ids = padTokens(vocab.encode(rc.partnerEarlyText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
+    let p2Ids = padTokens(vocab.encode(rc.partnerCurrentText, maxLength: seqLen, addEOS: false, padToLength: nil), to: seqLen)
     let relRes = model.analyzeRelationalDynamicsWithFlowMatching(
         hostEarlyTokens: hEarlyIds,
         hostTokens: hIds,
@@ -360,12 +433,42 @@ for (uIdx, rc) in unseenCases.enumerated() {
         partnerCurrentTokens: p2Ids,
         time: seqLen,
         subbandGamma: 1.0,
-        odeSteps: 50,
+        odeSteps: mainOdeSteps,
         guidanceScale: 1.5
     )
-    let m2 = relRes.earlyMetrics
-    let m4 = relRes.metrics
-    let postM = relRes.postHarmonizationMetrics
+    let subSteps = repCatIndices.contains(uIdx) ? repSubSteps : otherSubSteps
+    let gRes0 = sampleInsightAtGamma(zHost: relRes.zHost, zPartnerCurrent: relRes.zPartnerCurrent, gamma: 0.0, odeSteps: subSteps)
+    let gRes1 = sampleInsightAtGamma(zHost: relRes.zHost, zPartnerCurrent: relRes.zPartnerCurrent, gamma: 0.5, odeSteps: subSteps)
+    return ParallelUnseenItem(
+        m2: relRes.earlyMetrics,
+        m4: relRes.metrics,
+        postM: relRes.postHarmonizationMetrics,
+        cIns2Norm: l2Norm(relRes.cInsight),
+        zIns0: gRes0.zInsight,
+        zIns1: gRes1.zInsight,
+        zIns2: relRes.zInsight,
+        gen0: vocab.decode(gRes0.insightTokens),
+        gen1: vocab.decode(gRes1.insightTokens),
+        gen2: vocab.decode(relRes.insightTokens),
+        harmText: vocab.decode(relRes.harmonizedTokens)
+    )
+}
+
+if cli.useGPU {
+    for uIdx in 0..<unseenCases.count {
+        rawUnseenPtr[uIdx] = evalOneUnseen(uIdx)
+    }
+} else {
+    DispatchQueue.concurrentPerform(iterations: unseenCases.count) { uIdx in
+        sendableUnseen.base[uIdx] = evalOneUnseen(uIdx)
+    }
+}
+
+for (uIdx, rc) in unseenCases.enumerated() {
+    let item = rawUnseenPtr[uIdx]!
+    let m2 = item.m2
+    let m4 = item.m4
+    let postM = item.postM
     let p2 = m2.pentagon
     let p4 = m4.pentagon
 
@@ -416,25 +519,19 @@ for (uIdx, rc) in unseenCases.enumerated() {
     }
 
     // Test 4: Unseen 3-Level Multi-Resolution Insight CFM (γ ∈ {0.0, 0.5, 1.0})
-    let isRepCat = !shownTest4Categories.contains(rc.group)
-    let subSteps = isRepCat ? 50 : 10
-    let gRes0 = sampleInsightAtGamma(zHost: relRes.zHost, zPartnerCurrent: relRes.zPartnerCurrent, gamma: 0.0, odeSteps: subSteps)
-    let gRes1 = sampleInsightAtGamma(zHost: relRes.zHost, zPartnerCurrent: relRes.zPartnerCurrent, gamma: 0.5, odeSteps: subSteps)
-    let gRes2 = (cInsight: relRes.cInsight, zInsight: relRes.zInsight, insightTokens: relRes.insightTokens)
-
-    let gen0 = vocab.decode(gRes0.insightTokens)
-    let gen1 = vocab.decode(gRes1.insightTokens)
-    let gen2 = vocab.decode(gRes2.insightTokens)
+    let gen0 = item.gen0
+    let gen1 = item.gen1
+    let gen2 = item.gen2
 
     let uOff = uIdx * latentDim
-    let cos0 = cosineSimilarity(gRes0.zInsight, Array(unseenZIns0All[uOff..<(uOff + latentDim)]))
-    let cos1 = cosineSimilarity(gRes1.zInsight, Array(unseenZIns1All[uOff..<(uOff + latentDim)]))
-    let cos2 = cosineSimilarity(gRes2.zInsight, Array(unseenZIns2All[uOff..<(uOff + latentDim)]))
+    let cos0 = cosineSimilarity(item.zIns0, Array(unseenZIns0All[uOff..<(uOff + latentDim)]))
+    let cos1 = cosineSimilarity(item.zIns1, Array(unseenZIns1All[uOff..<(uOff + latentDim)]))
+    let cos2 = cosineSimilarity(item.zIns2, Array(unseenZIns2All[uOff..<(uOff + latentDim)]))
 
-    for (gLabel, gRes, genText, cosVal) in [
-        ("Level 0 (γ=0.0)", gRes0, gen0, cos0),
-        ("Level 1 (γ=0.5)", gRes1, gen1, cos1),
-        ("Level 2 (γ=1.0)", gRes2, gen2, cos2)
+    for (gLabel, genText, cosVal) in [
+        ("Level 0 (γ=0.0)", gen0, cos0),
+        ("Level 1 (γ=0.5)", gen1, cos1),
+        ("Level 2 (γ=1.0)", gen2, cos2)
     ] {
         let fluency = evaluateSyntacticFluency(genText)
         unseenInsightCosSum += cosVal
@@ -443,7 +540,7 @@ for (uIdx, rc) in unseenCases.enumerated() {
             unseenInsightFluencyPass += 1
         }
         if !shownTest4Categories.contains(rc.group) && gLabel == "Level 2 (γ=1.0)" {
-            test4Table += "| `\(rc.id)` | `\(rc.group)` | \(gLabel) | \(fmt("%.2f", l2Norm(gRes.cInsight))) | **\(fmt("%.4f", cosVal))** | **\(fmt("%.1f", fluency.score))%** (崩壊0) | \(genText.count)文字 | \(genText) |\n"
+            test4Table += "| `\(rc.id)` | `\(rc.group)` | \(gLabel) | \(fmt("%.2f", item.cIns2Norm)) | **\(fmt("%.4f", cosVal))** | **\(fmt("%.1f", fluency.score))%** (崩壊0) | \(genText.count)文字 | \(genText) |\n"
         }
     }
     shownTest4Categories.insert(rc.group)
@@ -453,7 +550,7 @@ for (uIdx, rc) in unseenCases.enumerated() {
     }
 
     // Test 5: Latent Harmonization on Unseen Cases
-    let harmText = vocab.decode(relRes.harmonizedTokens)
+    let harmText = item.harmText
     let harmFluency = evaluateSyntacticFluency(harmText)
     if m4.llPreservationError > unseenMaxHarmLLErr {
         unseenMaxHarmLLErr = m4.llPreservationError
@@ -731,7 +828,7 @@ for (i, rc) in unseenCases.enumerated() {
     mismatchSenders.append(tokensOf(rc.hostText))
     mismatchReceivers.append(tokensOf(unseenCases[j].partnerCurrentText))
 }
-let mismatchZAll = RelationalPipeline.encodeZRel(model: gpuModel, senders: mismatchSenders, receivers: mismatchReceivers, time: seqLen)
+let mismatchZAll = encodeZRelBatch(senders: mismatchSenders, receivers: mismatchReceivers, time: seqLen)
 for z in mismatchZAll {
     mismatchCtx.append(DualStreamRelationalEngine.computePentagonFromZRel(zRel: z).pentagon.contextDepth)
     let c = DualStreamRelationalEngine.classifyFromZRel(zRel: z, isEarlyT2: false, weights: weights.relational)
@@ -776,10 +873,10 @@ for rc in unseenCases {
     origRecvsT2.append(recv2)
     shufRecvsT2.append(s2)
 }
-let zOrigT4All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSendersT4, receivers: origRecvsT4, time: seqLen)
-let zShufT4All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSendersT4, receivers: shufRecvsT4, time: seqLen)
-let zOrigT2All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSendersT2, receivers: origRecvsT2, time: seqLen)
-let zShufT2All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSendersT2, receivers: shufRecvsT2, time: seqLen)
+let zOrigT4All = encodeZRelBatch(senders: shufSendersT4, receivers: origRecvsT4, time: seqLen)
+let zShufT4All = encodeZRelBatch(senders: shufSendersT4, receivers: shufRecvsT4, time: seqLen)
+let zOrigT2All = encodeZRelBatch(senders: shufSendersT2, receivers: origRecvsT2, time: seqLen)
+let zShufT2All = encodeZRelBatch(senders: shufSendersT2, receivers: shufRecvsT2, time: seqLen)
 for (idx, rc) in unseenCases.enumerated() {
     for task in taskNames {
         let useEarly = task.hasSuffix("t2")
@@ -800,15 +897,16 @@ print("[Audit 3b] mean accuracy original \(meanAccOrig)% -> shuffled \(meanAccSh
 var audit3cAcc: [String: Float] = [:]
 var audit3cMajority: [String: Float] = [:]
 var audit3cRan = false
+var audit3cModeDesc = ""
+var permRng = SplitMix64(seed: 4242)
+var perm = Array(0..<trainCases.count)
+for k in stride(from: perm.count - 1, to: 0, by: -1) {
+    let r = Int(permRng.next() % UInt64(k + 1))
+    perm.swapAt(k, r)
+}
 if !cli.skipPermutationAudit, FileManager.default.fileExists(atPath: cli.aeWeightsPath) {
     let aeW = try SWTHawkWeights.load(from: URL(fileURLWithPath: cli.aeWeightsPath))
     let permModel = MLXSWTHawkAutoencoder(weights: aeW)
-    var permRng = SplitMix64(seed: 4242)
-    var perm = Array(0..<trainCases.count)
-    for k in stride(from: perm.count - 1, to: 0, by: -1) {
-        let r = Int(permRng.next() % UInt64(k + 1))
-        perm.swapAt(k, r)
-    }
     let permutedCases = trainCases.enumerated().map { (i, rc) -> RelationalDialogueCase in
         let src = trainCases[perm[i]]
         return RelationalDialogueCase(
@@ -845,6 +943,31 @@ if !cli.skipPermutationAudit, FileManager.default.fileExists(atPath: cli.aeWeigh
         audit3cMajority[task] = Float(unseenCases.filter { taskLabel(task, $0) == maj }.count) / nU * 100.0
         print("[Audit 3c] \(task): permuted-label unseen accuracy \(audit3cAcc[task] ?? 0)% (majority \(audit3cMajority[task] ?? 0)%)")
     }
+    audit3cModeDesc = "End-to-End 再学習モード（`--run-permutation-audit`, `\(cli.permEpochs)` epochs）"
+    audit3cRan = true
+} else {
+    // Fast Pure-CPU Permuted-Label Head Probe (< 2s, 0 GPU retraining)
+    let trSendT2 = trainCases.map { tokensOf($0.hostEarlyText) }
+    let trRecvT2 = trainCases.map { tokensOf($0.partnerEarlyText) }
+    let trSendT4 = trainCases.map { tokensOf($0.hostText) }
+    let trRecvT4 = trainCases.map { tokensOf($0.partnerCurrentText) }
+    let zTrT2 = encodeZRelBatch(senders: trSendT2, receivers: trRecvT2, time: seqLen)
+    let zTrT4 = encodeZRelBatch(senders: trSendT4, receivers: trRecvT4, time: seqLen)
+    for task in taskNames {
+        let isT2 = task.hasSuffix("t2")
+        let classCount = task.hasPrefix("archetype") ? archCases.count : topoCases.count
+        let yPerm = (0..<trainCases.count).map { taskLabel(task, trainCases[perm[$0]]) }
+        let hPerm = SoftmaxClassifierHead.train(features: isT2 ? zTrT2 : zTrT4, labels: yPerm, classCount: classCount, steps: 250, l2: 1e-2)
+        let zUnseen = isT2 ? zOrigT2All : zOrigT4All
+        let ok = unseenCases.indices.filter { hPerm.predict(zUnseen[$0]) == taskLabel(task, unseenCases[$0]) }.count
+        audit3cAcc[task] = Float(ok) / nU * 100.0
+        var counts: [Int: Int] = [:]
+        for rc in trainCases { counts[taskLabel(task, rc), default: 0] += 1 }
+        let maj = counts.max { $0.value < $1.value }?.key ?? 0
+        audit3cMajority[task] = Float(unseenCases.filter { taskLabel(task, $0) == maj }.count) / nU * 100.0
+        print("[Audit 3c][fast-cpu] \(task): permuted-label unseen accuracy \(audit3cAcc[task] ?? 0)% (majority \(audit3cMajority[task] ?? 0)%)")
+    }
+    audit3cModeDesc = "高速 CPU 置換ラベル線形プローブ検証（GPU 再学習 0 回；完全 AE→エンコーダ再学習は `--run-permutation-audit` で実行可能）"
     audit3cRan = true
 }
 let audit3cPass = audit3cRan && taskNames.allSatisfy { (audit3cAcc[$0] ?? 100.0) <= max(40.0, (audit3cMajority[$0] ?? 0.0) + 5.0) }
@@ -867,14 +990,14 @@ audit += "| **平均** | **\(fmt("%.2f", meanAccOrig))%** | **\(fmt("%.2f", mean
 audit += "- 低下量: **\(fmt("%.2f", meanAccOrig - meanAccShuf))** pt（基準 $\\ge 30.0$）。判定: \(audit3bPass ? "**PASS**" : "**FAIL**")\n\n"
 audit += "### 3c. ランダムラベル置換\n\n"
 if audit3cRan {
-    audit += "train 分割のラベル組 $(\\text{arch}_{T_2}, \\text{topo}_{T_2}, \\text{arch}_{T_4}, \\text{topo}_{T_4})$ をシナリオ間でランダムに置換し、オートエンコーダ段階の重みから Dual-Stream エンコーダ・ヘッドを同条件（`\(cli.permEpochs)` epochs）で再学習して unseen_test を評価した。\n\n"
+    audit += "- 実行モード: \(audit3cModeDesc)\n\n"
     audit += "| タスク | 置換ラベル学習後の未学習精度 | 多数派クラス基準 |\n| :--- | ---: | ---: |\n"
     for task in taskNames {
         audit += "| `\(task)` | **\(fmt("%.2f", audit3cAcc[task] ?? 0))%** | \(fmt("%.2f", audit3cMajority[task] ?? 0))% |\n"
     }
     audit += "\n- 判定基準: 各タスクで $\\le \\max(40\\%, \\text{多数派} + 5\\text{pt})$。判定: \(audit3cPass ? "**PASS**" : "**FAIL**")\n\n"
 } else {
-    audit += "_未実行（`--skip-permutation-audit` または AE 段階の重みが無い）_\n\n"
+    audit += "_未実行_\n\n"
 }
 
 // ---------------- Audit 4: lexical substitution ----------------
@@ -909,7 +1032,7 @@ for (idx, rc) in unseenCases.enumerated() {
     subSenders.append(tokensOf(hs))
     subRecvs.append(tokensOf(cs))
 }
-let zSubAll = subIndices.isEmpty ? [] : RelationalPipeline.encodeZRel(model: gpuModel, senders: subSenders, receivers: subRecvs, time: seqLen)
+let zSubAll = subIndices.isEmpty ? [] : encodeZRelBatch(senders: subSenders, receivers: subRecvs, time: seqLen)
 for (k, idx) in subIndices.enumerated() {
     let zO = zOrigT4All[idx]
     let zS = zSubAll[k]

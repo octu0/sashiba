@@ -117,11 +117,52 @@ public enum RelationalArchetype: String, Codable, Sendable, Equatable, CaseItera
     case indifferentTroll = "INDIFFERENT_TROLL"
 }
 
-/// 5-axis Relational Pentagon scores in `[0.0, 100.0]` (`Phase 4 & 5 Section 3`).
+/// 4-way observable early-window (`T1–T2`) stance schema consolidating ambiguous initial politeness while keeping boundary friction sharp (`Layer 1 α = 0.8690`).
+public enum EarlyRelationalStance: String, Codable, Sendable, Equatable, CaseIterable {
+    case supportiveWarm = "EARLY_SUPPORTIVE_WARM"
+    case devotedSafe = "EARLY_DEVOTED_SAFE"
+    case boundaryFriction = "EARLY_BOUNDARY_FRICTION"
+    case detachedCold = "EARLY_DETACHED_COLD"
+
+    public static func from(archetype: RelationalArchetype) -> EarlyRelationalStance {
+        switch archetype {
+        case .trueSupporter, .casualHype:
+            return .supportiveWarm
+        case .gachikoiSafe:
+            return .devotedSafe
+        case .gachikoiRisk, .hiddenAggressor:
+            return .boundaryFriction
+        case .indifferentTroll:
+            return .detachedCold
+        }
+    }
+}
+
+/// 3-way observable early-window (`T1–T2`) distance schema consolidating `BENEVOLENT_GUARDIAN` & `ACQUAINTED_OBSERVER` (`Layer 1 α = 0.9418`).
+public enum EarlyRelationalDistance: String, Codable, Sendable, Equatable, CaseIterable {
+    case closeBond = "EARLY_CLOSE_BOND"
+    case politeObserver = "EARLY_POLITE_OBSERVER"
+    case unconnected = "EARLY_UNCONNECTED"
+
+    public static func from(topology: RelationalTopology) -> EarlyRelationalDistance {
+        switch topology {
+        case .deepAffection, .closeConfidant:
+            return .closeBond
+        case .benevolentGuardian, .acquaintedObserver:
+            return .politeObserver
+        case .unconnectedStranger:
+            return .unconnected
+        }
+    }
+}
+
+/// 5-axis Relational Pentagon scores in `[0.0, 100.0]`.
+/// Layer 2 audit status: Supervised Relational Prototype Projection (`L_metric`-guided structural radar visualization, not unsupervised emergent measurement).
 public struct RelationalPentagonScores: Codable, Sendable, Equatable {
+    public static let interpretationRole: String = "SUPERVISED_PROTOTYPE_PROJECTION"
     public let contextDepth: Float         // Score_ctx: Context Depth & Memory
     public let empathicResonance: Float    // Score_emp: Empathic Resonance
-    public let communicativeHarmony: Float // Score_sync: Communicative Harmony
+    public let communicativeHarmony: Float // Score_sync: Phase-Aligned Communicative Harmony
     public let boundaryStability: Float    // Score_stab: Boundary Respect & Stability
     public let longTermViability: Float    // Score_dev: Long-term Viability
 

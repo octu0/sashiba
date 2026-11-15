@@ -457,11 +457,26 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
         }
         let avgPolarityLoss = polarityCount > 0 ? (polarityLossSum / Float(polarityCount)) : 0.0
 
-        // Compute Stage 2 alignment loss L_align = λ L_CLIP + (1 - λ) ||c_aligned - x_1||_2^2
+        // Compute Stage 2 alignment loss telemetry on a bounded deterministic subsample (avoids O(totalPairs^2 * D) 35-min CPU stall when totalPairs ~ 8,000)
+        let maxDiagPairs = min(totalPairs, 256)
+        let strideStep = max(1, totalPairs / max(1, maxDiagPairs))
+        var subSummary: [Float] = []
+        var subCond: [Float] = []
+        subSummary.reserveCapacity(maxDiagPairs * lDim)
+        subCond.reserveCapacity(maxDiagPairs * lDim)
+        var sampledCount = 0
+        var pIdx = 0
+        while pIdx < totalPairs && sampledCount < maxDiagPairs {
+            let off = pIdx * lDim
+            subSummary.append(contentsOf: summaryBank[off..<(off + lDim)])
+            subCond.append(contentsOf: condBank[off..<(off + lDim)])
+            sampledCount += 1
+            pIdx += strideStep
+        }
         let alignMetrics = ConditionalFlowMatcher.computeAlignmentLoss(
-            cAligned: summaryBank,
-            x1: summaryBank,
-            batch: totalPairs,
+            cAligned: subSummary,
+            x1: subSummary,
+            batch: max(1, sampledCount),
             latentDim: lDim,
             lambda: 0.5
         )
@@ -485,25 +500,26 @@ public final class MLXSWTHawkTrainer: @unchecked Sendable {
             summaryBank: summaryBank
         )
 
-        // Verify CFM velocity loss E[||v_θ(x_t, t, c) - (x_1 - x_0)||_2^2] at t = 0.5 across all registered pairs
-        var x0 = [Float](repeating: 0.0, count: totalPairs * lDim)
-        var xT = [Float](repeating: 0.0, count: totalPairs * lDim)
-        for i in 0..<(totalPairs * lDim) {
-            x0[i] = 0.5 * condBank[i]
-            xT[i] = 0.5 * x0[i] + 0.5 * summaryBank[i]
+        // Verify CFM velocity loss E[||v_θ(x_t, t, c) - (x_1 - x_0)||_2^2] at t = 0.5 on bounded diagnostic subset
+        let diagN = max(1, sampledCount)
+        var x0 = [Float](repeating: 0.0, count: diagN * lDim)
+        var xT = [Float](repeating: 0.0, count: diagN * lDim)
+        for i in 0..<(diagN * lDim) {
+            x0[i] = 0.5 * subCond[i]
+            xT[i] = 0.5 * x0[i] + 0.5 * subSummary[i]
         }
         let vPred = ConditionalFlowMatcher.predictVelocity(
-            xT: xT, x0: x0, t: 0.5, condition: condBank, isUnconditional: false,
-            weights: model.flowMatchingWeights, batch: totalPairs,
-            precomputedTargets: summaryBank
+            xT: xT, x0: x0, t: 0.5, condition: subCond, isUnconditional: false,
+            weights: model.flowMatchingWeights, batch: diagN,
+            precomputedTargets: subSummary
         )
         var cfmSq: Float = 0.0
-        for i in 0..<(totalPairs * lDim) {
-            let uTarget = summaryBank[i] - x0[i]
+        for i in 0..<(diagN * lDim) {
+            let uTarget = subSummary[i] - x0[i]
             let diff = vPred[i] - uTarget
             cfmSq += diff * diff
         }
-        let cfmLoss = cfmSq / Float(max(1, totalPairs * lDim))
+        let cfmLoss = cfmSq / Float(max(1, diagN * lDim))
         return (alignMetrics.totalLoss, cfmLoss, avgPolarityLoss, totalPairs)
     }
 }

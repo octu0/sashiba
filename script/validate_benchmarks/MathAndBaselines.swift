@@ -321,12 +321,12 @@ enum BenchmarkMath {
                 var innerScores = [Float](repeating: 0.5, count: trainIdx.count)
                 for inTest in innerFolds {
                     let inTrain = innerSetAll.subtracting(Set(inTest)).sorted()
-                    let h = SoftmaxClassifierHead.trainMLX(
+                    let h = SoftmaxClassifierHead.train(
                         features: inTrain.map { trainX[$0] },
                         labels: inTrain.map { trainYInt[$0] },
                         classCount: 2,
-                        steps: 200,
-                        learningRate: 0.04,
+                        steps: 180,
+                        learningRate: 0.05,
                         l2: cand
                     )
                     for idx in inTest {
@@ -340,12 +340,12 @@ enum BenchmarkMath {
                 }
             }
 
-            let head = SoftmaxClassifierHead.trainMLX(
+            let head = SoftmaxClassifierHead.train(
                 features: trainX,
                 labels: trainYInt,
                 classCount: 2,
-                steps: 280,
-                learningRate: 0.04,
+                steps: 240,
+                learningRate: 0.05,
                 l2: bestL2
             )
             for idx in testIdx {
@@ -354,7 +354,6 @@ enum BenchmarkMath {
                 oofPreds[idx] = p1 >= 0.5
             }
         }
-        MLX.Memory.clearCache()
         let auc = rocAUC(scores: oofScores, labels: labels)
         let correct = zip(oofPreds, labels).filter { $0 == $1 }.count
         return (auc, Float(correct) / Float(max(1, totalN)))

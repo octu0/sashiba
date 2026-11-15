@@ -654,7 +654,14 @@ public enum DualStreamRelationalEngine {
         let rDiff = rHH - 1.0
         let rawEmp = 0.5 * (sHH + 1.0) * expf(-0.4 * rDiff * rDiff)
         let scoreEmp = 100.0 * max(0.0, min(1.0, rawEmp))
-        let rawSync = 1.0 - (envDiffNorm / (normHHS + normHHC + 1e-6))
+        // Phase-aligned & amplitude-balanced communicative harmony (fixes sign-blind |z_S|-|z_C| bug where sHH < 0 scored high):
+        let ampBalance = (2.0 * normHHS * normHHC) / (normHHSSq + normHHCSq + 1e-6)
+        let hhSync = 0.5 * (sHH + 1.0)
+        let llSync = 0.5 * (sLL + 1.0)
+        let antiPhaseGate = max(0.15, 1.0 - 0.85 * max(0.0, -sHH))
+        let phaseSync = (0.75 * hhSync + 0.25 * llSync) * antiPhaseGate
+        let envCoherence = max(0.0, 1.0 - 0.35 * (envDiffNorm / (normHHS + normHHC + 1e-6)))
+        let rawSync = ampBalance * phaseSync * envCoherence
         let scoreSync = 100.0 * max(0.0, min(1.0, rawSync))
         let negSpikePenalty = max(0.0, -sHH)
         let excessEnergyPenalty = 0.4 * max(0.0, rHH - 1.3)
@@ -1699,6 +1706,96 @@ public enum DualStreamRelationalEngine {
             weights: weights
         )
         return makeInferenceOutput(zRel: res.zRel, zContent: res.zContent, weights: weights.relational)
+    }
+
+    /// Marginalizes fine-grained `T2` probabilities into the Layer 1 validated 2-stage coarse early schema (`α = 0.869 / 0.942`).
+    public static func classifyEarlyCoarseFromZRel(
+        zRel: [Float],
+        weights: DualStreamRelationalWeights
+    ) -> (stance: EarlyRelationalStance, distance: EarlyRelationalDistance, stanceProbs: [Float], distanceProbs: [Float]) {
+        let fine = classifyFromZRel(zRel: zRel, isEarlyT2: true, weights: weights)
+        let archCases = RelationalArchetype.allCases
+        let topoCases = RelationalTopology.allCases
+        let stanceCases = EarlyRelationalStance.allCases
+        let distCases = EarlyRelationalDistance.allCases
+
+        var sProbs = [Float](repeating: 0.0, count: stanceCases.count)
+        for (i, a) in archCases.enumerated() where i < fine.archProbs.count {
+            let s = EarlyRelationalStance.from(archetype: a)
+            if let sIdx = stanceCases.firstIndex(of: s) {
+                sProbs[sIdx] += fine.archProbs[i]
+            }
+        }
+        var dProbs = [Float](repeating: 0.0, count: distCases.count)
+        for (i, t) in topoCases.enumerated() where i < fine.topoProbs.count {
+            let d = EarlyRelationalDistance.from(topology: t)
+            if let dIdx = distCases.firstIndex(of: d) {
+                dProbs[dIdx] += fine.topoProbs[i]
+            }
+        }
+        var bestS = 0
+        for i in 1..<sProbs.count where sProbs[i] > sProbs[bestS] { bestS = i }
+        var bestD = 0
+        for i in 1..<dProbs.count where dProbs[i] > dProbs[bestD] { bestD = i }
+        return (stanceCases[bestS], distCases[bestD], sProbs, dProbs)
+    }
+
+    private struct SendableFloatPtr: @unchecked Sendable {
+        let base: UnsafeMutablePointer<Float>
+    }
+
+    /// Multi-core pure-CPU batch encoder (`0` GPU memory / `0` MLX kernels) using `DispatchQueue.concurrentPerform`.
+    public static func encodeZRelCPUParallel(
+        senders: [[Int]],
+        receivers: [[Int]],
+        time: Int,
+        weights: SWTHawkWeights,
+        chunkSize: Int = 16
+    ) -> [[Float]] {
+        let n = min(senders.count, receivers.count)
+        guard n > 0 else { return [] }
+        let lDim = weights.relational.latentDim
+        let t = max(DualStreamRelationalWeights.canonicalSeqLen, time)
+        let numChunks = (n + chunkSize - 1) / chunkSize
+        let totalFloats = n * lDim
+        let rawPtr = UnsafeMutablePointer<Float>.allocate(capacity: totalFloats)
+        rawPtr.initialize(repeating: 0.0, count: totalFloats)
+        defer {
+            rawPtr.deinitialize(count: totalFloats)
+            rawPtr.deallocate()
+        }
+        let dst = SendableFloatPtr(base: rawPtr)
+        DispatchQueue.concurrentPerform(iterations: numChunks) { cIdx in
+            let start = cIdx * chunkSize
+            let end = min(n, start + chunkSize)
+            let curB = end - start
+            var sFlat: [Int] = []
+            var rFlat: [Int] = []
+            sFlat.reserveCapacity(curB * t)
+            rFlat.reserveCapacity(curB * t)
+            for i in start..<end {
+                sFlat.append(contentsOf: padOrTruncate(senders[i], to: t))
+                rFlat.append(contentsOf: padOrTruncate(receivers[i], to: t))
+            }
+            let zChunk = forwardBatchCPU(
+                senderTokens: sFlat,
+                receiverTokens: rFlat,
+                batch: curB,
+                time: t,
+                weights: weights
+            ).zRel
+            let dstOffset = start * lDim
+            for k in 0..<zChunk.count {
+                dst.base[dstOffset + k] = zChunk[k]
+            }
+        }
+        var out: [[Float]] = []
+        out.reserveCapacity(n)
+        for i in 0..<n {
+            let off = i * lDim
+            out.append(Array(UnsafeBufferPointer(start: rawPtr + off, count: lDim)))
+        }
+        return out
     }
 
     /// Builds the inference output (pentagon + 4 calibrated head predictions) from a single `zRel ∈ R^1024`.

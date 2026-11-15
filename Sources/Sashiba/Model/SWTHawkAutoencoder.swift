@@ -783,10 +783,38 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         return (mixedT, mixedH)
     }
 
+    private struct SendableFloatBuf: @unchecked Sendable {
+        let base: UnsafeMutablePointer<Float>
+    }
+
     /// Encodes a batch of token ID sequences `[B, T]` into subband-split principal component vectors `z = [z_LL(512); z_HH(512)] ∈ R^(B × 1024)`.
     public func encode(tokens: [Int], batch: Int, time: Int) -> [Float] {
         if let backend = latentEncoderBackend {
             return backend(tokens, batch, time)
+        }
+        if batch >= 32 {
+            let chunkSize = 32
+            let numChunks = (batch + chunkSize - 1) / chunkSize
+            let lDim = weights.latentDim
+            let totalFloats = batch * lDim
+            let raw = UnsafeMutablePointer<Float>.allocate(capacity: totalFloats)
+            raw.initialize(repeating: 0.0, count: totalFloats)
+            defer {
+                raw.deinitialize(count: totalFloats)
+                raw.deallocate()
+            }
+            let dst = SendableFloatBuf(base: raw)
+            DispatchQueue.concurrentPerform(iterations: numChunks) { cIdx in
+                let b0 = cIdx * chunkSize
+                let b1 = min(batch, b0 + chunkSize)
+                let slice = Array(tokens[(b0 * time)..<(b1 * time)])
+                let zPart = self.encodeCPU(tokens: slice, batch: b1 - b0, time: time)
+                let off = b0 * lDim
+                for k in 0..<zPart.count {
+                    dst.base[off + k] = zPart[k]
+                }
+            }
+            return Array(UnsafeBufferPointer(start: raw, count: totalFloats))
         }
         return encodeCPU(tokens: tokens, batch: batch, time: time)
     }
@@ -1019,6 +1047,10 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         return (z, logits)
     }
 
+    private struct SendableIntBuf: @unchecked Sendable {
+        let base: UnsafeMutablePointer<Int>
+    }
+
     /// Reconstructs token sequences `[B][T]` autoregressively from `z ∈ R^(B × 1024)` alone.
     public func reconstructGreedy(
         z: [Float],
@@ -1026,6 +1058,43 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         length: Int,
         bosToken: Int = TextVocabulary.bosId
     ) -> [[Int]] {
+        if batch >= 32 {
+            let chunkSize = 32
+            let numChunks = (batch + chunkSize - 1) / chunkSize
+            let lDim = weights.latentDim
+            let totalInts = batch * length
+            let raw = UnsafeMutablePointer<Int>.allocate(capacity: totalInts)
+            raw.initialize(repeating: TextVocabulary.padId, count: totalInts)
+            defer {
+                raw.deinitialize(count: totalInts)
+                raw.deallocate()
+            }
+            let dst = SendableIntBuf(base: raw)
+            DispatchQueue.concurrentPerform(iterations: numChunks) { cIdx in
+                let b0 = cIdx * chunkSize
+                let b1 = min(batch, b0 + chunkSize)
+                let zSlice = Array(z[(b0 * lDim)..<(b1 * lDim)])
+                let preds = HawkConditionalDecoder.decodeGreedy(
+                    z: zSlice,
+                    tokenEmbedding: self.weights.tokenEmbedding,
+                    weights: self.weights.decoder,
+                    batch: b1 - b0,
+                    length: length,
+                    bosToken: bosToken,
+                    subbandClassifier: self.weights.subbandClassifier
+                )
+                for (localIdx, seq) in preds.enumerated() {
+                    let rowOff = (b0 + localIdx) * length
+                    let copyCount = min(length, seq.count)
+                    for k in 0..<copyCount {
+                        dst.base[rowOff + k] = seq[k]
+                    }
+                }
+            }
+            return (0..<batch).map { b in
+                Array(UnsafeBufferPointer(start: raw + b * length, count: length))
+            }
+        }
         return HawkConditionalDecoder.decodeGreedy(
             z: z,
             tokenEmbedding: weights.tokenEmbedding,
