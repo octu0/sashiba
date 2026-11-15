@@ -638,6 +638,7 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
             let r34 = normalizeTwoSentences(rec.receiver_log_t3_t4, sentenceDelim: sDelim, clauseDelim: cDelim)
             let rharm = normalizeTwoSentences(rec.receiver_log_harmonized, sentenceDelim: sDelim, clauseDelim: cDelim)
 
+            let hostEarlyText = s12
             let hostText = s12 + s34
             let earlyText = r12
             let curText = r12 + r34
@@ -655,6 +656,7 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
                     expectedArchetypeT2: rec.expected_archetype_t2,
                     expectedTopology: rec.topology_5,
                     expectedArchetype: rec.archetype_6,
+                    hostEarlyText: hostEarlyText,
                     hostText: hostText,
                     partnerEarlyText: earlyText,
                     partnerCurrentText: curText,

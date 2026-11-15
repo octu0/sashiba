@@ -86,5 +86,59 @@ struct Step5DualStreamRelationalTests {
         }
         #expect(!tel.finalTotalLoss.isNaN)
     }
+
+    @Test("5.4: All 30 targetSubbandGeometry cells are non-degenerate, bounded, and pairwise separated")
+    func geometryNonDegenerate30Cells() {
+        var cells: [(RelationalArchetype, RelationalTopology, Float, Float, Float)] = []
+        for a in RelationalArchetype.allCases {
+            var prevSLL: Float = 2.0
+            for t in RelationalTopology.allCases {
+                let g = DualStreamRelationalEngine.targetSubbandGeometry(archetype: a, topology: t)
+                #expect(g.sLL >= -0.85 && g.sLL <= 0.95)
+                #expect(g.sHH >= -0.90 && g.sHH <= 0.92)
+                #expect(g.rHH >= 0.20 && g.rHH <= 1.55)
+                #expect(g.sLL < prevSLL, "sLL must decrease monotonically across topology for \(a)")
+                prevSLL = g.sLL
+                cells.append((a, t, g.sLL, g.sHH, g.rHH))
+            }
+        }
+        #expect(cells.count == 30)
+        for i in 0..<cells.count {
+            for j in (i + 1)..<cells.count {
+                let dx = cells[i].2 - cells[j].2
+                let dy = cells[i].3 - cells[j].3
+                let dz = cells[i].4 - cells[j].4
+                let dist = sqrtf(dx * dx + dy * dy + dz * dz)
+                #expect(dist > 0.05, "Collision between \(cells[i].0)/\(cells[i].1) and \(cells[j].0)/\(cells[j].1): dist=\(dist)")
+            }
+        }
+    }
+
+    @Test("5.5: Causal T2 sender window uses hostEarlyText (no future s34 leakage)")
+    func causalT2SenderWindow() throws {
+        let rc = RelationalDialogueCase(
+            id: "test_causal",
+            title: "causal",
+            expectedTopologyT2: .benevolentGuardian,
+            expectedArchetypeT2: .casualHype,
+            expectedTopology: .deepAffection,
+            expectedArchetype: .trueSupporter,
+            hostEarlyText: "前半1文目です。前半2文目です。",
+            hostText: "前半1文目です。前半2文目です。後半3文目です。後半4文目です。",
+            partnerEarlyText: "受信前半1文目です。受信前半2文目です。",
+            partnerCurrentText: "受信前半1文目です。受信前半2文目です。受信後半3文目です。受信後半4文目です。",
+            harmonizedPartnerText: "受信前半1文目です。受信前半2文目です。調律文です。調律2文目です。",
+            insightLevel0: "L0",
+            insightLevel1: "L1",
+            insightLevel2: "L2"
+        )
+        let vocab = TextVocabulary(texts: [rc.hostText, rc.partnerCurrentText])
+        let built = RelationalPipeline.buildPairs(cases: [rc], vocab: vocab, time: 64, includeHarmonized: false, mismatchPerCase: 0)
+        #expect(built.pairs.count == 2)
+        let earlyPair = built.pairs.first { $0.isEarlyT2 }!
+        let latePair = built.pairs.first { !$0.isEarlyT2 }!
+        #expect(vocab.decode(earlyPair.senderTokens) == rc.hostEarlyText)
+        #expect(vocab.decode(latePair.senderTokens) == rc.hostText)
+    }
 }
 

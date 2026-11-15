@@ -167,6 +167,7 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
     public let expectedArchetypeT2: RelationalArchetype
     public let expectedTopology: RelationalTopology
     public let expectedArchetype: RelationalArchetype
+    public let hostEarlyText: String
     public let hostText: String
     public let partnerEarlyText: String
     public let partnerCurrentText: String
@@ -186,6 +187,7 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         case expectedArchetypeT2
         case expectedTopology
         case expectedArchetype
+        case hostEarlyText
         case hostText
         case partnerEarlyText
         case partnerCurrentText
@@ -194,6 +196,29 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         case insightLevel1
         case insightLevel2
         case isZeroShotUnseen
+    }
+
+    public static func fallbackEarlyText(from hostText: String) -> String {
+        let terminators: Set<Character> = ["。", "！", "？", "!", "?"]
+        var sentences: [String] = []
+        var buf = ""
+        for ch in hostText {
+            buf.append(ch)
+            if terminators.contains(ch) {
+                if !buf.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    sentences.append(buf)
+                }
+                buf = ""
+            }
+        }
+        let tail = buf.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty {
+            sentences.append(buf)
+        }
+        if sentences.count >= 3 {
+            return sentences[0] + sentences[1]
+        }
+        return hostText
     }
 
     public init(
@@ -206,6 +231,7 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         expectedArchetypeT2: RelationalArchetype? = nil,
         expectedTopology: RelationalTopology,
         expectedArchetype: RelationalArchetype,
+        hostEarlyText: String? = nil,
         hostText: String,
         partnerEarlyText: String,
         partnerCurrentText: String,
@@ -225,6 +251,11 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         self.expectedTopology = expectedTopology
         self.expectedArchetype = expectedArchetype
         self.hostText = hostText
+        if let early = hostEarlyText, !early.isEmpty {
+            self.hostEarlyText = early
+        } else {
+            self.hostEarlyText = Self.fallbackEarlyText(from: hostText)
+        }
         self.partnerEarlyText = partnerEarlyText
         self.partnerCurrentText = partnerCurrentText
         self.harmonizedPartnerText = harmonizedPartnerText
@@ -247,7 +278,13 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         self.expectedArchetype = archT4
         self.expectedTopologyT2 = (try? container.decode(RelationalTopology.self, forKey: .expectedTopologyT2)) ?? topoT4
         self.expectedArchetypeT2 = (try? container.decode(RelationalArchetype.self, forKey: .expectedArchetypeT2)) ?? archT4
-        self.hostText = try container.decode(String.self, forKey: .hostText)
+        let hText = try container.decode(String.self, forKey: .hostText)
+        self.hostText = hText
+        if let early = try? container.decode(String.self, forKey: .hostEarlyText), !early.isEmpty {
+            self.hostEarlyText = early
+        } else {
+            self.hostEarlyText = Self.fallbackEarlyText(from: hText)
+        }
         self.partnerEarlyText = try container.decode(String.self, forKey: .partnerEarlyText)
         self.partnerCurrentText = try container.decode(String.self, forKey: .partnerCurrentText)
         self.harmonizedPartnerText = try container.decode(String.self, forKey: .harmonizedPartnerText)

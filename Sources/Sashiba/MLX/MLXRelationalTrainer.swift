@@ -308,11 +308,42 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
             // 2. L_supcon: Cross-group supervised contrastive loss within the same temporal phase
             let lSup = Self.crossGroupSupCon(mainZRel, posMask: posMask, temperature: lossWeights.supconTemperature)
 
-            // 3. L_metric: Subband geometric prototype regression (balanced across groups/classes)
+            // 3. L_metric: Subband geometric prototype + direct (sLL, sHH, rHH) invariant regression
             let diff = mainZRel - protos
             let rowSq = mean(diff * diff, axis: -1)
+            let qDim = half / 2
+            let mLLS = mainZRel[0..., 0..<qDim]
+            let mLLC = mainZRel[0..., qDim..<half]
+            let mHHS = mainZRel[0..., half..<(half + qDim)]
+            let mHHC = mainZRel[0..., (half + qDim)..<lDim]
+            let pLLS = protos[0..., 0..<qDim]
+            let pLLC = protos[0..., qDim..<half]
+            let pHHS = protos[0..., half..<(half + qDim)]
+            let pHHC = protos[0..., (half + qDim)..<lDim]
+
+            let nMLLS = sqrt(maximum(sum(mLLS * mLLS, axis: -1), MLXArray(Float(1e-8))))
+            let nMLLC = sqrt(maximum(sum(mLLC * mLLC, axis: -1), MLXArray(Float(1e-8))))
+            let predSLL = sum(mLLS * mLLC, axis: -1) / (nMLLS * nMLLC + 1e-6)
+            let nPLLS = sqrt(maximum(sum(pLLS * pLLS, axis: -1), MLXArray(Float(1e-8))))
+            let nPLLC = sqrt(maximum(sum(pLLC * pLLC, axis: -1), MLXArray(Float(1e-8))))
+            let targSLL = sum(pLLS * pLLC, axis: -1) / (nPLLS * nPLLC + 1e-6)
+
+            let nMHHS = sqrt(maximum(sum(mHHS * mHHS, axis: -1), MLXArray(Float(1e-8))))
+            let nMHHC = sqrt(maximum(sum(mHHC * mHHC, axis: -1), MLXArray(Float(1e-8))))
+            let predSHH = sum(mHHS * mHHC, axis: -1) / (nMHHS * nMHHC + 1e-6)
+            let nPHHS = sqrt(maximum(sum(pHHS * pHHS, axis: -1), MLXArray(Float(1e-8))))
+            let nPHHC = sqrt(maximum(sum(pHHC * pHHC, axis: -1), MLXArray(Float(1e-8))))
+            let targSHH = sum(pHHS * pHHC, axis: -1) / (nPHHS * nPHHC + 1e-6)
+
+            let predRHH = nMHHC / (nMHHS + 1e-4)
+            let targRHH = nPHHC / (nPHHS + 1e-4)
+            let dSLL = predSLL - targSLL
+            let dSHH = predSHH - targSHH
+            let dRHH = predRHH - targRHH
+            let geomErr = 1.6 * dSLL * dSLL + 1.2 * dSHH * dSHH + 0.6 * dRHH * dRHH
+
             let rowW = t4Mask + t2Mask
-            let lMetric = sum(rowSq * rowW) / maximum(sum(rowW), MLXArray(Float(1.0)))
+            let lMetric = sum((rowSq + geomErr) * rowW) / maximum(sum(rowW), MLXArray(Float(1.0)))
 
             // 4. L_cf: Counterfactual LL preservation & HH high-tension separation (zero hardcoded prototypes)
             let orig = comb.zRel[n..<(n + cfN)]

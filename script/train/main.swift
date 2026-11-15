@@ -21,6 +21,7 @@ struct TrainCLI {
     var relEpochs: Int = 15
     var relBatch: Int = 32
     var relLR: Float = 1.4e-3
+    var metricWeight: Float? = nil
     var aeWeightsPath: String = ".tmp/weights_ae.safetensors"
     var recalibrateCFM: Bool = false
 
@@ -86,6 +87,9 @@ struct TrainCLI {
             case "--rel-lr":
                 i += 1
                 if i < args.count, let v = Float(args[i]) { cli.relLR = v }
+            case "--metric-weight":
+                i += 1
+                if i < args.count, let v = Float(args[i]) { cli.metricWeight = max(0.0, v) }
             case "--ae-weights":
                 i += 1
                 if i < args.count { cli.aeWeightsPath = args[i] }
@@ -404,8 +408,13 @@ if (cli.epochs > 0 || cli.importWeightsPath != nil) && !cli.exportWeightsPath.is
                 relLen = max(relLen, vocab.encode(text, maxLength: cli.maxSeqLen, addEOS: false, padToLength: nil).count)
             }
         }
+        let relLossWeights: RelationalLossWeights = if let mw = cli.metricWeight {
+            RelationalLossWeights(metric: mw)
+        } else {
+            RelationalLossWeights()
+        }
         print("------------------------------------------------------------------")
-        print("[Phase 5.1] Relational E2E stage: \(relTrainCases.count) train scenarios | T = \(relLen) | epochs = \(cli.relEpochs)")
+        print("[Phase 5.1] Relational E2E stage: \(relTrainCases.count) train scenarios | T = \(relLen) | epochs = \(cli.relEpochs) | λ_metric = \(String(format: "%.3f", relLossWeights.metric))")
         let relStart = Date()
         let telemetry = RelationalPipeline.trainRelationalStage(
             model: model,
@@ -415,6 +424,7 @@ if (cli.epochs > 0 || cli.importWeightsPath != nil) && !cli.exportWeightsPath.is
             epochs: cli.relEpochs,
             batchSize: cli.relBatch,
             learningRate: cli.relLR,
+            lossWeights: relLossWeights,
             seed: cli.seed &+ 7
         )
         print(String(format: "[Phase 5.1] Relational stage finished in %.1fs", Date().timeIntervalSince(relStart)))

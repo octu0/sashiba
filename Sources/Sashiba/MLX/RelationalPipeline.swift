@@ -113,6 +113,7 @@ public enum RelationalPipeline {
         var rng = SplitMix64(seed: seed)
         var pairs: [RelationalTrainingPair] = []
         var cfs: [RelationalCounterfactualPair] = []
+        let hostEarly = cases.map { encodeTokens($0.hostEarlyText, vocab: vocab, time: time) }
         let host = cases.map { encodeTokens($0.hostText, vocab: vocab, time: time) }
         let early = cases.map { encodeTokens($0.partnerEarlyText, vocab: vocab, time: time) }
         let current = cases.map { encodeTokens($0.partnerCurrentText, vocab: vocab, time: time) }
@@ -127,7 +128,7 @@ public enum RelationalPipeline {
         for (i, rc) in cases.enumerated() {
             let uw = hasU ? uniquenessWeights![i] : 1.0
             pairs.append(RelationalTrainingPair(
-                senderTokens: host[i],
+                senderTokens: hostEarly[i],
                 receiverTokens: early[i],
                 archetype: archetypeIndex(rc.expectedArchetypeT2),
                 topology: topologyIndex(rc.expectedTopologyT2),
@@ -153,7 +154,7 @@ public enum RelationalPipeline {
                     separateHH: rc.expectedArchetype == .gachikoiRisk || rc.expectedArchetype == .hiddenAggressor
                 ))
             }
-            if cases.count > 1 && mismatchPerCase > 0 && i % 4 == 0 {
+            if cases.count > 1 && mismatchPerCase > 0 && i % 2 == 0 {
                 for k in 0..<mismatchPerCase {
                     var j = Int(rng.next() % UInt64(cases.count))
                     var guardCount = 0
@@ -245,10 +246,11 @@ public enum RelationalPipeline {
         )
 
         // Calibrate heads strictly on the GPU-encoded z_rel of training scenario pairs (identical tensor used by all reports).
+        let calHostEarly = trainCases.map { encodeTokens($0.hostEarlyText, vocab: vocab, time: time) }
         let calHost = trainCases.map { encodeTokens($0.hostText, vocab: vocab, time: time) }
         let calEarly = trainCases.map { encodeTokens($0.partnerEarlyText, vocab: vocab, time: time) }
         let calCurrent = trainCases.map { encodeTokens($0.partnerCurrentText, vocab: vocab, time: time) }
-        let z2 = encodeZRel(model: model, senders: calHost, receivers: calEarly, time: time)
+        let z2 = encodeZRel(model: model, senders: calHostEarly, receivers: calEarly, time: time)
         let z4 = encodeZRel(model: model, senders: calHost, receivers: calCurrent, time: time)
         trainer.calibrateHeads(
             zRelT4: z4,

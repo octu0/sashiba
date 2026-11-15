@@ -438,24 +438,47 @@ public enum DualStreamRelationalEngine {
         topology: RelationalTopology
     ) -> (sLL: Float, sHH: Float, rHH: Float) {
         switch (archetype, topology) {
-        case (.trueSupporter, .deepAffection):
-            return (sLL: 0.88, sHH: 0.88, rHH: 1.00)
-        case (.trueSupporter, .benevolentGuardian):
-            return (sLL: 0.85, sHH: 0.82, rHH: 0.96)
-        case (.gachikoiSafe, .deepAffection):
-            return (sLL: 0.90, sHH: 0.84, rHH: 1.20)
-        case (.gachikoiRisk, .closeConfidant), (.gachikoiRisk, _):
-            return (sLL: 0.72, sHH: -0.45, rHH: 1.42)
-        case (.hiddenAggressor, .acquaintedObserver), (.hiddenAggressor, _):
-            return (sLL: 0.12, sHH: -0.82, rHH: 1.28)
-        case (.casualHype, .benevolentGuardian):
-            return (sLL: 0.22, sHH: 0.78, rHH: 0.95)
-        case (.casualHype, .acquaintedObserver), (.casualHype, _):
-            return (sLL: 0.05, sHH: 0.42, rHH: 0.78)
-        case (.indifferentTroll, .unconnectedStranger), (.indifferentTroll, _):
-            return (sLL: -0.68, sHH: 0.02, rHH: 0.22)
-        default:
-            return (sLL: 0.50, sHH: 0.50, rHH: 1.00)
+        // TRUE_SUPPORTER: deep contextual understanding, calm balanced energy (rHH ≈ 0.86..0.98), warm positive sHH
+        case (.trueSupporter, .deepAffection):       return (sLL: 0.92, sHH: 0.90, rHH: 0.98)
+        case (.trueSupporter, .closeConfidant):      return (sLL: 0.84, sHH: 0.86, rHH: 0.95)
+        case (.trueSupporter, .benevolentGuardian):  return (sLL: 0.76, sHH: 0.82, rHH: 0.92)
+        case (.trueSupporter, .acquaintedObserver):  return (sLL: 0.66, sHH: 0.77, rHH: 0.89)
+        case (.trueSupporter, .unconnectedStranger): return (sLL: 0.56, sHH: 0.72, rHH: 0.86)
+
+        // GACHIKOI_SAFE: high contextual devotion, passionate high positive energy (rHH ≈ 1.24..1.36, sHH ≈ 0.68..0.76)
+        case (.gachikoiSafe, .deepAffection):        return (sLL: 0.88, sHH: 0.76, rHH: 1.36)
+        case (.gachikoiSafe, .closeConfidant):       return (sLL: 0.80, sHH: 0.74, rHH: 1.33)
+        case (.gachikoiSafe, .benevolentGuardian):   return (sLL: 0.72, sHH: 0.72, rHH: 1.30)
+        case (.gachikoiSafe, .acquaintedObserver):   return (sLL: 0.62, sHH: 0.70, rHH: 1.27)
+        case (.gachikoiSafe, .unconnectedStranger):  return (sLL: 0.52, sHH: 0.68, rHH: 1.24)
+
+        // CASUAL_HYPE: cheerful surface harmony, moderate-low context depth, healthy light distance
+        case (.casualHype, .deepAffection):          return (sLL: 0.44, sHH: 0.84, rHH: 1.08)
+        case (.casualHype, .closeConfidant):         return (sLL: 0.35, sHH: 0.78, rHH: 1.02)
+        case (.casualHype, .benevolentGuardian):     return (sLL: 0.26, sHH: 0.72, rHH: 0.95)
+        case (.casualHype, .acquaintedObserver):     return (sLL: 0.08, sHH: 0.46, rHH: 0.76)
+        case (.casualHype, .unconnectedStranger):    return (sLL: -0.08, sHH: 0.34, rHH: 0.66)
+
+        // GACHIKOI_RISK: obsessive context tracking paired with boundary-invading negative polarity & overheated rHH
+        case (.gachikoiRisk, .deepAffection):        return (sLL: 0.78, sHH: -0.38, rHH: 1.52)
+        case (.gachikoiRisk, .closeConfidant):       return (sLL: 0.70, sHH: -0.45, rHH: 1.46)
+        case (.gachikoiRisk, .benevolentGuardian):   return (sLL: 0.58, sHH: -0.51, rHH: 1.41)
+        case (.gachikoiRisk, .acquaintedObserver):   return (sLL: 0.46, sHH: -0.57, rHH: 1.36)
+        case (.gachikoiRisk, .unconnectedStranger):  return (sLL: 0.34, sHH: -0.63, rHH: 1.31)
+
+        // HIDDEN_AGGRESSOR: low genuine context alignment, sharp passive-aggressive negative polarity & elevated rHH
+        case (.hiddenAggressor, .deepAffection):       return (sLL: 0.24, sHH: -0.74, rHH: 1.26)
+        case (.hiddenAggressor, .closeConfidant):      return (sLL: 0.15, sHH: -0.78, rHH: 1.22)
+        case (.hiddenAggressor, .benevolentGuardian):  return (sLL: 0.06, sHH: -0.81, rHH: 1.18)
+        case (.hiddenAggressor, .acquaintedObserver):  return (sLL: -0.04, sHH: -0.84, rHH: 1.14)
+        case (.hiddenAggressor, .unconnectedStranger): return (sLL: -0.14, sHH: -0.88, rHH: 1.10)
+
+        // INDIFFERENT_TROLL: context-ignoring mismatch, cold dismissal, disengaged low rHH
+        case (.indifferentTroll, .deepAffection):       return (sLL: -0.44, sHH: -0.06, rHH: 0.42)
+        case (.indifferentTroll, .closeConfidant):      return (sLL: -0.52, sHH: -0.10, rHH: 0.37)
+        case (.indifferentTroll, .benevolentGuardian):  return (sLL: -0.60, sHH: -0.14, rHH: 0.32)
+        case (.indifferentTroll, .acquaintedObserver):  return (sLL: -0.68, sHH: -0.18, rHH: 0.27)
+        case (.indifferentTroll, .unconnectedStranger): return (sLL: -0.78, sHH: -0.22, rHH: 0.22)
         }
     }
 
@@ -474,7 +497,8 @@ public enum DualStreamRelationalEngine {
         let archIdx = RelationalArchetype.allCases.firstIndex(of: archetype) ?? 0
         let topoIdx = RelationalTopology.allCases.firstIndex(of: topology) ?? 0
         let phaseSalt: UInt64 = isEarlyT2 ? 0x0055_AA55_0055_AA55 : 0
-        let classSalt = UInt64((archIdx + 1) * 131 + (topoIdx + 1) * 17) ^ phaseSalt
+        let archSalt = UInt64((archIdx + 1) * 1009) ^ phaseSalt
+        let topoSalt = UInt64((topoIdx + 1) * 2027) ^ phaseSalt
 
         func makeZeroMeanUnitBasis(seed: UInt64, count: Int) -> [Float] {
             var rng = SplitMix64(seed: seed)
@@ -496,19 +520,36 @@ public enum DualStreamRelationalEngine {
             return v
         }
 
-        // Construct orthogonal u1, u2 in R^quarter using Gram-Schmidt
-        func makeCorrelatedPair(seed: UInt64, cosine: Float, normS: Float, normC: Float) -> ([Float], [Float]) {
-            let u1 = makeZeroMeanUnitBasis(seed: seed, count: quarter)
-            var u2 = makeZeroMeanUnitBasis(seed: seed ^ 0x5555_AAAA_5555_AAAA, count: quarter)
+        // Construct structured (archetype + topology) zero-mean orthonormal u1, u2 in R^quarter via Gram-Schmidt
+        func makeCorrelatedPair(domainTag: UInt64, cosine: Float, normS: Float, normC: Float) -> ([Float], [Float]) {
+            let a1 = makeZeroMeanUnitBasis(seed: domainTag ^ archSalt, count: quarter)
+            let t1 = makeZeroMeanUnitBasis(seed: (domainTag &+ 0x0101_0101_0101_0101) ^ topoSalt, count: quarter)
+            var u1 = [Float](repeating: 0.0, count: quarter)
+            var sq1: Float = 0.0
+            for i in 0..<quarter {
+                let v = 0.82 * a1[i] + 0.57 * t1[i]
+                u1[i] = v
+                sq1 += v * v
+            }
+            let inv1 = 1.0 / sqrtf(max(sq1, 1e-12))
+            for i in 0..<quarter { u1[i] *= inv1 }
+
+            let a2 = makeZeroMeanUnitBasis(seed: domainTag ^ archSalt ^ 0x5555_AAAA_5555_AAAA, count: quarter)
+            let t2 = makeZeroMeanUnitBasis(seed: (domainTag &+ 0x0101_0101_0101_0101) ^ topoSalt ^ 0x5555_AAAA_5555_AAAA, count: quarter)
+            var u2 = [Float](repeating: 0.0, count: quarter)
             var dot: Float = 0.0
-            for i in 0..<quarter { dot += u1[i] * u2[i] }
-            var sq: Float = 0.0
+            for i in 0..<quarter {
+                let v = 0.82 * a2[i] + 0.57 * t2[i]
+                u2[i] = v
+                dot += u1[i] * v
+            }
+            var sq2: Float = 0.0
             for i in 0..<quarter {
                 u2[i] -= dot * u1[i]
-                sq += u2[i] * u2[i]
+                sq2 += u2[i] * u2[i]
             }
-            let inv = 1.0 / sqrtf(max(sq, 1e-12))
-            for i in 0..<quarter { u2[i] *= inv }
+            let inv2 = 1.0 / sqrtf(max(sq2, 1e-12))
+            for i in 0..<quarter { u2[i] *= inv2 }
 
             let c = max(-0.99, min(0.99, cosine))
             let s = sqrtf(max(0.0, 1.0 - c * c))
@@ -524,7 +565,7 @@ public enum DualStreamRelationalEngine {
         let targetHalfNorm = sqrtf(Float(half))
         let llSideNorm = targetHalfNorm / sqrtf(2.0)
         let (llS, llC) = makeCorrelatedPair(
-            seed: 0x1000_0000_0000_0000 ^ classSalt,
+            domainTag: 0x1000_0000_0000_0000,
             cosine: geom.sLL,
             normS: llSideNorm,
             normC: llSideNorm
@@ -534,7 +575,7 @@ public enum DualStreamRelationalEngine {
         let hhNormS = targetHalfNorm / sqrtf(1.0 + r * r)
         let hhNormC = r * hhNormS
         let (hhS, hhC) = makeCorrelatedPair(
-            seed: 0x2000_0000_0000_0000 ^ classSalt,
+            domainTag: 0x2000_0000_0000_0000,
             cosine: geom.sHH,
             normS: hhNormS,
             normC: hhNormC

@@ -49,5 +49,4 @@ script/dataset/*
 !script/dataset/.gitkeep
 
 /docs/
-verification_report.md
 

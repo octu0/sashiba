@@ -348,11 +348,13 @@ func sampleInsightAtGamma(zHost: [Float], zPartnerCurrent: [Float], gamma: Float
 }
 
 for (uIdx, rc) in unseenCases.enumerated() {
+    let hEarlyIds = encodePadded(rc.hostEarlyText)
     let hIds = encodePadded(rc.hostText)
     let p1Ids = encodePadded(rc.partnerEarlyText)
     let p2Ids = encodePadded(rc.partnerCurrentText)
 
     let relRes = model.analyzeRelationalDynamicsWithFlowMatching(
+        hostEarlyTokens: hEarlyIds,
         hostTokens: hIds,
         partnerEarlyTokens: p1Ids,
         partnerCurrentTokens: p2Ids,
@@ -748,13 +750,15 @@ print("[Audit 3a] mean Score_ctx matched \(meanMatchedCtx) -> mismatched \(meanM
 var shuffleRng = SplitMix64(seed: 3131)
 var accOrig: [String: Int] = [:]
 var accShuf: [String: Int] = [:]
-var shufSenders: [[Int]] = []
+var shufSendersT4: [[Int]] = []
+var shufSendersT2: [[Int]] = []
 var origRecvsT4: [[Int]] = []
 var shufRecvsT4: [[Int]] = []
 var origRecvsT2: [[Int]] = []
 var shufRecvsT2: [[Int]] = []
 for rc in unseenCases {
-    shufSenders.append(tokensOf(rc.hostText))
+    shufSendersT4.append(tokensOf(rc.hostText))
+    shufSendersT2.append(tokensOf(rc.hostEarlyText))
     let recv4 = tokensOf(rc.partnerCurrentText)
     var s4 = recv4
     for k in stride(from: s4.count - 1, to: 0, by: -1) {
@@ -772,10 +776,10 @@ for rc in unseenCases {
     origRecvsT2.append(recv2)
     shufRecvsT2.append(s2)
 }
-let zOrigT4All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSenders, receivers: origRecvsT4, time: seqLen)
-let zShufT4All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSenders, receivers: shufRecvsT4, time: seqLen)
-let zOrigT2All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSenders, receivers: origRecvsT2, time: seqLen)
-let zShufT2All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSenders, receivers: shufRecvsT2, time: seqLen)
+let zOrigT4All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSendersT4, receivers: origRecvsT4, time: seqLen)
+let zShufT4All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSendersT4, receivers: shufRecvsT4, time: seqLen)
+let zOrigT2All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSendersT2, receivers: origRecvsT2, time: seqLen)
+let zShufT2All = RelationalPipeline.encodeZRel(model: gpuModel, senders: shufSendersT2, receivers: shufRecvsT2, time: seqLen)
 for (idx, rc) in unseenCases.enumerated() {
     for task in taskNames {
         let useEarly = task.hasSuffix("t2")
@@ -811,7 +815,7 @@ if !cli.skipPermutationAudit, FileManager.default.fileExists(atPath: cli.aeWeigh
             id: rc.id, group: rc.group, personaStyle: rc.personaStyle, topicDomain: rc.topicDomain, title: rc.title,
             expectedTopologyT2: src.expectedTopologyT2, expectedArchetypeT2: src.expectedArchetypeT2,
             expectedTopology: src.expectedTopology, expectedArchetype: src.expectedArchetype,
-            hostText: rc.hostText, partnerEarlyText: rc.partnerEarlyText, partnerCurrentText: rc.partnerCurrentText,
+            hostEarlyText: rc.hostEarlyText, hostText: rc.hostText, partnerEarlyText: rc.partnerEarlyText, partnerCurrentText: rc.partnerCurrentText,
             harmonizedPartnerText: rc.harmonizedPartnerText, insightLevel0: rc.insightLevel0, insightLevel1: rc.insightLevel1,
             insightLevel2: rc.insightLevel2, isZeroShotUnseen: false
         )
@@ -822,8 +826,8 @@ if !cli.skipPermutationAudit, FileManager.default.fileExists(atPath: cli.aeWeigh
         seed: 777, log: { print("  [Audit 3c] " + $0) }
     )
     let permW = permModel.exportWeights()
-    let permZ2All = RelationalPipeline.encodeZRel(model: permModel, senders: shufSenders, receivers: origRecvsT2, time: seqLen)
-    let permZ4All = RelationalPipeline.encodeZRel(model: permModel, senders: shufSenders, receivers: origRecvsT4, time: seqLen)
+    let permZ2All = RelationalPipeline.encodeZRel(model: permModel, senders: shufSendersT2, receivers: origRecvsT2, time: seqLen)
+    let permZ4All = RelationalPipeline.encodeZRel(model: permModel, senders: shufSendersT4, receivers: origRecvsT4, time: seqLen)
     var correct: [String: Int] = [:]
     for (idx, rc) in unseenCases.enumerated() {
         let z2 = permZ2All[idx]

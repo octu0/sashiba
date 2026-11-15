@@ -1137,6 +1137,7 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
     /// integrates the 50-Step Midpoint ODE for Multi-Resolution Insight Generation (`γ ∈ {0.0, 0.5, 1.0}`),
     /// and performs subband-orthogonal Latent Harmonization.
     public func analyzeRelationalDynamicsWithFlowMatching(
+        hostEarlyTokens: [Int]? = nil,
         hostTokens: [Int],
         partnerEarlyTokens: [Int],
         partnerCurrentTokens: [Int],
@@ -1157,7 +1158,8 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         harmonizedTokens: [Int],
         trajectoryNorms: [Float]
     ) {
-        precondition(hostTokens.count == time && partnerEarlyTokens.count == time && partnerCurrentTokens.count == time)
+        let hEarlyTokens = hostEarlyTokens ?? hostTokens
+        precondition(hEarlyTokens.count == time && hostTokens.count == time && partnerEarlyTokens.count == time && partnerCurrentTokens.count == time)
         let zHost = encode(tokens: hostTokens, batch: 1, time: time)
         let zPartnerEarly = encode(tokens: partnerEarlyTokens, batch: 1, time: time)
         let zPartnerCurrent = encode(tokens: partnerCurrentTokens, batch: 1, time: time)
@@ -1188,7 +1190,7 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
 
         if weights.relational.calibratedHeads.archetypeT4 != nil || weights.subbandClassifier.modulationRules.isEmpty {
             let zRelT2 = encodeRelationalBatch(
-                senderTokens: hostTokens, receiverTokens: partnerEarlyTokens, batch: 1, time: time
+                senderTokens: hEarlyTokens, receiverTokens: partnerEarlyTokens, batch: 1, time: time
             )
             let zRelT4 = encodeRelationalBatch(
                 senderTokens: hostTokens, receiverTokens: partnerCurrentTokens, batch: 1, time: time

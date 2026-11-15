@@ -103,16 +103,18 @@ print("Phase 5.1 Relational Head Evaluation (pure-neural z_rel, unified heads)")
 print("==================================================================")
 print("Train cases: \(trainCasesAll.count) | Unseen cases: \(unseenCasesAll.count) | seqLen: \(seqLen)")
 
+let hostEarlyTok = allCases.map { RelationalPipeline.encodeTokens($0.hostEarlyText, vocab: vocab, time: seqLen) }
 let hostTok = allCases.map { RelationalPipeline.encodeTokens($0.hostText, vocab: vocab, time: seqLen) }
 let earlyTok = allCases.map { RelationalPipeline.encodeTokens($0.partnerEarlyText, vocab: vocab, time: seqLen) }
 let currentTok = allCases.map { RelationalPipeline.encodeTokens($0.partnerCurrentText, vocab: vocab, time: seqLen) }
 
 let ngram = CharNGramFeaturizer(dim: 2048)
+let ngramHostEarly = allCases.map { ngram.features($0.hostEarlyText) }
 let ngramHost = allCases.map { ngram.features($0.hostText) }
 let ngramEarly = allCases.map { ngram.features($0.partnerEarlyText) }
 let ngramCurrent = allCases.map { ngram.features($0.partnerCurrentText) }
 func ngramInput(_ i: Int, _ early: Bool) -> [Float] {
-    return ngramHost[i] + (early ? ngramEarly[i] : ngramCurrent[i])
+    return (early ? ngramHostEarly[i] : ngramHost[i]) + (early ? ngramEarly[i] : ngramCurrent[i])
 }
 
 struct EvalResult {
@@ -172,7 +174,7 @@ let pct = { (v: Float) in String(format: "%6.2f%%", v * 100.0) }
 // ------------------------------------------------------------------
 // (A) Scenario split: the SAME calibrated heads and the SAME z_rel tensor used by verify_latent_space (Audit 5).
 // ------------------------------------------------------------------
-let zT2All = RelationalPipeline.encodeZRel(model: mainModel, senders: hostTok, receivers: earlyTok, time: seqLen)
+let zT2All = RelationalPipeline.encodeZRel(model: mainModel, senders: hostEarlyTok, receivers: earlyTok, time: seqLen)
 let zT4All = RelationalPipeline.encodeZRel(model: mainModel, senders: hostTok, receivers: currentTok, time: seqLen)
 
 var splitResults: [EvalResult] = []
@@ -284,7 +286,7 @@ if !cli.skipFolds {
         )
         let fw = model.exportWeights()
         let evalIdx = foldTrain + foldTest
-        let z2 = RelationalPipeline.encodeZRel(model: model, senders: evalIdx.map { hostTok[$0] }, receivers: evalIdx.map { earlyTok[$0] }, time: seqLen)
+        let z2 = RelationalPipeline.encodeZRel(model: model, senders: evalIdx.map { hostEarlyTok[$0] }, receivers: evalIdx.map { earlyTok[$0] }, time: seqLen)
         let z4 = RelationalPipeline.encodeZRel(model: model, senders: evalIdx.map { hostTok[$0] }, receivers: evalIdx.map { currentTok[$0] }, time: seqLen)
         var row: [Int: Int] = [:]
         for (k, i) in evalIdx.enumerated() {
