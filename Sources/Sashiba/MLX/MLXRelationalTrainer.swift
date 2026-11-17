@@ -397,8 +397,11 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         let useTokDrop = pairs.count > 8
         let alphaHost = model.relational.alphaRel
 
+        let numTopos = topoCases.count
         var t4ArchCounts = [Int](repeating: 0, count: archCases.count)
         var t2ArchCounts = [Int](repeating: 0, count: archCases.count)
+        var t4CellCounts = [Int](repeating: 0, count: archCases.count * numTopos)
+        var t2CellCounts = [Int](repeating: 0, count: archCases.count * numTopos)
         var groupPairCounts: [String: Int] = [:]
         var nT4 = 0
         var nT2 = 0
@@ -406,29 +409,41 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
             if !p.groupKey.hasPrefix("MISMATCH:") {
                 groupPairCounts[p.groupKey, default: 0] += 1
             }
+            let validCell = (p.archetype >= 0 && p.archetype < archCases.count && p.topology >= 0 && p.topology < numTopos)
             if p.isEarlyT2 {
                 if p.archetype >= 0 && p.archetype < archCases.count { t2ArchCounts[p.archetype] += 1 }
+                if validCell { t2CellCounts[p.archetype * numTopos + p.topology] += 1 }
                 nT2 += 1
             } else {
                 if p.archetype >= 0 && p.archetype < archCases.count { t4ArchCounts[p.archetype] += 1 }
+                if validCell { t4CellCounts[p.archetype * numTopos + p.topology] += 1 }
                 nT4 += 1
             }
         }
         let maxGroupPairs = Float(max(1, groupPairCounts.values.max() ?? 1))
         let meanT4 = Float(max(1, nT4)) / Float(max(1, t4ArchCounts.filter { $0 > 0 }.count))
         let meanT2 = Float(max(1, nT2)) / Float(max(1, t2ArchCounts.filter { $0 > 0 }.count))
+        let meanCellT4 = Float(max(1, nT4)) / Float(max(1, t4CellCounts.filter { $0 > 0 }.count))
+        let meanCellT2 = Float(max(1, nT2)) / Float(max(1, t2CellCounts.filter { $0 > 0 }.count))
         func sampleClsWeight(_ p: RelationalTrainingPair) -> Float {
             if p.groupKey.hasPrefix("MISMATCH:") {
                 let c = max(1, t4ArchCounts[p.archetype])
                 return 0.72 * min(1.75, max(0.75, powf(meanT4 / Float(c), 0.30)))
             }
             let gMul = min(1.50, max(0.85, powf(maxGroupPairs / Float(max(1, groupPairCounts[p.groupKey] ?? 1)), 0.35))) * p.uniquenessWeight
+            let cellIdx = p.archetype * numTopos + p.topology
             if p.isEarlyT2 {
                 let c = max(1, t2ArchCounts[p.archetype])
-                return gMul * min(1.75, max(0.75, powf(meanT2 / Float(c), 0.30)))
+                let cc = max(1, (cellIdx >= 0 && cellIdx < t2CellCounts.count) ? t2CellCounts[cellIdx] : c)
+                let archMul = min(1.65, max(0.80, powf(meanT2 / Float(c), 0.25)))
+                let cellMul = min(1.75, max(0.80, powf(meanCellT2 / Float(cc), 0.22)))
+                return gMul * archMul * cellMul
             } else {
                 let c = max(1, t4ArchCounts[p.archetype])
-                return gMul * min(1.75, max(0.75, powf(meanT4 / Float(c), 0.30)))
+                let cc = max(1, (cellIdx >= 0 && cellIdx < t4CellCounts.count) ? t4CellCounts[cellIdx] : c)
+                let archMul = min(1.65, max(0.80, powf(meanT4 / Float(c), 0.25)))
+                let cellMul = min(1.75, max(0.80, powf(meanCellT4 / Float(cc), 0.22)))
+                return gMul * archMul * cellMul
             }
         }
 
