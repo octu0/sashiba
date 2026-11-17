@@ -1184,19 +1184,25 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         return (res.zRel, res.zContent)
     }
 
-    /// Runs pure-neural Dual-Stream Relational Inference taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])` (`Phase 5.1 Audit 1`).
+    /// Runs Dual-Stream Relational Inference (`v4` + `v4_hybrid`) taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])`.
     public func inferRelational(
         senderTokenIDs: [Int],
         receiverTokenIDs: [Int]
     ) -> RelationalInferenceOutput {
         let time = max(DualStreamRelationalWeights.canonicalSeqLen, max(senderTokenIDs.count, receiverTokenIDs.count))
+        let sPad = DualStreamRelationalEngine.padOrTruncate(senderTokenIDs, to: time)
+        let rPad = DualStreamRelationalEngine.padOrTruncate(receiverTokenIDs, to: time)
         let res = encodeRelationalBatchWithContent(
-            senderTokens: DualStreamRelationalEngine.padOrTruncate(senderTokenIDs, to: time),
-            receiverTokens: DualStreamRelationalEngine.padOrTruncate(receiverTokenIDs, to: time),
+            senderTokens: sPad,
+            receiverTokens: rPad,
             batch: 1,
             time: time
         )
-        return DualStreamRelationalEngine.makeInferenceOutput(zRel: res.zRel, zContent: res.zContent, weights: weights.relational)
+        let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
+        let hyb = RelationalHybridFeatureExtractor(vocabulary: vocab).extract(
+            senderTokens: sPad, receiverTokens: rPad, zRel: res.zRel, weights: weights
+        )
+        return DualStreamRelationalEngine.makeInferenceOutput(zRel: res.zRel, hybridFeatures: hyb, zContent: res.zContent, weights: weights.relational)
     }
 
     /// Phase 5 & 5.1: Relational Dynamics Engine:

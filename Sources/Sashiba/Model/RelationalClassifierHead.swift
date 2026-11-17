@@ -327,37 +327,6 @@ public struct SoftmaxClassifierHead: Codable, Sendable, Equatable {
     }
 }
 
-/// Hashed character uni-gram + bi-gram frequency features, L2-normalized. Used as a non-neural reference baseline.
-public struct CharNGramFeaturizer: Sendable {
-    public let dim: Int
-
-    public init(dim: Int = 2048) {
-        self.dim = dim
-    }
-
-    public func features(_ text: String) -> [Float] {
-        var v = [Float](repeating: 0.0, count: dim)
-        let scalars = text.unicodeScalars.map { UInt64($0.value) }
-        for (i, s) in scalars.enumerated() {
-            v[Int(Self.mix(s) % UInt64(dim))] += 1.0
-            if i + 1 < scalars.count {
-                let pair = (s << 21) ^ scalars[i + 1] ^ 0x9e37_79b9_7f4a_7c15
-                v[Int(Self.mix(pair) % UInt64(dim))] += 1.0
-            }
-        }
-        let norm = sqrtf(v.reduce(0.0) { $0 + $1 * $1 })
-        guard norm > 0 else { return v }
-        return v.map { $0 / norm }
-    }
-
-    static func mix(_ x: UInt64) -> UInt64 {
-        var z = x &+ 0x9e37_79b9_7f4a_7c15
-        z = (z ^ (z >> 30)) &* 0xbf58_476d_1ce4_e5b9
-        z = (z ^ (z >> 27)) &* 0x94d0_49bb_1331_11eb
-        return z ^ (z >> 31)
-    }
-}
-
 /// Pure token-ID, topic-noun-swap-invariant hybrid relational descriptor (`160` dims for `z_rel ∈ R^128`):
 /// combines `z_rel` (`128`), nonlinear subband geometry (`8`), cross-stream content-echo & subband rule modulation (`8`),
 /// and non-lexical dialogue turn-taking / punctuation / sentence-trajectory cadence (`16`).

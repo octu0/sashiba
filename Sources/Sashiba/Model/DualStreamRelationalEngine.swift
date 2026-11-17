@@ -75,23 +75,35 @@ public struct RelationalAuditTelemetry: Codable, Sendable, Equatable {
     }
 }
 
-/// Container for calibrated linear classification heads serialized alongside model weights (`Phase 5.1 Audit 5`).
+/// Container for calibrated `v4` (`z_rel` 128D) and `v4_hybrid` (160D) linear classification heads serialized alongside model weights.
 public struct RelationalCalibratedHeads: Codable, Sendable, Equatable {
     public var archetypeT4: SoftmaxClassifierHead?
     public var topologyT4: SoftmaxClassifierHead?
     public var archetypeT2: SoftmaxClassifierHead?
     public var topologyT2: SoftmaxClassifierHead?
+    public var hybridArchetypeT4: SoftmaxClassifierHead?
+    public var hybridTopologyT4: SoftmaxClassifierHead?
+    public var hybridArchetypeT2: SoftmaxClassifierHead?
+    public var hybridTopologyT2: SoftmaxClassifierHead?
 
     public init(
         archetypeT4: SoftmaxClassifierHead? = nil,
         topologyT4: SoftmaxClassifierHead? = nil,
         archetypeT2: SoftmaxClassifierHead? = nil,
-        topologyT2: SoftmaxClassifierHead? = nil
+        topologyT2: SoftmaxClassifierHead? = nil,
+        hybridArchetypeT4: SoftmaxClassifierHead? = nil,
+        hybridTopologyT4: SoftmaxClassifierHead? = nil,
+        hybridArchetypeT2: SoftmaxClassifierHead? = nil,
+        hybridTopologyT2: SoftmaxClassifierHead? = nil
     ) {
         self.archetypeT4 = archetypeT4
         self.topologyT4 = topologyT4
         self.archetypeT2 = archetypeT2
         self.topologyT2 = topologyT2
+        self.hybridArchetypeT4 = hybridArchetypeT4
+        self.hybridTopologyT4 = hybridTopologyT4
+        self.hybridArchetypeT2 = hybridArchetypeT2
+        self.hybridTopologyT2 = hybridTopologyT2
     }
 
     public func serialize() -> String {
@@ -112,10 +124,11 @@ public struct RelationalCalibratedHeads: Codable, Sendable, Equatable {
     }
 }
 
-/// Output of pure-neural Dual-Stream Relational Inference taking only `(senderTokenIDs: [Int], receiverTokenIDs: [Int])` (`Phase 5.1 Audit 1`).
+/// Output of Dual-Stream Relational Inference (`v4` `z_rel` + `v4_hybrid` `160D` descriptor) taking only `(senderTokenIDs: [Int], receiverTokenIDs: [Int])`.
 public struct RelationalInferenceOutput: Sendable, Equatable {
-    public let zRel: [Float]          // [1024] = [z_LL^rel(512) ; z_HH^rel(512)]
-    public let zContent: [Float]      // [512] auxiliary topic/content latent vector
+    public let zRel: [Float]          // [128] = [z_LL^rel(64) ; z_HH^rel(64)]
+    public let hybridFeatures: [Float]// [160] = z_rel(128) + subbandGeom(8) + echoAndPentagon(8) + rhythm(16)
+    public let zContent: [Float]      // auxiliary topic/content latent vector
     public let archetypeProbsT4: [Float]
     public let topologyProbsT4: [Float]
     public let archetypeProbsT2: [Float]
@@ -124,6 +137,14 @@ public struct RelationalInferenceOutput: Sendable, Equatable {
     public let predictedTopologyT4: RelationalTopology
     public let predictedArchetypeT2: RelationalArchetype
     public let predictedTopologyT2: RelationalTopology
+    public let hybridArchetypeProbsT4: [Float]
+    public let hybridTopologyProbsT4: [Float]
+    public let hybridArchetypeProbsT2: [Float]
+    public let hybridTopologyProbsT2: [Float]
+    public let hybridPredictedArchetypeT4: RelationalArchetype
+    public let hybridPredictedTopologyT4: RelationalTopology
+    public let hybridPredictedArchetypeT2: RelationalArchetype
+    public let hybridPredictedTopologyT2: RelationalTopology
     public let pentagon: RelationalPentagonScores
     public let sLL: Float
     public let sHH: Float
@@ -731,6 +752,44 @@ public enum DualStreamRelationalEngine {
         var bestT = 0
         for i in 1..<tProbs.count where tProbs[i] > tProbs[bestT] { bestT = i }
         return (archCases[bestA], topoCases[bestT], aProbs, tProbs)
+    }
+
+    /// Predicts `(archetype, topology)` and probability distributions from the `160D` `v4_hybrid` feature vector
+    /// (falling back to `classifyFromZRel` if hybrid heads are not yet calibrated).
+    public static func classifyFromHybrid(
+        hybridFeatures: [Float],
+        zRel: [Float],
+        isEarlyT2: Bool,
+        weights: DualStreamRelationalWeights
+    ) -> (archetype: RelationalArchetype, topology: RelationalTopology, archProbs: [Float], topoProbs: [Float]) {
+        let archCases = RelationalArchetype.allCases
+        let topoCases = RelationalTopology.allCases
+
+        if isEarlyT2,
+           let hArch = weights.calibratedHeads.hybridArchetypeT2,
+           let hTopo = weights.calibratedHeads.hybridTopologyT2,
+           hArch.featureDim == hybridFeatures.count,
+           hTopo.featureDim == hybridFeatures.count {
+            return (
+                archCases[hArch.predict(hybridFeatures)],
+                topoCases[hTopo.predict(hybridFeatures)],
+                hArch.probabilities(hybridFeatures),
+                hTopo.probabilities(hybridFeatures)
+            )
+        }
+        if !isEarlyT2,
+           let hArch = weights.calibratedHeads.hybridArchetypeT4,
+           let hTopo = weights.calibratedHeads.hybridTopologyT4,
+           hArch.featureDim == hybridFeatures.count,
+           hTopo.featureDim == hybridFeatures.count {
+            return (
+                archCases[hArch.predict(hybridFeatures)],
+                topoCases[hTopo.predict(hybridFeatures)],
+                hArch.probabilities(hybridFeatures),
+                hTopo.probabilities(hybridFeatures)
+            )
+        }
+        return classifyFromZRel(zRel: zRel, isEarlyT2: isEarlyT2, weights: weights)
     }
 
     /// Alternating sign vector `[+1, -1, +1, -1, ...]` of length `dim` used for directed 2-gram Haar wavelet coherence.
@@ -1689,7 +1748,7 @@ public enum DualStreamRelationalEngine {
         ).zRel
     }
 
-    /// Full pure-neural Dual-Stream Relational Inference taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])` (`Phase 5.1 Audit 1`).
+    /// Full Dual-Stream Relational Inference (`v4` + `v4_hybrid`) taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])`.
     public static func inferRelational(
         senderTokenIDs: [Int],
         receiverTokenIDs: [Int],
@@ -1705,7 +1764,11 @@ public enum DualStreamRelationalEngine {
             time: time,
             weights: weights
         )
-        return makeInferenceOutput(zRel: res.zRel, zContent: res.zContent, weights: weights.relational)
+        let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
+        let hyb = RelationalHybridFeatureExtractor(vocabulary: vocab).extract(
+            senderTokens: sPad, receiverTokens: cPad, zRel: res.zRel, weights: weights
+        )
+        return makeInferenceOutput(zRel: res.zRel, hybridFeatures: hyb, zContent: res.zContent, weights: weights.relational)
     }
 
     /// Marginalizes fine-grained `T2` probabilities into the Layer 1 validated 2-stage coarse early schema (`α = 0.869 / 0.942`).
@@ -1798,17 +1861,21 @@ public enum DualStreamRelationalEngine {
         return out
     }
 
-    /// Builds the inference output (pentagon + 4 calibrated head predictions) from a single `zRel ∈ R^1024`.
+    /// Builds the inference output (pentagon + `v4` & `v4_hybrid` calibrated head predictions).
     public static func makeInferenceOutput(
         zRel: [Float],
+        hybridFeatures: [Float],
         zContent: [Float],
         weights: DualStreamRelationalWeights
     ) -> RelationalInferenceOutput {
         let p = computePentagonFromZRel(zRel: zRel, zRelEarly: nil)
         let c4 = classifyFromZRel(zRel: zRel, isEarlyT2: false, weights: weights)
         let c2 = classifyFromZRel(zRel: zRel, isEarlyT2: true, weights: weights)
+        let hc4 = classifyFromHybrid(hybridFeatures: hybridFeatures, zRel: zRel, isEarlyT2: false, weights: weights)
+        let hc2 = classifyFromHybrid(hybridFeatures: hybridFeatures, zRel: zRel, isEarlyT2: true, weights: weights)
         return RelationalInferenceOutput(
             zRel: zRel,
+            hybridFeatures: hybridFeatures,
             zContent: zContent,
             archetypeProbsT4: c4.archProbs,
             topologyProbsT4: c4.topoProbs,
@@ -1818,6 +1885,14 @@ public enum DualStreamRelationalEngine {
             predictedTopologyT4: c4.topology,
             predictedArchetypeT2: c2.archetype,
             predictedTopologyT2: c2.topology,
+            hybridArchetypeProbsT4: hc4.archProbs,
+            hybridTopologyProbsT4: hc4.topoProbs,
+            hybridArchetypeProbsT2: hc2.archProbs,
+            hybridTopologyProbsT2: hc2.topoProbs,
+            hybridPredictedArchetypeT4: hc4.archetype,
+            hybridPredictedTopologyT4: hc4.topology,
+            hybridPredictedArchetypeT2: hc2.archetype,
+            hybridPredictedTopologyT2: hc2.topology,
             pentagon: p.pentagon,
             sLL: p.sLL,
             sHH: p.sHH,

@@ -252,6 +252,14 @@ public enum RelationalPipeline {
         let calCurrent = trainCases.map { encodeTokens($0.partnerCurrentText, vocab: vocab, time: time) }
         let z2 = encodeZRel(model: model, senders: calHostEarly, receivers: calEarly, time: time)
         let z4 = encodeZRel(model: model, senders: calHost, receivers: calCurrent, time: time)
+        let exportedPreCal = model.exportWeights()
+        let extractor = RelationalHybridFeatureExtractor(vocabulary: vocab)
+        let hyb2 = trainCases.indices.map { i in
+            extractor.extract(senderTokens: calHostEarly[i], receiverTokens: calEarly[i], zRel: z2[i], weights: exportedPreCal)
+        }
+        let hyb4 = trainCases.indices.map { i in
+            extractor.extract(senderTokens: calHost[i], receiverTokens: calCurrent[i], zRel: z4[i], weights: exportedPreCal)
+        }
         trainer.calibrateHeads(
             zRelT4: z4,
             archT4: trainCases.map { archetypeIndex($0.expectedArchetype) },
@@ -259,6 +267,8 @@ public enum RelationalPipeline {
             zRelT2: z2,
             archT2: trainCases.map { archetypeIndex($0.expectedArchetypeT2) },
             topoT2: trainCases.map { topologyIndex($0.expectedTopologyT2) },
+            hybridT4: hyb4,
+            hybridT2: hyb2,
             groups: trainCases.map(\.group),
             uniquenessWeights: uWeights,
             steps: 350,

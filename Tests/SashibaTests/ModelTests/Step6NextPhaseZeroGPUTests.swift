@@ -151,5 +151,11 @@ struct Step6NextPhaseZeroGPUTests {
             }
             #expect(maxDiff < 1e-4, "Mismatch at item \(i): \(maxDiff)")
         }
+
+        let inf = SWTHawkAutoencoder(weights: w).inferRelational(senderTokenIDs: sToks[0], receiverTokenIDs: rToks[0])
+        #expect(inf.zRel.count == 128)
+        #expect(inf.hybridFeatures.count == 160)
+        #expect(inf.hybridArchetypeProbsT4.count == 6)
+        #expect(inf.hybridTopologyProbsT4.count == 5)
     }
 }

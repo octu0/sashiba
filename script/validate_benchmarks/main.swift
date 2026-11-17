@@ -3,12 +3,8 @@ import MLX
 import Sashiba
 
 struct ValidateBenchmarksCLI: Sendable {
-    var v2DataPath: String = ".tmp"
-    var v1BackupDir: String = ".tmp/phase5_1_backup"
-    var v1WeightsPath: String = ".tmp/phase5_1_backup/weights.safetensors"
-    var v2NoMetricWeightsPath: String = ".tmp/train_v2/weights_nometric.safetensors"
-    var v2WeightsPath: String = ".tmp/weights.safetensors"
-    var v3WeightsPath: String = ""
+    var dataPath: String = ".tmp"
+    var weightsPath: String = ".tmp/weights.safetensors"
     var layer1ConsensusPath: String = ".tmp/validation/layer1_blind_consensus_60.json"
     var layer1T2FullPath: String = ".tmp/validation/layer1_t2_consensus_60.json"
     var layer1T4FullPath: String = ".tmp/validation/layer1_t4_consensus_60.json"
@@ -29,22 +25,10 @@ struct ValidateBenchmarksCLI: Sendable {
             switch args[i] {
             case "-d", "--data":
                 i += 1
-                if i < args.count { cli.v2DataPath = args[i] }
-            case "--v1-dir":
+                if i < args.count { cli.dataPath = args[i] }
+            case "-w", "--weights":
                 i += 1
-                if i < args.count { cli.v1BackupDir = args[i] }
-            case "--v1-weights":
-                i += 1
-                if i < args.count { cli.v1WeightsPath = args[i] }
-            case "--v2-nometric-weights":
-                i += 1
-                if i < args.count { cli.v2NoMetricWeightsPath = args[i] }
-            case "--v2-weights":
-                i += 1
-                if i < args.count { cli.v2WeightsPath = args[i] }
-            case "--v3-weights":
-                i += 1
-                if i < args.count { cli.v3WeightsPath = args[i] }
+                if i < args.count { cli.weightsPath = args[i] }
             case "--gpu":
                 cli.useGPU = true
             case "--cpu":
@@ -135,13 +119,6 @@ struct UnkStats: Codable {
     let total_cases: Int
 }
 
-struct SuiteModelEval: Codable {
-    let accuracy: FourTaskMetrics
-    let unk_stats: UnkStats?
-    let drop_pt_from_unseen_test: FourTaskMetrics?
-    let paired_inversion_accuracy: PairedInversionMetrics?
-}
-
 struct PairedInversionMetrics: Codable {
     let total_pairs: Int
     let archetype_t4: Float
@@ -152,12 +129,11 @@ struct PairedInversionMetrics: Codable {
     let joint_t4_both_correct: Float
 }
 
-struct CausalLeakageAuditOutput: Codable {
-    let dataset_cases: Int
-    let non_causal_t2: FourTaskMetrics
-    let strict_causal_t2: FourTaskMetrics
-    let archetype_t2_leakage_delta_pt: Float
-    let topology_t2_leakage_delta_pt: Float
+struct SuiteModelEval: Codable {
+    let accuracy: FourTaskMetrics
+    let unk_stats: UnkStats?
+    let drop_pt_from_unseen_test: FourTaskMetrics?
+    let paired_inversion_accuracy: PairedInversionMetrics?
 }
 
 struct SubbandGeometryModelEval: Codable {
@@ -187,8 +163,8 @@ struct PentagonModelValidity: Codable {
 }
 
 struct Layer2ValidationOutput: Codable {
-    let subband_geometry_ablation: [String: SubbandGeometryModelEval]
-    let pentagon_external_validity: [String: PentagonModelValidity]
+    let subband_geometry: SubbandGeometryModelEval
+    let pentagon_external_validity: PentagonModelValidity
 }
 
 struct Layer3SuiteOutput: Codable {
@@ -225,7 +201,6 @@ struct BenchmarkMetricsReport: Codable {
     let generated_at: String
     let execution_mode: String
     let wall_clock_seconds: Double
-    let v1_causal_t2_leakage_audit: CausalLeakageAuditOutput
     let in_distribution_unseen_test: Layer3SuiteOutput
     let p0_coarse_t2_benchmarks: [String: [String: CoarseEarlyT2Metrics]]
     let layer2_validation: Layer2ValidationOutput
@@ -344,6 +319,13 @@ func predictCoarseFromProbs(archProbs: [Float], topoProbs: [Float]) -> (stance: 
     return (bestS, bestD)
 }
 
+func accuracyRate(_ preds: [Int], _ labels: [Int]) -> Float {
+    let n = min(preds.count, labels.count)
+    guard n > 0 else { return 0.0 }
+    let ok = zip(preds, labels).filter { $0 == $1 }.count
+    return Float(ok) / Float(n)
+}
+
 func computeCoarseEarlyT2(cases: [RelationalDialogueCase], predStance: [Int], predDist: [Int]) -> CoarseEarlyT2Metrics {
     let stanceCases = EarlyRelationalStance.allCases
     let distCases = EarlyRelationalDistance.allCases
@@ -354,9 +336,8 @@ func computeCoarseEarlyT2(cases: [RelationalDialogueCase], predStance: [Int], pr
     return CoarseEarlyT2Metrics(early_stance_4way: sAcc, early_distance_3way: dAcc, mean: 0.5 * (sAcc + dAcc))
 }
 
-func encodeSuiteWithModel(
+func encodeSuite(
     suiteName: String,
-    modelName: String,
     weightsPath: String,
     cases: [RelationalDialogueCase],
     model: MLXSWTHawkAutoencoder?,
@@ -366,17 +347,14 @@ func encodeSuiteWithModel(
     cacheDir: String,
     disableCache: Bool,
     didMissCache: inout Bool,
-    maxSeqLen: Int,
-    useCausalT2: Bool = true
+    maxSeqLen: Int
 ) -> EncodedSuite {
     let seqLen = cases
         .flatMap { [$0.hostEarlyText, $0.hostText, $0.partnerEarlyText, $0.partnerCurrentText] }
         .map { min(maxSeqLen, vocab.encode($0, maxLength: maxSeqLen, addEOS: false).count) }
         .reduce(max(4, DualStreamRelationalWeights.canonicalSeqLen), max)
 
-    let sT2 = cases.map {
-        RelationalPipeline.encodeTokens(useCausalT2 ? $0.hostEarlyText : $0.hostText, vocab: vocab, time: seqLen)
-    }
+    let sT2 = cases.map { RelationalPipeline.encodeTokens($0.hostEarlyText, vocab: vocab, time: seqLen) }
     let sT4 = cases.map { RelationalPipeline.encodeTokens($0.hostText, vocab: vocab, time: seqLen) }
     let rT2 = cases.map { RelationalPipeline.encodeTokens($0.partnerEarlyText, vocab: vocab, time: seqLen) }
     let rT4 = cases.map { RelationalPipeline.encodeTokens($0.partnerCurrentText, vocab: vocab, time: seqLen) }
@@ -385,7 +363,7 @@ func encodeSuiteWithModel(
     let wSize = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
     let wMtime = Int64(((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0).rounded())
     let cachePath = (cacheDir as NSString).appendingPathComponent(
-        "\(modelName)_\(suiteName)_\(useCausalT2 ? "causal" : "noncausal")_n\(cases.count)_t\(seqLen)_s\(wSize)_m\(wMtime).bin"
+        "v4_\(suiteName)_causal_n\(cases.count)_t\(seqLen)_s\(wSize)_m\(wMtime).bin"
     )
 
     let z2: [[Float]]
@@ -463,13 +441,6 @@ func encodeSuiteWithModel(
     )
 }
 
-func accuracyRate(_ preds: [Int], _ labels: [Int]) -> Float {
-    let n = min(preds.count, labels.count)
-    guard n > 0 else { return 0.0 }
-    let ok = zip(preds, labels).filter { $0 == $1 }.count
-    return Float(ok) / Float(n)
-}
-
 func computeFourTaskAccuracy(
     cases: [RelationalDialogueCase],
     predArchT4: [Int],
@@ -507,12 +478,7 @@ func computePairedInversion(
 ) -> PairedInversionMetrics {
     var byPairKey: [String: [Int]] = [:]
     for (idx, rc) in cases.enumerated() {
-        let key: String
-        if rc.id.hasSuffix("_A") || rc.id.hasSuffix("_B") {
-            key = String(rc.id.dropLast(2))
-        } else {
-            key = rc.id
-        }
+        let key = (rc.id.hasSuffix("_A") || rc.id.hasSuffix("_B")) ? String(rc.id.dropLast(2)) : rc.id
         byPairKey[key, default: []].append(idx)
     }
     let validPairs = byPairKey.keys.sorted().compactMap { k -> (Int, Int)? in
@@ -520,11 +486,7 @@ func computePairedInversion(
         return (arr[0], arr[1])
     }
     let pCount = max(1, validPairs.count)
-    var okAT4 = 0
-    var okTT4 = 0
-    var okAT2 = 0
-    var okTT2 = 0
-    var okJointT4 = 0
+    var okAT4 = 0, okTT4 = 0, okAT2 = 0, okTT2 = 0, okJointT4 = 0
     for (i, j) in validPairs {
         let a4i = predArchT4[i] == RelationalPipeline.archetypeIndex(cases[i].expectedArchetype)
         let a4j = predArchT4[j] == RelationalPipeline.archetypeIndex(cases[j].expectedArchetype)
@@ -570,7 +532,6 @@ func correlatePentagon(modelPreds: [[Float]], humanMeans: [[Float]]) -> Pentagon
         let ys = (0..<n).map { humanMeans[$0][ax] }
         rs[ax] = BenchmarkMath.pearsonR(xs, ys)
     }
-    let meanR = rs.reduce(0.0, +) / 5.0
     return PentagonAxisCorrelation(
         n_cases: n,
         contextDepth: rs[0],
@@ -578,11 +539,11 @@ func correlatePentagon(modelPreds: [[Float]], humanMeans: [[Float]]) -> Pentagon
         communicativeHarmony: rs[2],
         boundaryStability: rs[3],
         longTermViability: rs[4],
-        mean_pearson_r: meanR
+        mean_pearson_r: rs.reduce(0.0, +) / 5.0
     )
 }
 
-// MARK: - Main Execution
+// MARK: - Main Execution (v4 & v4_hybrid Only)
 
 let startWallTime = Date()
 let cli = ValidateBenchmarksCLI.parse(CommandLine.arguments)
@@ -590,22 +551,17 @@ if cli.useGPU {
     MLX.Memory.cacheLimit = 128 * 1024 * 1024
     MLX.Memory.clearCache()
 }
-var didMissAnyCache = false
 let pct = { (v: Float) in String(format: "%6.2f%%", v * 100.0) }
 
 print("==================================================================")
-print("Sashiba Comprehensive Multi-Layer Benchmark & External Validation")
+print("Sashiba External Benchmark Validation [v4 & v4_hybrid]")
 print("Execution mode: \(cli.useGPU ? "GPU (MLX)" : "Pure Multi-Core CPU (0 GPU VRAM)") | Cache: \(cli.disableCache ? "OFF" : cli.cacheDir)")
 print("==================================================================")
 
-// Load datasets
-let v1Config = DatasetConfiguration.load(from: cli.v1BackupDir)
-let v1UnseenCases = v1Config.relationalDialogueCases.filter { $0.isZeroShotUnseen }
-
-let v2Config = DatasetConfiguration.load(from: cli.v2DataPath)
-let v2TrainCases = v2Config.relationalDialogueCases.filter { !$0.isZeroShotUnseen }
-let v2UnseenCases = v2Config.relationalDialogueCases.filter { $0.isZeroShotUnseen }
-let v2CaseByID = Dictionary(uniqueKeysWithValues: v2Config.relationalDialogueCases.map { ($0.id, $0) })
+let mainConfig = DatasetConfiguration.load(from: cli.dataPath)
+let trainCases = mainConfig.relationalDialogueCases.filter { !$0.isZeroShotUnseen }
+let unseenCases = mainConfig.relationalDialogueCases.filter { $0.isZeroShotUnseen }
+let caseByID = Dictionary(uniqueKeysWithValues: mainConfig.relationalDialogueCases.map { ($0.id, $0) })
 
 let l3aCases = DatasetConfiguration.load(from: cli.layer3aDir).relationalDialogueCases
 let l3bCases = DatasetConfiguration.load(from: cli.layer3bDir).relationalDialogueCases
@@ -616,60 +572,33 @@ let l1Items = try JSONDecoder().decode(
     [Layer1ConsensusItem].self,
     from: Data(contentsOf: URL(fileURLWithPath: cli.layer1ConsensusPath))
 )
-let l1T2MatchedCases: [(pent: [Float], rc: RelationalDialogueCase)]
-if FileManager.default.fileExists(atPath: cli.layer1T2FullPath),
-   let items = try? JSONDecoder().decode([Layer1T2OnlyItem].self, from: Data(contentsOf: URL(fileURLWithPath: cli.layer1T2FullPath))) {
-    l1T2MatchedCases = items.compactMap { item in
-        guard let rc = v2CaseByID[item.scenario_id] else { return nil }
-        return (item.pentagon_t2_mean, rc)
-    }
+let l1T2MatchedCases: [(pent: [Float], rc: RelationalDialogueCase)] = if FileManager.default.fileExists(atPath: cli.layer1T2FullPath),
+    let items = try? JSONDecoder().decode([Layer1T2OnlyItem].self, from: Data(contentsOf: URL(fileURLWithPath: cli.layer1T2FullPath))) {
+    items.compactMap { item in caseByID[item.scenario_id].map { (item.pentagon_t2_mean, $0) } }
 } else {
-    l1T2MatchedCases = l1Items.compactMap { item in
-        guard let rc = v2CaseByID[item.scenario_id] else { return nil }
-        return (item.pentagon_t2_mean, rc)
-    }
+    l1Items.compactMap { item in caseByID[item.scenario_id].map { (item.pentagon_t2_mean, $0) } }
 }
 
-let l1T4MatchedCases: [(pent: [Float], rc: RelationalDialogueCase)]
-if FileManager.default.fileExists(atPath: cli.layer1T4FullPath),
-   let items = try? JSONDecoder().decode([Layer1T4OnlyItem].self, from: Data(contentsOf: URL(fileURLWithPath: cli.layer1T4FullPath))) {
-    l1T4MatchedCases = items.compactMap { item in
-        guard let rc = v2CaseByID[item.scenario_id] else { return nil }
-        return (item.pentagon_t4_mean, rc)
-    }
+let l1T4MatchedCases: [(pent: [Float], rc: RelationalDialogueCase)] = if FileManager.default.fileExists(atPath: cli.layer1T4FullPath),
+    let items = try? JSONDecoder().decode([Layer1T4OnlyItem].self, from: Data(contentsOf: URL(fileURLWithPath: cli.layer1T4FullPath))) {
+    items.compactMap { item in caseByID[item.scenario_id].map { (item.pentagon_t4_mean, $0) } }
 } else {
-    l1T4MatchedCases = l1Items.compactMap { item in
-        guard let rc = v2CaseByID[item.scenario_id] else { return nil }
-        return (item.pentagon_t4_mean, rc)
-    }
+    l1Items.compactMap { item in caseByID[item.scenario_id].map { (item.pentagon_t4_mean, $0) } }
 }
 
 let l4MetaPath = (cli.layer4Dir as NSString).appendingPathComponent("metadata.json")
-let l4Meta = try JSONDecoder().decode(
-    Layer4MetadataFile.self,
-    from: Data(contentsOf: URL(fileURLWithPath: l4MetaPath))
-)
+let l4Meta = try JSONDecoder().decode(Layer4MetadataFile.self, from: Data(contentsOf: URL(fileURLWithPath: l4MetaPath)))
 let l4RawByID = Dictionary(uniqueKeysWithValues: l4CasesRaw.map { ($0.id, $0) })
 let l4Aligned: [(rc: RelationalDialogueCase, meta: Layer4MetadataItem)] = l4Meta.items.compactMap { m in
     guard let raw = l4RawByID[m.scenario_id] else { return nil }
     let rc = RelationalDialogueCase(
-        id: raw.id,
-        group: raw.group,
-        personaStyle: raw.personaStyle,
-        topicDomain: raw.topicDomain,
-        title: raw.title,
-        expectedTopologyT2: m.consensus_topology_t2,
-        expectedArchetypeT2: m.consensus_archetype_t2,
-        expectedTopology: m.consensus_topology_t4,
-        expectedArchetype: m.consensus_archetype_t4,
-        hostEarlyText: raw.hostEarlyText,
-        hostText: raw.hostText,
-        partnerEarlyText: raw.partnerEarlyText,
-        partnerCurrentText: raw.partnerCurrentText,
+        id: raw.id, group: raw.group, personaStyle: raw.personaStyle, topicDomain: raw.topicDomain, title: raw.title,
+        expectedTopologyT2: m.consensus_topology_t2, expectedArchetypeT2: m.consensus_archetype_t2,
+        expectedTopology: m.consensus_topology_t4, expectedArchetype: m.consensus_archetype_t4,
+        hostEarlyText: raw.hostEarlyText, hostText: raw.hostText,
+        partnerEarlyText: raw.partnerEarlyText, partnerCurrentText: raw.partnerCurrentText,
         harmonizedPartnerText: raw.harmonizedPartnerText,
-        insightLevel0: raw.insightLevel0,
-        insightLevel1: raw.insightLevel1,
-        insightLevel2: raw.insightLevel2,
+        insightLevel0: raw.insightLevel0, insightLevel1: raw.insightLevel1, insightLevel2: raw.insightLevel2,
         isZeroShotUnseen: true
     )
     return (rc, m)
@@ -677,496 +606,225 @@ let l4Aligned: [(rc: RelationalDialogueCase, meta: Layer4MetadataItem)] = l4Meta
 let l4Cases = l4Aligned.map(\.rc)
 let l4MetaOrdered = l4Aligned.map(\.meta)
 
-print("Loaded splits: v2 train=\(v2TrainCases.count), unseen=\(v2UnseenCases.count), L1_T2=\(l1T2MatchedCases.count), L1_T4=\(l1T4MatchedCases.count), L3a=\(l3aCases.count), L3b=\(l3bCases.count), L3c=\(l3cCases.count), L4=\(l4Cases.count)")
+print("Loaded splits: train=\(trainCases.count), unseen=\(unseenCases.count), L1_T2=\(l1T2MatchedCases.count), L1_T4=\(l1T4MatchedCases.count), L3a=\(l3aCases.count), L3b=\(l3bCases.count), L3c=\(l3cCases.count), L4=\(l4Cases.count)")
 
-struct AllSuitesForModel {
-    let train: EncodedSuite
-    let unseen: EncodedSuite
-    let l1T2: EncodedSuite
-    let l1T4: EncodedSuite
-    let l3a: EncodedSuite
-    let l3b: EncodedSuite
-    let l3c: EncodedSuite
-    let l4: EncodedSuite
-}
+let w = try SWTHawkWeights.load(from: URL(fileURLWithPath: cli.weightsPath))
+let vocab = TextVocabulary.deserialize(w.serializedVocabulary)
+let extractor = RelationalHybridFeatureExtractor(vocabulary: vocab)
+let gpuModel: MLXSWTHawkAutoencoder? = cli.useGPU ? MLXSWTHawkAutoencoder(weights: w) : nil
+var didMissAnyCache = false
 
-func evaluateNeuralModel(name: String, path: String) throws -> (suites: AllSuitesForModel, v1NonCausalAudit: EncodedSuite?, v1CausalAudit: EncodedSuite?, cacheMiss: Bool) {
-    let t0 = Date()
-    print("[Model: \(name)] Loading \(path)...")
-    let w = try SWTHawkWeights.load(from: URL(fileURLWithPath: path))
-    let vocab = TextVocabulary.deserialize(w.serializedVocabulary)
-    let extractor = RelationalHybridFeatureExtractor(vocabulary: vocab)
-    let model: MLXSWTHawkAutoencoder? = cli.useGPU ? MLXSWTHawkAutoencoder(weights: w) : nil
+@MainActor
+func enc(_ sName: String, _ cs: [RelationalDialogueCase]) -> EncodedSuite {
     var localMiss = false
-
-    func enc(_ sName: String, _ cs: [RelationalDialogueCase], causal: Bool = true) -> EncodedSuite {
-        return encodeSuiteWithModel(
-            suiteName: sName,
-            modelName: name,
-            weightsPath: path,
-            cases: cs,
-            model: model,
-            weights: w,
-            vocab: vocab,
-            extractor: extractor,
-            cacheDir: cli.cacheDir,
-            disableCache: cli.disableCache,
-            didMissCache: &localMiss,
-            maxSeqLen: cli.maxSeqLen,
-            useCausalT2: causal
-        )
-    }
-
-    var v1NonCausal: EncodedSuite? = nil
-    var v1Causal: EncodedSuite? = nil
-    if name == "v1" && !v1UnseenCases.isEmpty {
-        v1NonCausal = enc("v1_unseen", v1UnseenCases, causal: false)
-        v1Causal = enc("v1_unseen", v1UnseenCases, causal: true)
-    }
-
-    let tr = enc("train", v2TrainCases)
-    let un = enc("unseen", v2UnseenCases)
-    let l1T2 = enc("l1_t2", l1T2MatchedCases.map(\.rc))
-    let l1T4 = enc("l1_t4", l1T4MatchedCases.map(\.rc))
-    let s3a = enc("l3a", l3aCases)
-    let s3b = enc("l3b", l3bCases)
-    let s3c = enc("l3c", l3cCases)
-    let s4 = enc("l4", l4Cases)
-    if cli.useGPU {
-        MLX.Memory.clearCache()
-    }
-    print(String(format: "[Model: %@] Encoded all suites in %.2fs", name as NSString, Date().timeIntervalSince(t0)))
-    return (AllSuitesForModel(train: tr, unseen: un, l1T2: l1T2, l1T4: l1T4, l3a: s3a, l3b: s3b, l3c: s3c, l4: s4), v1NonCausal, v1Causal, localMiss)
+    let out = encodeSuite(
+        suiteName: sName, weightsPath: cli.weightsPath, cases: cs, model: gpuModel, weights: w,
+        vocab: vocab, extractor: extractor, cacheDir: cli.cacheDir, disableCache: cli.disableCache,
+        didMissCache: &localMiss, maxSeqLen: cli.maxSeqLen
+    )
+    if localMiss { didMissAnyCache = true }
+    return out
 }
 
-let resolvedV2Path: String
-let resolvedV3Path: String?
-let resolvedV4Path: String?
-if !cli.v3WeightsPath.isEmpty {
-    resolvedV2Path = cli.v2WeightsPath
-    resolvedV3Path = cli.v3WeightsPath
-    resolvedV4Path = nil
-} else if FileManager.default.fileExists(atPath: ".tmp/v2_backup/weights.safetensors")
-    && FileManager.default.fileExists(atPath: ".tmp/v3_backup/weights.safetensors")
-    && cli.v2WeightsPath == ".tmp/weights.safetensors" {
-    resolvedV2Path = ".tmp/v2_backup/weights.safetensors"
-    resolvedV3Path = ".tmp/v3_backup/weights.safetensors"
-    resolvedV4Path = ".tmp/weights.safetensors"
-} else if FileManager.default.fileExists(atPath: ".tmp/v2_backup/weights.safetensors") && cli.v2WeightsPath == ".tmp/weights.safetensors" {
-    resolvedV2Path = ".tmp/v2_backup/weights.safetensors"
-    resolvedV3Path = ".tmp/weights.safetensors"
-    resolvedV4Path = nil
+let tEncode = Date()
+let trSuite = enc("train", trainCases)
+let unSuite = enc("unseen", unseenCases)
+let l1T2Suite = enc("l1_t2", l1T2MatchedCases.map(\.rc))
+let l1T4Suite = enc("l1_t4", l1T4MatchedCases.map(\.rc))
+let l3aSuite = enc("l3a", l3aCases)
+let l3bSuite = enc("l3b", l3bCases)
+let l3cSuite = enc("l3c", l3cCases)
+let l4Suite = enc("l4", l4Cases)
+if cli.useGPU { MLX.Memory.clearCache() }
+print(String(format: "[v4] Encoded all suites in %.2fs", Date().timeIntervalSince(tEncode)))
+
+// Resolve v4_hybrid heads (prefer serialized heads inside weights.safetensors; otherwise calibrate on trainCases)
+let hybridArchT4: SoftmaxClassifierHead
+let hybridTopoT4: SoftmaxClassifierHead
+let hybridArchT2: SoftmaxClassifierHead
+let hybridTopoT2: SoftmaxClassifierHead
+
+let cal = w.relational.calibratedHeads
+if let ha4 = cal.hybridArchetypeT4, let ht4 = cal.hybridTopologyT4,
+   let ha2 = cal.hybridArchetypeT2, let ht2 = cal.hybridTopologyT2,
+   ha4.featureDim == trSuite.hybridT4[0].count {
+    hybridArchT4 = ha4
+    hybridTopoT4 = ht4
+    hybridArchT2 = ha2
+    hybridTopoT2 = ht2
+    print("[v4_hybrid] Loaded serialized 160D hybrid heads directly from \(cli.weightsPath)")
 } else {
-    resolvedV2Path = cli.v2WeightsPath
-    resolvedV3Path = nil
-    resolvedV4Path = nil
+    let groups = trainCases.map(\.group)
+    let yA4 = trainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetype) }
+    let yT4 = trainCases.map { RelationalPipeline.topologyIndex($0.expectedTopology) }
+    let yA2 = trainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetypeT2) }
+    let yT2 = trainCases.map { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
+    hybridArchT4 = SoftmaxClassifierHead.trainGroupCV(features: trSuite.hybridT4, labels: yA4, groups: groups, classCount: 6, steps: 350)
+    hybridTopoT4 = SoftmaxClassifierHead.trainGroupCV(features: trSuite.hybridT4, labels: yT4, groups: groups, classCount: 5, steps: 350)
+    hybridArchT2 = SoftmaxClassifierHead.trainGroupCV(features: trSuite.hybridT2, labels: yA2, groups: groups, classCount: 6, steps: 350)
+    hybridTopoT2 = SoftmaxClassifierHead.trainGroupCV(features: trSuite.hybridT2, labels: yT2, groups: groups, classCount: 5, steps: 350)
+    print("[v4_hybrid] Calibrated 160D hybrid heads on CPU Group-CV")
 }
 
-let (v1Eval, v1NonCausalOpt, v1CausalOpt, m1) = try evaluateNeuralModel(name: "v1", path: cli.v1WeightsPath)
-let (v2NoMetricEval, _, _, m2) = try evaluateNeuralModel(name: "v2_nometric", path: cli.v2NoMetricWeightsPath)
-let (v2Eval, _, _, m3) = try evaluateNeuralModel(name: "v2", path: resolvedV2Path)
-let v3EvalTuple: (suites: AllSuitesForModel, miss: Bool)?
-if let p3 = resolvedV3Path, FileManager.default.fileExists(atPath: p3) {
-    let r = try evaluateNeuralModel(name: "v3", path: p3)
-    v3EvalTuple = (r.0, r.3)
-} else {
-    v3EvalTuple = nil
-}
-let v3Eval = v3EvalTuple?.suites
-let v4EvalTuple: (suites: AllSuitesForModel, miss: Bool)?
-if let p4 = resolvedV4Path, FileManager.default.fileExists(atPath: p4) {
-    let r = try evaluateNeuralModel(name: "v4", path: p4)
-    v4EvalTuple = (r.0, r.3)
-} else {
-    v4EvalTuple = nil
-}
-let v4Eval = v4EvalTuple?.suites
-didMissAnyCache = m1 || m2 || m3 || (v3EvalTuple?.miss ?? false) || (v4EvalTuple?.miss ?? false)
-
-// 1. Causal T2 leakage audit on v1
-let v1NonCausalAcc = computeFourTaskAccuracy(
-    cases: v1UnseenCases,
-    predArchT4: v1NonCausalOpt!.predArchT4,
-    predTopoT4: v1NonCausalOpt!.predTopoT4,
-    predArchT2: v1NonCausalOpt!.predArchT2,
-    predTopoT2: v1NonCausalOpt!.predTopoT2
-)
-let v1CausalAcc = computeFourTaskAccuracy(
-    cases: v1UnseenCases,
-    predArchT4: v1CausalOpt!.predArchT4,
-    predTopoT4: v1CausalOpt!.predTopoT4,
-    predArchT2: v1CausalOpt!.predArchT2,
-    predTopoT2: v1CausalOpt!.predTopoT2
-)
-let causalAudit = CausalLeakageAuditOutput(
-    dataset_cases: v1UnseenCases.count,
-    non_causal_t2: v1NonCausalAcc,
-    strict_causal_t2: v1CausalAcc,
-    archetype_t2_leakage_delta_pt: (v1NonCausalAcc.archetype_t2 - v1CausalAcc.archetype_t2) * 100.0,
-    topology_t2_leakage_delta_pt: (v1NonCausalAcc.topology_t2 - v1CausalAcc.topology_t2) * 100.0
-)
-print(String(
-    format: "[Step 4.1 Causal Audit v1] arch_T2: non-causal %.2f%% -> causal %.2f%% (Δ %+.2f pt) | topo_T2: non-causal %.2f%% -> causal %.2f%% (Δ %+.2f pt)",
-    v1NonCausalAcc.archetype_t2 * 100, v1CausalAcc.archetype_t2 * 100, causalAudit.archetype_t2_leakage_delta_pt,
-    v1NonCausalAcc.topology_t2 * 100, v1CausalAcc.topology_t2 * 100, causalAudit.topology_t2_leakage_delta_pt
-))
-
-// Train non-neural baselines (char_ngram 2048x2 & surface_stats 12D) strictly on v2TrainCases (strict causal T2!)
-let ngram = CharNGramFeaturizer(dim: 2048)
-func ngramFeatures(_ cases: [RelationalDialogueCase], early: Bool) -> [[Float]] {
-    return cases.map { rc in
-        let s = early ? rc.hostEarlyText : rc.hostText
-        let r = early ? rc.partnerEarlyText : rc.partnerCurrentText
-        return ngram.features(s) + ngram.features(r)
-    }
-}
-func surfaceFeatures(_ cases: [RelationalDialogueCase], early: Bool) -> [[Float]] {
-    return cases.map { rc in
-        let s = early ? rc.hostEarlyText : rc.hostText
-        let r = early ? rc.partnerEarlyText : rc.partnerCurrentText
-        return SurfaceStatsFeaturizer.features(sender: s, receiver: r)
-    }
+func projectHybrid(_ base: EncodedSuite) -> EncodedSuite {
+    let coarse = base.hybridT2.map { predictCoarseFromProbs(archProbs: hybridArchT2.probabilities($0), topoProbs: hybridTopoT2.probabilities($0)) }
+    return EncodedSuite(
+        zT2: base.zT2, zT4: base.zT4, hybridT2: base.hybridT2, hybridT4: base.hybridT4,
+        predArchT4: base.hybridT4.map { hybridArchT4.predict($0) },
+        predTopoT4: base.hybridT4.map { hybridTopoT4.predict($0) },
+        predArchT2: base.hybridT2.map { hybridArchT2.predict($0) },
+        predTopoT2: base.hybridT2.map { hybridTopoT2.predict($0) },
+        predStanceT2: coarse.map(\.stance),
+        predDistT2: coarse.map(\.dist),
+        subbandT2: base.subbandT2, subbandT4: base.subbandT4,
+        pentagonT2: base.pentagonT2, pentagonT4: base.pentagonT4, unk: base.unk
+    )
 }
 
-struct LinearBaselineHeads {
-    let archT4: SoftmaxClassifierHead
-    let topoT4: SoftmaxClassifierHead
-    let archT2: SoftmaxClassifierHead
-    let topoT2: SoftmaxClassifierHead
+let unHybrid = projectHybrid(unSuite)
+let l3aHybrid = projectHybrid(l3aSuite)
+let l3bHybrid = projectHybrid(l3bSuite)
+let l3cHybrid = projectHybrid(l3cSuite)
+let l4Hybrid = projectHybrid(l4Suite)
 
-    func predictSuite(_ cases: [RelationalDialogueCase], featFn: ([RelationalDialogueCase], Bool) -> [[Float]]) -> (a4: [Int], t4: [Int], a2: [Int], t2: [Int], s2: [Int], d2: [Int]) {
-        let x2 = featFn(cases, true)
-        let x4 = featFn(cases, false)
-        let coarse = x2.map { predictCoarseFromProbs(archProbs: archT2.probabilities($0), topoProbs: topoT2.probabilities($0)) }
-        return (
-            x4.map { archT4.predict($0) },
-            x4.map { topoT4.predict($0) },
-            x2.map { archT2.predict($0) },
-            x2.map { topoT2.predict($0) },
-            coarse.map(\.stance),
-            coarse.map(\.dist)
-        )
-    }
-
-    func projectHybridSuite(_ base: EncodedSuite) -> EncodedSuite {
-        let coarse = base.hybridT2.map { predictCoarseFromProbs(archProbs: archT2.probabilities($0), topoProbs: topoT2.probabilities($0)) }
-        return EncodedSuite(
-            zT2: base.zT2,
-            zT4: base.zT4,
-            hybridT2: base.hybridT2,
-            hybridT4: base.hybridT4,
-            predArchT4: base.hybridT4.map { archT4.predict($0) },
-            predTopoT4: base.hybridT4.map { topoT4.predict($0) },
-            predArchT2: base.hybridT2.map { archT2.predict($0) },
-            predTopoT2: base.hybridT2.map { topoT2.predict($0) },
-            predStanceT2: coarse.map(\.stance),
-            predDistT2: coarse.map(\.dist),
-            subbandT2: base.subbandT2,
-            subbandT4: base.subbandT4,
-            pentagonT2: base.pentagonT2,
-            pentagonT4: base.pentagonT4,
-            unk: base.unk
-        )
-    }
-}
-
-func fitBaselineHeads(name: String, featFn: ([RelationalDialogueCase], Bool) -> [[Float]], steps: Int = 320, l2: Float = 2e-3) -> LinearBaselineHeads {
-    print("[Baseline: \(name)] Fitting linear heads on \(v2TrainCases.count) train cases (pure CPU)...")
-    let x2 = featFn(v2TrainCases, true)
-    let x4 = featFn(v2TrainCases, false)
-    let yA4 = v2TrainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetype) }
-    let yT4 = v2TrainCases.map { RelationalPipeline.topologyIndex($0.expectedTopology) }
-    let yA2 = v2TrainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetypeT2) }
-    let yT2 = v2TrainCases.map { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
-    let hA4 = SoftmaxClassifierHead.train(features: x4, labels: yA4, classCount: 6, steps: steps, l2: l2)
-    let hT4 = SoftmaxClassifierHead.train(features: x4, labels: yT4, classCount: 5, steps: steps, l2: l2)
-    let hA2 = SoftmaxClassifierHead.train(features: x2, labels: yA2, classCount: 6, steps: steps, l2: l2)
-    let hT2 = SoftmaxClassifierHead.train(features: x2, labels: yT2, classCount: 5, steps: steps, l2: l2)
-    return LinearBaselineHeads(archT4: hA4, topoT4: hT4, archT2: hA2, topoT2: hT2)
-}
-
-func fitHybridHeads(label: String, suites: AllSuitesForModel) -> LinearBaselineHeads {
-    let t0 = Date()
-    let groups = v2TrainCases.map(\.group)
-    let yA4 = v2TrainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetype) }
-    let yT4 = v2TrainCases.map { RelationalPipeline.topologyIndex($0.expectedTopology) }
-    let yA2 = v2TrainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetypeT2) }
-    let yT2 = v2TrainCases.map { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
-    let hA4 = SoftmaxClassifierHead.trainGroupCV(features: suites.train.hybridT4, labels: yA4, groups: groups, classCount: 6, steps: 350)
-    let hT4 = SoftmaxClassifierHead.trainGroupCV(features: suites.train.hybridT4, labels: yT4, groups: groups, classCount: 5, steps: 350)
-    let hA2 = SoftmaxClassifierHead.trainGroupCV(features: suites.train.hybridT2, labels: yA2, groups: groups, classCount: 6, steps: 350)
-    let hT2 = SoftmaxClassifierHead.trainGroupCV(features: suites.train.hybridT2, labels: yT2, groups: groups, classCount: 5, steps: 350)
-    print(String(format: "[Model: %@] Calibrated 160D hybrid heads (pure CPU Group-CV, 0 GPU) in %.2fs", label as NSString, Date().timeIntervalSince(t0)))
-    return LinearBaselineHeads(archT4: hA4, topoT4: hT4, archT2: hA2, topoT2: hT2)
-}
-
-let v2HybridHeads = fitHybridHeads(label: "v2_hybrid", suites: v2Eval)
-let v2HybridUnseen = v2HybridHeads.projectHybridSuite(v2Eval.unseen)
-let v2HybridL3a = v2HybridHeads.projectHybridSuite(v2Eval.l3a)
-let v2HybridL3b = v2HybridHeads.projectHybridSuite(v2Eval.l3b)
-let v2HybridL3c = v2HybridHeads.projectHybridSuite(v2Eval.l3c)
-let v2HybridL4 = v2HybridHeads.projectHybridSuite(v2Eval.l4)
-
-let v3HybridHeads: LinearBaselineHeads? = v3Eval.map { fitHybridHeads(label: "v3_hybrid", suites: $0) }
-let v4HybridHeads: LinearBaselineHeads? = v4Eval.map { fitHybridHeads(label: "v4_hybrid", suites: $0) }
-func makeSuiteMap(_ pick: (AllSuitesForModel) -> EncodedSuite, v2Hyb: EncodedSuite) -> [String: EncodedSuite] {
-    var m: [String: EncodedSuite] = [
-        "v1": pick(v1Eval),
-        "v2_nometric": pick(v2NoMetricEval),
-        "v2": pick(v2Eval),
-        "v2_hybrid": v2Hyb
-    ]
-    if let e3 = v3Eval, let hh3 = v3HybridHeads {
-        let base3 = pick(e3)
-        m["v3"] = base3
-        m["v3_hybrid"] = hh3.projectHybridSuite(base3)
-    }
-    if let e4 = v4Eval, let hh4 = v4HybridHeads {
-        let base4 = pick(e4)
-        m["v4"] = base4
-        m["v4_hybrid"] = hh4.projectHybridSuite(base4)
-    }
-    return m
-}
-
-let ngramHeads = fitBaselineHeads(name: "char_ngram", featFn: ngramFeatures, steps: 320, l2: 2e-3)
-let surfaceHeads = fitBaselineHeads(name: "surface_stats", featFn: surfaceFeatures, steps: 320, l2: 2e-3)
-
-// Evaluate all models on unseen_test (to serve as reference for Layer 3b drop_pt)
-func buildAllModelEvalForSuite(
+func evalPair(
     cases: [RelationalDialogueCase],
-    neuralMap: [String: EncodedSuite],
+    v4Suite: EncodedSuite,
+    hybSuite: EncodedSuite,
     unseenRef: [String: FourTaskMetrics]?,
     isInversionSuite: Bool
 ) -> [String: SuiteModelEval] {
     var out: [String: SuiteModelEval] = [:]
-    for (mName, enc) in neuralMap {
+    for (mName, enc) in [("v4", v4Suite), ("v4_hybrid", hybSuite)] {
         let acc = computeFourTaskAccuracy(
-            cases: cases,
-            predArchT4: enc.predArchT4,
-            predTopoT4: enc.predTopoT4,
-            predArchT2: enc.predArchT2,
-            predTopoT2: enc.predTopoT2
+            cases: cases, predArchT4: enc.predArchT4, predTopoT4: enc.predTopoT4,
+            predArchT2: enc.predArchT2, predTopoT2: enc.predTopoT2
         )
         let drop = unseenRef?[mName].map { computeDropPt(unseen: $0, target: acc) }
         let paired = isInversionSuite ? computePairedInversion(
-            cases: cases,
-            predArchT4: enc.predArchT4,
-            predTopoT4: enc.predTopoT4,
-            predArchT2: enc.predArchT2,
-            predTopoT2: enc.predTopoT2
+            cases: cases, predArchT4: enc.predArchT4, predTopoT4: enc.predTopoT4,
+            predArchT2: enc.predArchT2, predTopoT2: enc.predTopoT2
         ) : nil
         out[mName] = SuiteModelEval(accuracy: acc, unk_stats: enc.unk, drop_pt_from_unseen_test: drop, paired_inversion_accuracy: paired)
     }
-
-    for (bName, heads, fn) in [("char_ngram", ngramHeads, ngramFeatures), ("surface_stats", surfaceHeads, surfaceFeatures)] {
-        let preds = heads.predictSuite(cases, featFn: fn)
-        let acc = computeFourTaskAccuracy(
-            cases: cases,
-            predArchT4: preds.a4,
-            predTopoT4: preds.t4,
-            predArchT2: preds.a2,
-            predTopoT2: preds.t2
-        )
-        let drop = unseenRef?[bName].map { computeDropPt(unseen: $0, target: acc) }
-        let paired = isInversionSuite ? computePairedInversion(
-            cases: cases,
-            predArchT4: preds.a4,
-            predTopoT4: preds.t4,
-            predArchT2: preds.a2,
-            predTopoT2: preds.t2
-        ) : nil
-        out[bName] = SuiteModelEval(accuracy: acc, unk_stats: nil, drop_pt_from_unseen_test: drop, paired_inversion_accuracy: paired)
-    }
     return out
 }
 
-func buildCoarseT2EvalForSuite(
-    cases: [RelationalDialogueCase],
-    neuralMap: [String: EncodedSuite]
-) -> [String: CoarseEarlyT2Metrics] {
-    var out: [String: CoarseEarlyT2Metrics] = [:]
-    for (mName, enc) in neuralMap {
-        out[mName] = computeCoarseEarlyT2(cases: cases, predStance: enc.predStanceT2, predDist: enc.predDistT2)
-    }
-    for (bName, heads, fn) in [("char_ngram", ngramHeads, ngramFeatures), ("surface_stats", surfaceHeads, surfaceFeatures)] {
-        let preds = heads.predictSuite(cases, featFn: fn)
-        out[bName] = computeCoarseEarlyT2(cases: cases, predStance: preds.s2, predDist: preds.d2)
-    }
-    return out
-}
-
-let unseenModelMap = buildAllModelEvalForSuite(
-    cases: v2UnseenCases,
-    neuralMap: makeSuiteMap({ $0.unseen }, v2Hyb: v2HybridUnseen),
-    unseenRef: nil,
-    isInversionSuite: false
-)
-let unseenAccRef = unseenModelMap.mapValues(\.accuracy)
-
-for k in ["v1", "v2_nometric", "v2", "v2_hybrid", "v3", "v3_hybrid", "char_ngram", "surface_stats"] {
-    if let r = unseenModelMap[k]?.accuracy {
-        print("[Unseen Test] \(k.padding(toLength: 14, withPad: " ", startingAt: 0)): archT4 \(pct(r.archetype_t4)) | topoT4 \(pct(r.topology_t4)) | archT2 \(pct(r.archetype_t2)) | topoT2 \(pct(r.topology_t2)) | mean \(pct(r.mean))")
+// 1. In-Distribution unseen_test
+let unseenEval = evalPair(cases: unseenCases, v4Suite: unSuite, hybSuite: unHybrid, unseenRef: nil, isInversionSuite: false)
+let unseenAccRef = unseenEval.mapValues(\.accuracy)
+for k in ["v4", "v4_hybrid"] {
+    if let r = unseenEval[k]?.accuracy {
+        print("[Unseen Test] \(k.padding(toLength: 10, withPad: " ", startingAt: 0)): archT4 \(pct(r.archetype_t4)) | topoT4 \(pct(r.topology_t4)) | archT2 \(pct(r.archetype_t2)) | topoT2 \(pct(r.topology_t2)) | mean \(pct(r.mean))")
     }
 }
 
-// 2. Layer 2: (sLL, sHH, rHH) 3D Linear Probe + MI & Pentagon External Validity
-func evaluateSubbandGeometry(_ suites: AllSuitesForModel) -> SubbandGeometryModelEval {
-    let trX2 = suites.train.subbandT2.map { [$0.sLL, $0.sHH, $0.rHH] }
-    let trX4 = suites.train.subbandT4.map { [$0.sLL, $0.sHH, $0.rHH] }
-    let unX2 = suites.unseen.subbandT2.map { [$0.sLL, $0.sHH, $0.rHH] }
-    let unX4 = suites.unseen.subbandT4.map { [$0.sLL, $0.sHH, $0.rHH] }
+// 2. Layer 2: Subband Geometry & Pentagon Validity
+let trX2 = trSuite.subbandT2.map { [$0.sLL, $0.sHH, $0.rHH] }
+let trX4 = trSuite.subbandT4.map { [$0.sLL, $0.sHH, $0.rHH] }
+let unX2 = unSuite.subbandT2.map { [$0.sLL, $0.sHH, $0.rHH] }
+let unX4 = unSuite.subbandT4.map { [$0.sLL, $0.sHH, $0.rHH] }
 
-    let trYA4 = v2TrainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetype) }
-    let trYT4 = v2TrainCases.map { RelationalPipeline.topologyIndex($0.expectedTopology) }
-    let trYA2 = v2TrainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetypeT2) }
-    let trYT2 = v2TrainCases.map { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
+let trYA4 = trainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetype) }
+let trYT4 = trainCases.map { RelationalPipeline.topologyIndex($0.expectedTopology) }
+let trYA2 = trainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetypeT2) }
+let trYT2 = trainCases.map { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
 
-    let unYA4 = v2UnseenCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetype) }
-    let unYT4 = v2UnseenCases.map { RelationalPipeline.topologyIndex($0.expectedTopology) }
-    let unYA2 = v2UnseenCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetypeT2) }
-    let unYT2 = v2UnseenCases.map { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
+let unYA4 = unseenCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetype) }
+let unYT4 = unseenCases.map { RelationalPipeline.topologyIndex($0.expectedTopology) }
+let unYA2 = unseenCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetypeT2) }
+let unYT2 = unseenCases.map { RelationalPipeline.topologyIndex($0.expectedTopologyT2) }
 
-    let hA4 = SoftmaxClassifierHead.train(features: trX4, labels: trYA4, classCount: 6, steps: 350, l2: 1e-3)
-    let hT4 = SoftmaxClassifierHead.train(features: trX4, labels: trYT4, classCount: 5, steps: 350, l2: 1e-3)
-    let hA2 = SoftmaxClassifierHead.train(features: trX2, labels: trYA2, classCount: 6, steps: 350, l2: 1e-3)
-    let hT2 = SoftmaxClassifierHead.train(features: trX2, labels: trYT2, classCount: 5, steps: 350, l2: 1e-3)
+let hA4 = SoftmaxClassifierHead.train(features: trX4, labels: trYA4, classCount: 6, steps: 350, l2: 1e-3)
+let hT4 = SoftmaxClassifierHead.train(features: trX4, labels: trYT4, classCount: 5, steps: 350, l2: 1e-3)
+let hA2 = SoftmaxClassifierHead.train(features: trX2, labels: trYA2, classCount: 6, steps: 350, l2: 1e-3)
+let hT2 = SoftmaxClassifierHead.train(features: trX2, labels: trYT2, classCount: 5, steps: 350, l2: 1e-3)
 
-    let trAcc = FourTaskMetrics(
+let miA4 = BenchmarkMath.discretizedSubbandMI(triples: unSuite.subbandT4, labels: unYA4, classCount: 6)
+let miT4 = BenchmarkMath.discretizedSubbandMI(triples: unSuite.subbandT4, labels: unYT4, classCount: 5)
+let miA2 = BenchmarkMath.discretizedSubbandMI(triples: unSuite.subbandT2, labels: unYA2, classCount: 6)
+let miT2 = BenchmarkMath.discretizedSubbandMI(triples: unSuite.subbandT2, labels: unYT2, classCount: 5)
+
+let geomEval = SubbandGeometryModelEval(
+    linear_probe_3d_train_accuracy: FourTaskMetrics(
         archT4: accuracyRate(trX4.map { hA4.predict($0) }, trYA4),
         topoT4: accuracyRate(trX4.map { hT4.predict($0) }, trYT4),
         archT2: accuracyRate(trX2.map { hA2.predict($0) }, trYA2),
         topoT2: accuracyRate(trX2.map { hT2.predict($0) }, trYT2)
-    )
-    let unAcc = FourTaskMetrics(
+    ),
+    linear_probe_3d_unseen_accuracy: FourTaskMetrics(
         archT4: accuracyRate(unX4.map { hA4.predict($0) }, unYA4),
         topoT4: accuracyRate(unX4.map { hT4.predict($0) }, unYT4),
         archT2: accuracyRate(unX2.map { hA2.predict($0) }, unYA2),
         topoT2: accuracyRate(unX2.map { hT2.predict($0) }, unYT2)
-    )
+    ),
+    mutual_information_bits: FourTaskMetrics(archT4: miA4.miBits, topoT4: miT4.miBits, archT2: miA2.miBits, topoT2: miT2.miBits),
+    label_entropy_bits: FourTaskMetrics(archT4: miA4.labelEntropyBits, topoT4: miT4.labelEntropyBits, archT2: miA2.labelEntropyBits, topoT2: miT2.labelEntropyBits)
+)
 
-    let miA4 = BenchmarkMath.discretizedSubbandMI(triples: suites.unseen.subbandT4, labels: unYA4, classCount: 6)
-    let miT4 = BenchmarkMath.discretizedSubbandMI(triples: suites.unseen.subbandT4, labels: unYT4, classCount: 5)
-    let miA2 = BenchmarkMath.discretizedSubbandMI(triples: suites.unseen.subbandT2, labels: unYA2, classCount: 6)
-    let miT2 = BenchmarkMath.discretizedSubbandMI(triples: suites.unseen.subbandT2, labels: unYT2, classCount: 5)
+let l1HumT2 = l1T2MatchedCases.map(\.pent)
+let l1HumT4 = l1T4MatchedCases.map(\.pent)
+let l4HumT2 = l4MetaOrdered.map(\.pentagon_t2_mean)
+let l4HumT4 = l4MetaOrdered.map(\.pentagon_t4_mean)
 
-    return SubbandGeometryModelEval(
-        linear_probe_3d_train_accuracy: trAcc,
-        linear_probe_3d_unseen_accuracy: unAcc,
-        mutual_information_bits: FourTaskMetrics(archT4: miA4.miBits, topoT4: miT4.miBits, archT2: miA2.miBits, topoT2: miT2.miBits),
-        label_entropy_bits: FourTaskMetrics(archT4: miA4.labelEntropyBits, topoT4: miT4.labelEntropyBits, archT2: miA2.labelEntropyBits, topoT2: miT2.labelEntropyBits)
-    )
-}
-
-func evaluatePentagonValidity(_ suites: AllSuitesForModel) -> PentagonModelValidity {
-    let l1HumT2 = l1T2MatchedCases.map(\.pent)
-    let l1HumT4 = l1T4MatchedCases.map(\.pent)
-    let l4HumT2 = l4MetaOrdered.map(\.pentagon_t2_mean)
-    let l4HumT4 = l4MetaOrdered.map(\.pentagon_t4_mean)
-
-    let c1T2 = correlatePentagon(modelPreds: suites.l1T2.pentagonT2, humanMeans: l1HumT2)
-    let c1T4 = correlatePentagon(modelPreds: suites.l1T4.pentagonT4, humanMeans: l1HumT4)
-    let c4T2 = correlatePentagon(modelPreds: suites.l4.pentagonT2, humanMeans: l4HumT2)
-    let c4T4 = correlatePentagon(modelPreds: suites.l4.pentagonT4, humanMeans: l4HumT4)
-    let combT2 = correlatePentagon(modelPreds: suites.l1T2.pentagonT2 + suites.l4.pentagonT2, humanMeans: l1HumT2 + l4HumT2)
-    let combT4 = correlatePentagon(modelPreds: suites.l1T4.pentagonT4 + suites.l4.pentagonT4, humanMeans: l1HumT4 + l4HumT4)
-
-    return PentagonModelValidity(
-        layer1_blind_t2: c1T2,
-        layer1_blind_t4: c1T4,
-        layer4_gold_t2: c4T2,
-        layer4_gold_t4: c4T4,
-        combined_t2: combT2,
-        combined_t4: combT4
-    )
-}
-
-var geomAblation: [String: SubbandGeometryModelEval] = [
-    "v1": evaluateSubbandGeometry(v1Eval),
-    "v2_nometric": evaluateSubbandGeometry(v2NoMetricEval),
-    "v2": evaluateSubbandGeometry(v2Eval)
-]
-var pentValidity: [String: PentagonModelValidity] = [
-    "v1": evaluatePentagonValidity(v1Eval),
-    "v2_nometric": evaluatePentagonValidity(v2NoMetricEval),
-    "v2": evaluatePentagonValidity(v2Eval)
-]
-if let e3 = v3Eval {
-    geomAblation["v3"] = evaluateSubbandGeometry(e3)
-    pentValidity["v3"] = evaluatePentagonValidity(e3)
-}
-if let e4 = v4Eval {
-    geomAblation["v4"] = evaluateSubbandGeometry(e4)
-    pentValidity["v4"] = evaluatePentagonValidity(e4)
-}
-
-for m in ["v1", "v2_nometric", "v2", "v3", "v4"] {
-    guard let g = geomAblation[m], let p = pentValidity[m] else { continue }
-    print(String(
-        format: "[Layer 2] %-12@ | 3D Probe mean: %.2f%% | MI mean: %.3f bits | Pentagon Pearson r (comb T2/T4): %.3f / %.3f",
-        m as NSString,
-        g.linear_probe_3d_unseen_accuracy.mean * 100.0,
-        g.mutual_information_bits.mean,
-        p.combined_t2.mean_pearson_r,
-        p.combined_t4.mean_pearson_r
-    ))
-}
+let pentEval = PentagonModelValidity(
+    layer1_blind_t2: correlatePentagon(modelPreds: l1T2Suite.pentagonT2, humanMeans: l1HumT2),
+    layer1_blind_t4: correlatePentagon(modelPreds: l1T4Suite.pentagonT4, humanMeans: l1HumT4),
+    layer4_gold_t2: correlatePentagon(modelPreds: l4Suite.pentagonT2, humanMeans: l4HumT2),
+    layer4_gold_t4: correlatePentagon(modelPreds: l4Suite.pentagonT4, humanMeans: l4HumT4),
+    combined_t2: correlatePentagon(modelPreds: l1T2Suite.pentagonT2 + l4Suite.pentagonT2, humanMeans: l1HumT2 + l4HumT2),
+    combined_t4: correlatePentagon(modelPreds: l1T4Suite.pentagonT4 + l4Suite.pentagonT4, humanMeans: l1HumT4 + l4HumT4)
+)
+print(String(
+    format: "[Layer 2] v4 | 3D Probe mean: %.2f%% | MI mean: %.3f bits | Pentagon Pearson r (comb T2/T4): %.3f / %.3f",
+    geomEval.linear_probe_3d_unseen_accuracy.mean * 100.0,
+    geomEval.mutual_information_bits.mean,
+    pentEval.combined_t2.mean_pearson_r,
+    pentEval.combined_t4.mean_pearson_r
+))
 
 // 3. Layer 3 OOD Benchmarks (3a, 3b, 3c)
-let l3aEval = buildAllModelEvalForSuite(
-    cases: l3aCases,
-    neuralMap: makeSuiteMap({ $0.l3a }, v2Hyb: v2HybridL3a),
-    unseenRef: nil,
-    isInversionSuite: false
-)
-let l3bEval = buildAllModelEvalForSuite(
-    cases: l3bCases,
-    neuralMap: makeSuiteMap({ $0.l3b }, v2Hyb: v2HybridL3b),
-    unseenRef: unseenAccRef,
-    isInversionSuite: false
-)
-let l3cEval = buildAllModelEvalForSuite(
-    cases: l3cCases,
-    neuralMap: makeSuiteMap({ $0.l3c }, v2Hyb: v2HybridL3c),
-    unseenRef: nil,
-    isInversionSuite: true
-)
+let l3aEval = evalPair(cases: l3aCases, v4Suite: l3aSuite, hybSuite: l3aHybrid, unseenRef: nil, isInversionSuite: false)
+let l3bEval = evalPair(cases: l3bCases, v4Suite: l3bSuite, hybSuite: l3bHybrid, unseenRef: unseenAccRef, isInversionSuite: false)
+let l3cEval = evalPair(cases: l3cCases, v4Suite: l3cSuite, hybSuite: l3cHybrid, unseenRef: nil, isInversionSuite: true)
 
 for (suiteName, evalMap) in [("layer3a", l3aEval), ("layer3b", l3bEval), ("layer3c", l3cEval)] {
-    for k in ["v1", "v2", "v2_hybrid", "v3", "v3_hybrid", "v4", "v4_hybrid", "char_ngram", "surface_stats"] {
+    for k in ["v4", "v4_hybrid"] {
         if let e = evalMap[k] {
             let extra = if let p = e.paired_inversion_accuracy {
                 String(format: " | paired_mean %.2f%%", p.mean_paired_accuracy * 100.0)
             } else if let d = e.drop_pt_from_unseen_test {
                 String(format: " | drop %+.2f pt", d.mean)
-            } else {
-                ""
-            }
-            print("[\(suiteName)] \(k.padding(toLength: 14, withPad: " ", startingAt: 0)): mean \(pct(e.accuracy.mean)) (archT4 \(pct(e.accuracy.archetype_t4)), topoT4 \(pct(e.accuracy.topology_t4)), archT2 \(pct(e.accuracy.archetype_t2)), topoT2 \(pct(e.accuracy.topology_t2)))\(extra)")
+            } else { "" }
+            print("[\(suiteName)] \(k.padding(toLength: 10, withPad: " ", startingAt: 0)): mean \(pct(e.accuracy.mean)) (archT4 \(pct(e.accuracy.archetype_t4)), topoT4 \(pct(e.accuracy.topology_t4)), archT2 \(pct(e.accuracy.archetype_t2)), topoT2 \(pct(e.accuracy.topology_t2)))\(extra)")
         }
     }
 }
 
-// 4. Layer 4 External Anchor Gold Benchmark & Future Behavioral Event Prediction (Stratified 5-Fold CV)
-let l4ZeroShot = buildAllModelEvalForSuite(
-    cases: l4Cases,
-    neuralMap: makeSuiteMap({ $0.l4 }, v2Hyb: v2HybridL4),
-    unseenRef: nil,
-    isInversionSuite: false
-)
+// 4. Layer 4 External Gold Benchmark & Coarse T2
+let l4ZeroShot = evalPair(cases: l4Cases, v4Suite: l4Suite, hybSuite: l4Hybrid, unseenRef: nil, isInversionSuite: false)
+for k in ["v4", "v4_hybrid"] {
+    if let e = l4ZeroShot[k] {
+        print("[layer4 ] \(k.padding(toLength: 10, withPad: " ", startingAt: 0)): mean \(pct(e.accuracy.mean)) (archT4 \(pct(e.accuracy.archetype_t4)), topoT4 \(pct(e.accuracy.topology_t4)), archT2 \(pct(e.accuracy.archetype_t2)), topoT2 \(pct(e.accuracy.topology_t2)))")
+    }
+}
 
+func coarsePair(_ cs: [RelationalDialogueCase], _ s4: EncodedSuite, _ sh: EncodedSuite) -> [String: CoarseEarlyT2Metrics] {
+    return [
+        "v4": computeCoarseEarlyT2(cases: cs, predStance: s4.predStanceT2, predDist: s4.predDistT2),
+        "v4_hybrid": computeCoarseEarlyT2(cases: cs, predStance: sh.predStanceT2, predDist: sh.predDistT2)
+    ]
+}
 let p0CoarseBenchmarks: [String: [String: CoarseEarlyT2Metrics]] = [
-    "unseen_test": buildCoarseT2EvalForSuite(cases: v2UnseenCases, neuralMap: makeSuiteMap({ $0.unseen }, v2Hyb: v2HybridUnseen)),
-    "layer3a": buildCoarseT2EvalForSuite(cases: l3aCases, neuralMap: makeSuiteMap({ $0.l3a }, v2Hyb: v2HybridL3a)),
-    "layer3b": buildCoarseT2EvalForSuite(cases: l3bCases, neuralMap: makeSuiteMap({ $0.l3b }, v2Hyb: v2HybridL3b)),
-    "layer3c": buildCoarseT2EvalForSuite(cases: l3cCases, neuralMap: makeSuiteMap({ $0.l3c }, v2Hyb: v2HybridL3c)),
-    "layer4_gold": buildCoarseT2EvalForSuite(cases: l4Cases, neuralMap: makeSuiteMap({ $0.l4 }, v2Hyb: v2HybridL4))
+    "unseen_test": coarsePair(unseenCases, unSuite, unHybrid),
+    "layer3a": coarsePair(l3aCases, l3aSuite, l3aHybrid),
+    "layer3b": coarsePair(l3bCases, l3bSuite, l3bHybrid),
+    "layer3c": coarsePair(l3cCases, l3cSuite, l3cHybrid),
+    "layer4_gold": coarsePair(l4Cases, l4Suite, l4Hybrid)
 ]
 for sKey in ["unseen_test", "layer3a", "layer3b", "layer3c", "layer4_gold"] {
-    if let m = p0CoarseBenchmarks[sKey]?["v3"] ?? p0CoarseBenchmarks[sKey]?["v2"],
-       let mh = p0CoarseBenchmarks[sKey]?["v3_hybrid"] ?? p0CoarseBenchmarks[sKey]?["v2_hybrid"] {
-        let tag = (p0CoarseBenchmarks[sKey]?["v3"] != nil) ? "v3" : "v2"
-        print("[P0 Coarse T2 | \(sKey.padding(toLength: 11, withPad: " ", startingAt: 0))] \(tag) mean \(pct(m.mean)) (stance \(pct(m.early_stance_4way)), dist \(pct(m.early_distance_3way))) | \(tag)_hybrid mean \(pct(mh.mean)) (stance \(pct(mh.early_stance_4way)), dist \(pct(mh.early_distance_3way)))")
+    if let m = p0CoarseBenchmarks[sKey]?["v4"], let mh = p0CoarseBenchmarks[sKey]?["v4_hybrid"] {
+        print("[P0 Coarse T2 | \(sKey.padding(toLength: 11, withPad: " ", startingAt: 0))] v4 mean \(pct(m.mean)) (stance \(pct(m.early_stance_4way)), dist \(pct(m.early_distance_3way))) | v4_hybrid mean \(pct(mh.mean)) (stance \(pct(mh.early_stance_4way)), dist \(pct(mh.early_distance_3way)))")
     }
 }
 
@@ -1180,35 +838,12 @@ let foldsRet90 = BenchmarkMath.stratifiedBinaryFolds(labels: yRet90, k: 5, seed:
 let foldsBlock = BenchmarkMath.stratifiedBinaryFolds(labels: yBlock, k: 5, seed: 2028)
 let foldsDrift = BenchmarkMath.stratifiedContinuousFolds(targets: yDrift, k: 5, seed: 2029)
 
-var featureBanks: [(String, [[Float]])] = []
-if let e4 = v4Eval {
-    featureBanks.append(("v4_hybrid_t2", e4.l4.hybridT2))
-    featureBanks.append(("v4_hybrid_t4", e4.l4.hybridT4))
-    featureBanks.append(("v4_z_rel_t2", e4.l4.zT2))
-    featureBanks.append(("v4_z_rel_t4", e4.l4.zT4))
-}
-if let e3 = v3Eval {
-    featureBanks.append(("v3_hybrid_t2", e3.l4.hybridT2))
-    featureBanks.append(("v3_hybrid_t4", e3.l4.hybridT4))
-    featureBanks.append(("v3_z_rel_t2", e3.l4.zT2))
-    featureBanks.append(("v3_z_rel_t4", e3.l4.zT4))
-}
-featureBanks.append(contentsOf: [
-    ("v2_hybrid_compact_t2", v2Eval.l4.hybridT2.map { Array($0[128..<160]) }),
-    ("v2_hybrid_compact_t4", v2Eval.l4.hybridT4.map { Array($0[128..<160]) }),
-    ("v2_hybrid_t2", v2Eval.l4.hybridT2),
-    ("v2_hybrid_t4", v2Eval.l4.hybridT4),
-    ("v2_z_rel_t2", v2Eval.l4.zT2),
-    ("v2_z_rel_t4", v2Eval.l4.zT4),
-    ("v1_z_rel_t2", v1Eval.l4.zT2),
-    ("v1_z_rel_t4", v1Eval.l4.zT4),
-    ("v2_nometric_z_rel_t2", v2NoMetricEval.l4.zT2),
-    ("v2_nometric_z_rel_t4", v2NoMetricEval.l4.zT4),
-    ("char_ngram_t2", ngramFeatures(l4Cases, early: true)),
-    ("char_ngram_t4", ngramFeatures(l4Cases, early: false)),
-    ("surface_stats_t2", surfaceFeatures(l4Cases, early: true)),
-    ("surface_stats_t4", surfaceFeatures(l4Cases, early: false))
-])
+let featureBanks: [(String, [[Float]])] = [
+    ("v4_z_rel_t2", l4Suite.zT2),
+    ("v4_hybrid_t2", l4Suite.hybridT2),
+    ("v4_z_rel_t4", l4Suite.zT4),
+    ("v4_hybrid_t4", l4Suite.hybridT4)
+]
 
 var outRet30: [String: BinaryOutcomeMetrics] = [:]
 var outRet90: [String: BinaryOutcomeMetrics] = [:]
@@ -1225,7 +860,7 @@ for (fName, feats) in featureBanks {
     outBlock[fName] = BinaryOutcomeMetrics(roc_auc: blk.rocAUC, accuracy: blk.accuracy)
     outDrift[fName] = ContinuousOutcomeMetrics(pearson_r: drf.pearsonR, mae: drf.mae)
     print(String(
-        format: "[Layer 4 Outcomes] %-22@ | ret30 AUC %.3f | ret90 AUC %.3f | block AUC %.3f | drift r %.3f (MAE %.3f)",
+        format: "[Layer 4 Outcomes] %-14@ | ret30 AUC %.3f | ret90 AUC %.3f | block AUC %.3f | drift r %.3f (MAE %.3f)",
         fName as NSString, r30.rocAUC, r90.rocAUC, blk.rocAUC, drf.pearsonR, drf.mae
     ))
 }
@@ -1237,12 +872,11 @@ let report = BenchmarkMetricsReport(
     generated_at: ISO8601DateFormatter().string(from: Date()),
     execution_mode: execModeLabel,
     wall_clock_seconds: elapsedWallSec,
-    v1_causal_t2_leakage_audit: causalAudit,
-    in_distribution_unseen_test: Layer3SuiteOutput(n_cases: v2UnseenCases.count, models: unseenModelMap),
+    in_distribution_unseen_test: Layer3SuiteOutput(n_cases: unseenCases.count, models: unseenEval),
     p0_coarse_t2_benchmarks: p0CoarseBenchmarks,
     layer2_validation: Layer2ValidationOutput(
-        subband_geometry_ablation: geomAblation,
-        pentagon_external_validity: pentValidity
+        subband_geometry: geomEval,
+        pentagon_external_validity: pentEval
     ),
     layer3_ood_benchmarks: [
         "layer3a_style_domain_holdout": Layer3SuiteOutput(n_cases: l3aCases.count, models: l3aEval),
@@ -1263,8 +897,7 @@ let outURL = URL(fileURLWithPath: cli.outputPath)
 try FileManager.default.createDirectory(at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 let encoder = JSONEncoder()
 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-let jsonData = try encoder.encode(report)
-try jsonData.write(to: outURL)
+try encoder.encode(report).write(to: outURL)
 print("==================================================================")
 print(String(format: "Completed in %.2fs (%@) -> Saved to %@", elapsedWallSec, execModeLabel as NSString, cli.outputPath as NSString))
 print("==================================================================")

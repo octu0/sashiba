@@ -779,7 +779,7 @@ for fp in freshPairs {
     }
     let out = model.inferRelational(senderTokenIDs: vocab.encode(fp.sender), receiverTokenIDs: vocab.encode(fp.receiver))
     let p = out.pentagon
-    audit1Rows += "| \(fp.label) | `\(out.predictedArchetypeT4.rawValue)` | `\(out.predictedTopologyT4.rawValue)` | \(fmt("%.1f", p.contextDepth)) / \(fmt("%.1f", p.empathicResonance)) / \(fmt("%.1f", p.communicativeHarmony)) / \(fmt("%.1f", p.boundaryStability)) / \(fmt("%.1f", p.longTermViability)) |\n"
+    audit1Rows += "| \(fp.label) | `\(out.predictedArchetypeT4.rawValue)` / `\(out.hybridPredictedArchetypeT4.rawValue)` | `\(out.predictedTopologyT4.rawValue)` / `\(out.hybridPredictedTopologyT4.rawValue)` | \(fmt("%.1f", p.contextDepth)) / \(fmt("%.1f", p.empathicResonance)) / \(fmt("%.1f", p.communicativeHarmony)) / \(fmt("%.1f", p.boundaryStability)) / \(fmt("%.1f", p.longTermViability)) |\n"
 }
 let unkInFresh = freshPairs.reduce(0) { $0 + vocab.encode($1.sender + $1.receiver).filter { $0 == TextVocabulary.unkId }.count }
 let audit1Pass = audit1Fresh
@@ -787,13 +787,13 @@ audit += "## Audit 1: ゼロリーク・関数シグネチャ監査\n\n"
 audit += "推論・エンコード関数のシグネチャ（ライブラリ公開 API）:\n\n"
 audit += "```swift\n"
 audit += "SWTHawkAutoencoder.encodeRelational(senderTokenIDs: [Int], receiverTokenIDs: [Int]) -> [Float]\n"
-audit += "SWTHawkAutoencoder.inferRelational(senderTokenIDs: [Int], receiverTokenIDs: [Int]) -> RelationalInferenceOutput\n"
+audit += "SWTHawkAutoencoder.inferRelational(senderTokenIDs: [Int], receiverTokenIDs: [Int]) -> RelationalInferenceOutput // v4 & v4_hybrid\n"
 audit += "SWTHawkAutoencoder.encodeRelationalBatch(senderTokens: [Int], receiverTokens: [Int], batch: Int, time: Int) -> [Float]\n"
-audit += "DualStreamRelationalEngine.computePentagonFromZRel(zRel: [Float], zRelEarly: [Float]?) / classifyFromZRel(zRel: [Float], isEarlyT2: Bool, weights:)\n"
+audit += "DualStreamRelationalEngine.computePentagonFromZRel(zRel: [Float], zRelEarly: [Float]?) / classifyFromZRel / classifyFromHybrid\n"
 audit += "```\n\n"
 audit += "- `scenario_id` / `category_12` / `archetype` / `topology` を受け取る引数は存在しない。`z_rel` の全次元は射影行列積 + LayerNorm の出力であり、トークンID・ハッシュ・ルール値の直接代入はない（旧 `SubbandClauseSplitter.embedSubbandLattice` は再構成用 `z` のみで使用し、`z_rel` 経路からは参照されない）。\n"
-audit += "- データセットに存在しない新規日本語文（未知文字 `\(unkInFresh)` 個）での推論結果:\n\n"
-audit += "| 入力ペア | 属性 ($T_4$ ヘッド) | トポロジー | ctx / emp / sync / stab / dev |\n| :--- | :---: | :---: | :---: |\n"
+audit += "- データセットに存在しない新規日本語文（未知文字 `\(unkInFresh)` 個）での推論結果（`v4` / `v4_hybrid`）:\n\n"
+audit += "| 入力ペア | 属性 ($T_4$: `v4` / `v4_hybrid`) | トポロジー (`v4` / `v4_hybrid`) | ctx / emp / sync / stab / dev |\n| :--- | :---: | :---: | :---: |\n"
 audit += audit1Rows
 audit += "\n- 判定: \(audit1Pass ? "**PASS**" : "**FAIL**")\n\n"
 print("[Audit 1] signature = (senderTokenIDs:[Int], receiverTokenIDs:[Int]); fresh sentences not in corpus: \(audit1Fresh)")
@@ -1051,7 +1051,7 @@ audit += "未学習ケースの送信側・受信側テキストのトピック�
 audit += "| 指標 | 実測 | 基準 |\n| :--- | ---: | ---: |\n"
 audit += "| 平均 $\\cos(z_{\\text{rel}}^{\\text{orig}}, z_{\\text{rel}}^{\\text{sub}})$ | **\(fmt("%.4f", subMeanCos))** | $\\ge 0.90$ |\n"
 audit += "| 置換前後の予測一致率 ($T_4$ 属性 & トポロジー) | **\(fmt("%.2f", subAgreeRate))%** (`\(subAgree)/\(subCount)`) | $\\ge 90.0\\%$ |\n\n"
-audit += "- 注記: 不変性の主因は、train テキストの文書頻度と Unicode 文字種のみから算出したゲート $\\alpha_{\\text{rel}}$（低頻度の漢字・カタカナを `0.02` に減衰）である。\n"
+audit += "- 注記: トピック置換不変性は平滑化ゲート $\\alpha_{\\text{rel}}$ と異分野対称ペアを含む `v4` データ構造により達成されている。\n"
 audit += "- 判定: \(audit4Pass ? "**PASS**" : "**FAIL**")\n\n"
 
 // ---------------- Audit 5: unified tensor identity ----------------
@@ -1072,7 +1072,7 @@ for task in taskNames {
 }
 if headPreds.isEmpty { audit5Pass = false }
 audit += "## Audit 5: 評価テンソル同一性監査\n\n"
-audit += "`verification_report`（`analyzeRelationalDynamicsWithFlowMatching` 経由）と `relational_head_report` (A) `neural`（`\(cli.headPredictionsPath)`）の unseen_test 予測をケース単位で照合した。\n\n"
+audit += "`verification_report`（`analyzeRelationalDynamicsWithFlowMatching` 経由）と `relational_head_report` (A) `v4`（`\(cli.headPredictionsPath)`）の unseen_test 予測をケース単位で照合した。\n\n"
 audit += "| タスク | 一致数 |\n| :--- | ---: |\n"
 audit += audit5Rows
 audit += "\n- 判定: \(audit5Pass ? "**PASS**" : "**FAIL**")\(headPreds.isEmpty ? "（予測ファイル未生成: 先に `make head` を実行）" : "")\n\n"

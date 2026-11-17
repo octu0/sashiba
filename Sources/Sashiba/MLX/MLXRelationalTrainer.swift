@@ -723,6 +723,8 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         zRelT2: [[Float]],
         archT2: [Int],
         topoT2: [Int],
+        hybridT4: [[Float]]? = nil,
+        hybridT2: [[Float]]? = nil,
         groups: [String]? = nil,
         uniquenessWeights: [Float]? = nil,
         steps: Int = 350,
@@ -805,11 +807,29 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
             return SoftmaxClassifierHead.trainMLX(features: features, labels: labels, classCount: classCount, steps: steps, l2: bestL2, classBalancePower: bestBal, sampleWeights: allGroupWeights)
         }
 
+        let gArr = groups ?? []
+        let hybA4: SoftmaxClassifierHead? = if let h4 = hybridT4, h4.count == archT4.count {
+            SoftmaxClassifierHead.trainGroupCV(features: h4, labels: archT4, groups: gArr, classCount: RelationalArchetype.allCases.count, steps: steps)
+        } else { nil }
+        let hybT4: SoftmaxClassifierHead? = if let h4 = hybridT4, h4.count == topoT4.count {
+            SoftmaxClassifierHead.trainGroupCV(features: h4, labels: topoT4, groups: gArr, classCount: RelationalTopology.allCases.count, steps: steps)
+        } else { nil }
+        let hybA2: SoftmaxClassifierHead? = if let h2 = hybridT2, h2.count == archT2.count {
+            SoftmaxClassifierHead.trainGroupCV(features: h2, labels: archT2, groups: gArr, classCount: RelationalArchetype.allCases.count, steps: steps)
+        } else { nil }
+        let hybT2: SoftmaxClassifierHead? = if let h2 = hybridT2, h2.count == topoT2.count {
+            SoftmaxClassifierHead.trainGroupCV(features: h2, labels: topoT2, groups: gArr, classCount: RelationalTopology.allCases.count, steps: steps)
+        } else { nil }
+
         let heads = RelationalCalibratedHeads(
             archetypeT4: fitWithGroupCV(features: zRelT4, labels: archT4, classCount: RelationalArchetype.allCases.count),
             topologyT4: fitWithGroupCV(features: zRelT4, labels: topoT4, classCount: RelationalTopology.allCases.count),
             archetypeT2: fitWithGroupCV(features: zRelT2, labels: archT2, classCount: RelationalArchetype.allCases.count),
-            topologyT2: fitWithGroupCV(features: zRelT2, labels: topoT2, classCount: RelationalTopology.allCases.count)
+            topologyT2: fitWithGroupCV(features: zRelT2, labels: topoT2, classCount: RelationalTopology.allCases.count),
+            hybridArchetypeT4: hybA4,
+            hybridTopologyT4: hybT4,
+            hybridArchetypeT2: hybA2,
+            hybridTopologyT2: hybT2
         )
         model.relational.calibratedHeads = heads
     }

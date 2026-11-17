@@ -6,11 +6,11 @@ struct RelationalHeadCLI {
     var dataPath: String = ".tmp"
     var weightsPath: String = ".tmp/weights.safetensors"
     var aeWeightsPath: String = ".tmp/weights_ae.safetensors"
-    var reportPath: String = ".tmp/relational_head_report.md"
     var headsPath: String = ".tmp/relational_heads.json"
+    var reportPath: String = ".tmp/relational_head_report.md"
     var predictionsPath: String = ".tmp/relational_head_predictions_A.json"
-    var steps: Int = 300
     var maxSeqLen: Int = 512
+    var steps: Int = 350
     var foldEpochs: Int = 15
     var relBatch: Int = 32
     var relLR: Float = 1.4e-3
@@ -31,24 +31,21 @@ struct RelationalHeadCLI {
             case "--ae-weights":
                 i += 1
                 if i < args.count { cli.aeWeightsPath = args[i] }
-            case "-o", "--report":
-                i += 1
-                if i < args.count { cli.reportPath = args[i] }
             case "--heads":
                 i += 1
                 if i < args.count { cli.headsPath = args[i] }
+            case "-o", "--output":
+                i += 1
+                if i < args.count { cli.reportPath = args[i] }
+            case "--predictions":
+                i += 1
+                if i < args.count { cli.predictionsPath = args[i] }
             case "--steps":
                 i += 1
-                if i < args.count, let v = Int(args[i]) { cli.steps = max(1, v) }
+                if i < args.count, let v = Int(args[i]) { cli.steps = max(10, v) }
             case "--fold-epochs":
                 i += 1
                 if i < args.count, let v = Int(args[i]) { cli.foldEpochs = max(1, v) }
-            case "--rel-batch":
-                i += 1
-                if i < args.count, let v = Int(args[i]) { cli.relBatch = max(2, v) }
-            case "--rel-lr":
-                i += 1
-                if i < args.count, let v = Float(args[i]) { cli.relLR = v }
             case "--skip-folds":
                 cli.skipFolds = true
             case "--retrain-folds":
@@ -67,7 +64,6 @@ struct RelationalHeadCLI {
     }
 }
 
-/// One prediction target: which receiver text is used as input and which label is predicted.
 struct HeadTask {
     let name: String
     let useEarlyText: Bool
@@ -98,7 +94,7 @@ guard !trainCasesAll.isEmpty && !unseenCasesAll.isEmpty else {
     exit(1)
 }
 
-let weights = try SWTHawkWeights.load(from: URL(fileURLWithPath: cli.weightsPath))
+var weights = try SWTHawkWeights.load(from: URL(fileURLWithPath: cli.weightsPath))
 let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
 let hybridExtractor = RelationalHybridFeatureExtractor(vocabulary: vocab)
 let mainModel: MLXSWTHawkAutoencoder? = cli.useGPU ? MLXSWTHawkAutoencoder(weights: weights) : nil
@@ -110,7 +106,7 @@ let seqLen = allCases
     .reduce(4, max)
 
 print("==================================================================")
-print("Phase 5.1 Relational Head Evaluation (Mode: \(cli.useGPU ? "GPU" : "Pure Multi-Core CPU (0 GPU VRAM)"))")
+print("Relational Head Evaluation [v4 & v4_hybrid] (Mode: \(cli.useGPU ? "GPU" : "Pure Multi-Core CPU (0 GPU VRAM)"))")
 print("==================================================================")
 print("Train cases: \(trainCasesAll.count) | Unseen cases: \(unseenCasesAll.count) | seqLen: \(seqLen)")
 
@@ -118,15 +114,6 @@ let hostEarlyTok = allCases.map { RelationalPipeline.encodeTokens($0.hostEarlyTe
 let hostTok = allCases.map { RelationalPipeline.encodeTokens($0.hostText, vocab: vocab, time: seqLen) }
 let earlyTok = allCases.map { RelationalPipeline.encodeTokens($0.partnerEarlyText, vocab: vocab, time: seqLen) }
 let currentTok = allCases.map { RelationalPipeline.encodeTokens($0.partnerCurrentText, vocab: vocab, time: seqLen) }
-
-let ngram = CharNGramFeaturizer(dim: 2048)
-let ngramHostEarly = allCases.map { ngram.features($0.hostEarlyText) }
-let ngramHost = allCases.map { ngram.features($0.hostText) }
-let ngramEarly = allCases.map { ngram.features($0.partnerEarlyText) }
-let ngramCurrent = allCases.map { ngram.features($0.partnerCurrentText) }
-func ngramInput(_ i: Int, _ early: Bool) -> [Float] {
-    return (early ? ngramHostEarly[i] : ngramHost[i]) + (early ? ngramEarly[i] : ngramCurrent[i])
-}
 
 struct EvalResult {
     let task: String
@@ -163,13 +150,11 @@ func summarize(task: HeadTask, featurizer: String, testIdx: [Int], preds: [Int],
 
 func majorityClass(_ labels: [Int], classCount: Int) -> Int {
     var counts = [Int](repeating: 0, count: classCount)
-    for y in labels {
-        counts[y] += 1
-    }
+    for y in labels { counts[y] += 1 }
     return counts.firstIndex(of: counts.max() ?? 0) ?? 0
 }
 
-func head(_ heads: RelationalCalibratedHeads, _ task: HeadTask) -> SoftmaxClassifierHead? {
+func zHead(_ heads: RelationalCalibratedHeads, _ task: HeadTask) -> SoftmaxClassifierHead? {
     switch task.name {
     case "archetype_t4": return heads.archetypeT4
     case "topology_t4": return heads.topologyT4
@@ -178,12 +163,21 @@ func head(_ heads: RelationalCalibratedHeads, _ task: HeadTask) -> SoftmaxClassi
     }
 }
 
+func hybridHead(_ heads: RelationalCalibratedHeads, _ task: HeadTask) -> SoftmaxClassifierHead? {
+    switch task.name {
+    case "archetype_t4": return heads.hybridArchetypeT4
+    case "topology_t4": return heads.hybridTopologyT4
+    case "archetype_t2": return heads.hybridArchetypeT2
+    default: return heads.hybridTopologyT2
+    }
+}
+
 let trainIndices = allCases.indices.filter { !allCases[$0].isZeroShotUnseen }
 let unseenIndices = allCases.indices.filter { allCases[$0].isZeroShotUnseen }
 let pct = { (v: Float) in String(format: "%6.2f%%", v * 100.0) }
 
 // ------------------------------------------------------------------
-// (A) Scenario split: the SAME calibrated heads and the SAME z_rel tensor used by verify_latent_space (Audit 5).
+// (A) Scenario split: v4 (z_rel 128D) & v4_hybrid (160D)
 // ------------------------------------------------------------------
 let zT2All: [[Float]]
 let zT4All: [[Float]]
@@ -227,6 +221,7 @@ if !cli.useGPU, let c2 = loadZCache(zCacheT2, rows: allCases.count, dim: relDim)
     saveZCache(zCacheT2, matrix: zT2All)
     saveZCache(zCacheT4, matrix: zT4All)
 }
+
 let hybridT2All = allCases.indices.map { i in
     hybridExtractor.extract(senderTokens: hostEarlyTok[i], receiverTokens: earlyTok[i], zRel: zT2All[i], weights: weights)
 }
@@ -237,7 +232,7 @@ let hybridT4All = allCases.indices.map { i in
 var splitResults: [EvalResult] = []
 var predictionsA: [String: [String: Int]] = [:]
 for task in tasks {
-    guard let h = head(weights.relational.calibratedHeads, task) else {
+    guard let h = zHead(weights.relational.calibratedHeads, task) else {
         print("Calibrated head missing for \(task.name); run `make train` with --rel-epochs > 0")
         exit(1)
     }
@@ -251,49 +246,64 @@ for task in tasks {
     predictionsA[task.name] = perCase
     let maj = majorityClass(trainIndices.map { task.label(allCases[$0]) }, classCount: task.classNames.count)
     let r = summarize(
-        task: task, featurizer: "neural", testIdx: unseenIndices, preds: preds,
+        task: task, featurizer: "v4", testIdx: unseenIndices, preds: preds,
         majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
     )
     splitResults.append(r)
-    print("[split   ][neural] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+    print("[split   ][v4       ] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
 }
+
 let trainGroups = trainIndices.map { allCases[$0].group }
+var didCalibrateHybrid = false
 for task in tasks {
     let hyb = task.useEarlyText ? hybridT2All : hybridT4All
     let trainX = trainIndices.map { hyb[$0] }
     let trainY = trainIndices.map { task.label(allCases[$0]) }
-    let h = SoftmaxClassifierHead.trainGroupCV(features: trainX, labels: trainY, groups: trainGroups, classCount: task.classNames.count, steps: 350)
+    let h: SoftmaxClassifierHead
+    if let existing = hybridHead(weights.relational.calibratedHeads, task), existing.featureDim == trainX[0].count {
+        h = existing
+    } else {
+        h = SoftmaxClassifierHead.trainGroupCV(features: trainX, labels: trainY, groups: trainGroups, classCount: task.classNames.count, steps: cli.steps)
+        switch task.name {
+        case "archetype_t4": weights.relational.calibratedHeads.hybridArchetypeT4 = h
+        case "topology_t4": weights.relational.calibratedHeads.hybridTopologyT4 = h
+        case "archetype_t2": weights.relational.calibratedHeads.hybridArchetypeT2 = h
+        default: weights.relational.calibratedHeads.hybridTopologyT2 = h
+        }
+        didCalibrateHybrid = true
+    }
     let trainCorrect = zip(trainX, trainY).filter { h.predict($0) == $1 }.count
     let preds = unseenIndices.map { h.predict(hyb[$0]) }
     let maj = majorityClass(trainY, classCount: task.classNames.count)
     let r = summarize(
-        task: task, featurizer: "neural_hybrid", testIdx: unseenIndices, preds: preds,
+        task: task, featurizer: "v4_hybrid", testIdx: unseenIndices, preds: preds,
         majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
     )
     splitResults.append(r)
-    print("[split   ][neural_hybrid] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+    print("[split   ][v4_hybrid] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
 }
-for task in tasks {
-    let trainX = trainIndices.map { ngramInput($0, task.useEarlyText) }
-    let trainY = trainIndices.map { task.label(allCases[$0]) }
-    let h = SoftmaxClassifierHead.train(features: trainX, labels: trainY, classCount: task.classNames.count, steps: cli.steps)
-    let trainCorrect = zip(trainX, trainY).filter { h.predict($0) == $1 }.count
-    let preds = unseenIndices.map { h.predict(ngramInput($0, task.useEarlyText)) }
-    let maj = majorityClass(trainY, classCount: task.classNames.count)
-    let r = summarize(
-        task: task, featurizer: "char_ngram", testIdx: unseenIndices, preds: preds,
-        majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
+if didCalibrateHybrid {
+    try weights.save(to: URL(fileURLWithPath: cli.weightsPath))
+    saveZCache(
+        (zCacheDir as NSString).appendingPathComponent("relhead_t2_\(allCases.count)_\(seqLen)_" +
+            "\(((try? FileManager.default.attributesOfItem(atPath: cli.weightsPath)[.size] as? NSNumber)?.int64Value ?? 0))_" +
+            "\(Int64(((try? FileManager.default.attributesOfItem(atPath: cli.weightsPath)[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0))).bin"),
+        matrix: zT2All
     )
-    splitResults.append(r)
-    print("[split   ][char_ngram] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+    saveZCache(
+        (zCacheDir as NSString).appendingPathComponent("relhead_t4_\(allCases.count)_\(seqLen)_" +
+            "\(((try? FileManager.default.attributesOfItem(atPath: cli.weightsPath)[.size] as? NSNumber)?.int64Value ?? 0))_" +
+            "\(Int64(((try? FileManager.default.attributesOfItem(atPath: cli.weightsPath)[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0))).bin"),
+        matrix: zT4All
+    )
+    print("Persisted calibrated v4_hybrid (160D) heads into \(cli.weightsPath)")
 }
+
 let predData = try JSONEncoder().encode(predictionsA)
 try predData.write(to: URL(fileURLWithPath: cli.predictionsPath))
 
 // ------------------------------------------------------------------
-// (B) Stratified Group 6-Fold: categories grouped by (arch_T2, topo_T2, arch_T4, topo_T4) signature and assigned
-// round-robin, so every label of a held-out fold also appears on the training side. The encoder is RE-TRAINED
-// per fold from the autoencoder-stage weights on the fold's training categories only.
+// (B) Stratified Group 6-Fold CV: v4 & v4_hybrid
 // ------------------------------------------------------------------
 let foldCount = 6
 let categories = Array(Set(allCases.map(\.group))).sorted()
@@ -330,12 +340,12 @@ var holdoutResults: [EvalResult] = []
 var foldLog: [String] = []
 if !cli.skipFolds {
     let aeWeights = try SWTHawkWeights.load(from: URL(fileURLWithPath: cli.aeWeightsPath))
-    var neuralPreds: [String: [Int: Int]] = [:]
-    var neuralTrainCorrect: [String: Int] = [:]
-    var neuralTrainTotal: [String: Int] = [:]
+    var v4Preds: [String: [Int: Int]] = [:]
+    var hybPreds: [String: [Int: Int]] = [:]
+    var v4TrainCorrect: [String: Int] = [:]
+    var hybTrainCorrect: [String: Int] = [:]
+    var trainTotal: [String: Int] = [:]
     var majorityPredsByTask: [String: [Int: Int]] = [:]
-    var ngramPreds: [String: [Int: Int]] = [:]
-    var ngramTrainCorrect: [String: Int] = [:]
 
     for fold in 0..<foldCount {
         let foldTrain = trainIndices.filter { foldOfCategory[allCases[$0].group] != fold }
@@ -361,32 +371,31 @@ if !cli.skipFolds {
         let evalIdx = foldTrain + foldTest
         let z2 = RelationalPipeline.encodeZRel(model: model, senders: evalIdx.map { hostEarlyTok[$0] }, receivers: evalIdx.map { earlyTok[$0] }, time: seqLen)
         let z4 = RelationalPipeline.encodeZRel(model: model, senders: evalIdx.map { hostTok[$0] }, receivers: evalIdx.map { currentTok[$0] }, time: seqLen)
-        var row: [Int: Int] = [:]
-        for (k, i) in evalIdx.enumerated() {
-            row[i] = k
+        let hyb2 = evalIdx.enumerated().map { (k, idx) in
+            hybridExtractor.extract(senderTokens: hostEarlyTok[idx], receiverTokens: earlyTok[idx], zRel: z2[k], weights: fw)
         }
+        let hyb4 = evalIdx.enumerated().map { (k, idx) in
+            hybridExtractor.extract(senderTokens: hostTok[idx], receiverTokens: currentTok[idx], zRel: z4[k], weights: fw)
+        }
+        var row: [Int: Int] = [:]
+        for (k, i) in evalIdx.enumerated() { row[i] = k }
 
         for task in tasks {
-            guard let h = head(fw.relational.calibratedHeads, task) else { continue }
+            guard let hz = zHead(fw.relational.calibratedHeads, task),
+                  let hh = hybridHead(fw.relational.calibratedHeads, task) else { continue }
             let z = task.useEarlyText ? z2 : z4
-            let tc = foldTrain.filter { h.predict(z[row[$0]!]) == task.label(allCases[$0]) }.count
-            neuralTrainCorrect[task.name, default: 0] += tc
-            neuralTrainTotal[task.name, default: 0] += foldTrain.count
+            let hyb = task.useEarlyText ? hyb2 : hyb4
+            v4TrainCorrect[task.name, default: 0] += foldTrain.filter { hz.predict(z[row[$0]!]) == task.label(allCases[$0]) }.count
+            hybTrainCorrect[task.name, default: 0] += foldTrain.filter { hh.predict(hyb[row[$0]!]) == task.label(allCases[$0]) }.count
+            trainTotal[task.name, default: 0] += foldTrain.count
             let maj = majorityClass(foldTrain.map { task.label(allCases[$0]) }, classCount: task.classNames.count)
             for i in foldTest {
-                neuralPreds[task.name, default: [:]][i] = h.predict(z[row[i]!])
+                v4Preds[task.name, default: [:]][i] = hz.predict(z[row[i]!])
+                hybPreds[task.name, default: [:]][i] = hh.predict(hyb[row[i]!])
                 majorityPredsByTask[task.name, default: [:]][i] = maj
             }
-
-            let trainX = foldTrain.map { ngramInput($0, task.useEarlyText) }
-            let trainY = foldTrain.map { task.label(allCases[$0]) }
-            let nh = SoftmaxClassifierHead.trainMLX(features: trainX, labels: trainY, classCount: task.classNames.count, steps: cli.steps)
-            ngramTrainCorrect[task.name, default: 0] += zip(trainX, trainY).filter { nh.predict($0) == $1 }.count
-            for i in foldTest {
-                ngramPreds[task.name, default: [:]][i] = nh.predict(ngramInput(i, task.useEarlyText))
-            }
-            let foldAcc = Float(foldTest.filter { neuralPreds[task.name]![$0] == task.label(allCases[$0]) }.count) / Float(max(1, foldTest.count))
-            print("  [fold \(fold)] \(task.name): neural held-out \(pct(foldAcc))")
+            let foldAcc = Float(foldTest.filter { hybPreds[task.name]![$0] == task.label(allCases[$0]) }.count) / Float(max(1, foldTest.count))
+            print("  [fold \(fold)] \(task.name): v4_hybrid held-out \(pct(foldAcc))")
         }
         let line = String(format: "fold %d: %d categories, train %d, test %d, %.1fs", fold, foldCats.count, foldTrain.count, foldTest.count, Date().timeIntervalSince(start))
         foldLog.append(line)
@@ -395,34 +404,24 @@ if !cli.skipFolds {
     }
 
     let allTest = allCases.indices.filter { foldOfCategory[allCases[$0].group] != nil }
-    for task in tasks {
-        let rn = summarize(
-            task: task, featurizer: "neural", testIdx: allTest,
-            preds: allTest.map { neuralPreds[task.name]?[$0] ?? 0 },
-            majorityPreds: allTest.map { majorityPredsByTask[task.name]?[$0] ?? 0 },
-            trainCorrect: neuralTrainCorrect[task.name] ?? 0, trainTotal: neuralTrainTotal[task.name] ?? 1
-        )
-        holdoutResults.append(rn)
-        print("[holdout ][neural] \(task.name): held-out categories \(pct(rn.testAcc)) | majority \(pct(rn.majorityAcc)) | label unseen in training: \(missingByTask[task.name] ?? -1)")
-    }
-    for task in tasks {
-        let rg = summarize(
-            task: task, featurizer: "char_ngram", testIdx: allTest,
-            preds: allTest.map { ngramPreds[task.name]?[$0] ?? 0 },
-            majorityPreds: allTest.map { majorityPredsByTask[task.name]?[$0] ?? 0 },
-            trainCorrect: ngramTrainCorrect[task.name] ?? 0, trainTotal: neuralTrainTotal[task.name] ?? 1
-        )
-        holdoutResults.append(rg)
-        print("[holdout ][char_ngram] \(task.name): held-out categories \(pct(rg.testAcc)) | majority \(pct(rg.majorityAcc))")
+    for (fName, pMap, tcMap) in [("v4", v4Preds, v4TrainCorrect), ("v4_hybrid", hybPreds, hybTrainCorrect)] {
+        for task in tasks {
+            let r = summarize(
+                task: task, featurizer: fName, testIdx: allTest,
+                preds: allTest.map { pMap[task.name]?[$0] ?? 0 },
+                majorityPreds: allTest.map { majorityPredsByTask[task.name]?[$0] ?? 0 },
+                trainCorrect: tcMap[task.name] ?? 0, trainTotal: trainTotal[task.name] ?? 1
+            )
+            holdoutResults.append(r)
+            print("[holdout ][\(fName)] \(task.name): held-out categories \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+        }
     }
 } else {
-    // Fast Zero-GPU Frozen-Feature Group 6-Fold Head CV (evaluates strictly on unseen_test of held-out categories, 0 label leakage)
     let startFast = Date()
     var zPreds: [String: [Int: Int]] = [:]
     var hPreds: [String: [Int: Int]] = [:]
-    var ngPreds: [String: [Int: Int]] = [:]
     var majPreds: [String: [Int: Int]] = [:]
-    var zTrC: [String: Int] = [:], hTrC: [String: Int] = [:], ngTrC: [String: Int] = [:], trTot: [String: Int] = [:]
+    var zTrC: [String: Int] = [:], hTrC: [String: Int] = [:], trTot: [String: Int] = [:]
 
     for fold in 0..<foldCount {
         let foldTrain = trainIndices.filter { foldOfCategory[allCases[$0].group] != fold }
@@ -438,22 +437,19 @@ if !cli.skipFolds {
 
             let hz = SoftmaxClassifierHead.trainGroupCV(features: foldTrain.map { zBank[$0] }, labels: yTr, groups: fGroups, classCount: task.classNames.count, steps: 200)
             let hh = SoftmaxClassifierHead.trainGroupCV(features: foldTrain.map { hBank[$0] }, labels: yTr, groups: fGroups, classCount: task.classNames.count, steps: 200)
-            let hng = SoftmaxClassifierHead.train(features: foldTrain.map { ngramInput($0, task.useEarlyText) }, labels: yTr, classCount: task.classNames.count, steps: 140, learningRate: 0.08)
 
             zTrC[task.name, default: 0] += foldTrain.filter { hz.predict(zBank[$0]) == task.label(allCases[$0]) }.count
             hTrC[task.name, default: 0] += foldTrain.filter { hh.predict(hBank[$0]) == task.label(allCases[$0]) }.count
-            ngTrC[task.name, default: 0] += foldTrain.filter { hng.predict(ngramInput($0, task.useEarlyText)) == task.label(allCases[$0]) }.count
 
             for i in foldTest {
                 zPreds[task.name, default: [:]][i] = hz.predict(zBank[i])
                 hPreds[task.name, default: [:]][i] = hh.predict(hBank[i])
-                ngPreds[task.name, default: [:]][i] = hng.predict(ngramInput(i, task.useEarlyText))
                 majPreds[task.name, default: [:]][i] = maj
             }
         }
     }
     let unseenHoldoutIdx = unseenIndices.filter { foldOfCategory[allCases[$0].group] != nil }
-    for (featName, pMap, tcMap) in [("neural_frozen", zPreds, zTrC), ("neural_hybrid_frozen", hPreds, hTrC), ("char_ngram", ngPreds, ngTrC)] {
+    for (featName, pMap, tcMap) in [("v4_frozen", zPreds, zTrC), ("v4_hybrid_frozen", hPreds, hTrC)] {
         for task in tasks {
             let r = summarize(
                 task: task, featurizer: featName, testIdx: unseenHoldoutIdx,
@@ -469,7 +465,7 @@ if !cli.skipFolds {
 }
 
 func resultTable(_ rs: [EvalResult], testLabel: String) -> String {
-    var t = "| 特徴 | タスク | 学習精度 | \(testLabel) | 多数派クラス基準 |\n"
+    var t = "| モデル構成 | タスク | 学習精度 | \(testLabel) | 多数派クラス基準 |\n"
     t += "| :--- | :--- | ---: | ---: | ---: |\n"
     for r in rs {
         t += "| `\(r.featurizer)` | `\(r.task)` | \(String(format: "%.2f", r.trainAcc * 100.0))% | **\(String(format: "%.2f", r.testAcc * 100.0))%** (\(r.correct)/\(r.total)) | \(String(format: "%.2f", r.majorityAcc * 100.0))% |\n"
@@ -486,13 +482,12 @@ func perClassList(_ rs: [EvalResult]) -> String {
     return s
 }
 
-var report = "# 関係性分類の汎化評価（Phase 5.1+: 高速 CPU 検証・ハイブリッド特徴対応）\n\n"
+var report = "# 関係性分類の汎化評価（`v4` & `v4_hybrid` 標準構成）\n\n"
 report += "- 入力: `(senderTokenIDs, receiverTokenIDs)` の2配列のみ（連結しない Dual-Stream。$T_4$ は受信側全文、$T_2$ は受信側前半）\n"
-report += "- `neural`: `z_rel = [z_LL^rel(\(weights.relational.latentDim / 2)); z_HH^rel(\(weights.relational.latentDim / 2))] ∈ R^\(weights.relational.latentDim)`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
-report += "- `neural_hybrid`: `z_rel` + 非線形サブバンド幾何(8) + トピック置換不変エコー・変調(8) + 非語彙対話リズム(16) = `\(weights.relational.latentDim + 32)` 次元（GPU 再学習ゼロ・CPU Group-CV 校正）\n"
-report += "- `char_ngram`: 文字 1-gram / 2-gram のハッシュ特徴（`[送信側 ; 受信側]` 連結、比較用ベースライン）\n\n"
+report += "- `v4`: `z_rel = [z_LL^rel(\(weights.relational.latentDim / 2)); z_HH^rel(\(weights.relational.latentDim / 2))] ∈ R^\(weights.relational.latentDim)`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
+report += "- `v4_hybrid`: `z_rel` + 非線形サブバンド幾何(8) + トピック置換不変エコー・Pentagon(8) + 非語彙対話リズム(16) = `\(weights.relational.latentDim + 32)` 次元（`weights.safetensors` 内蔵 Group-CV 校正ヘッド）\n\n"
 report += "## (A) シナリオ分割: train → unseen_test\n\n"
-report += "学習 `\(trainIndices.count)` 件、評価 `\(unseenIndices.count)` 件。`neural` は学習時に保存された校正ヘッドをそのまま適用（GPU 再学習なし）。\n\n"
+report += "学習 `\(trainIndices.count)` 件、評価 `\(unseenIndices.count)` 件。\n\n"
 report += resultTable(splitResults, testLabel: "未学習精度")
 report += "\n### クラス別正解数\n\n"
 report += perClassList(splitResults)
