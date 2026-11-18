@@ -181,6 +181,228 @@ public struct RelationalPentagonScores: Codable, Sendable, Equatable {
     }
 }
 
+/// Continuous & ordinal emotional gradation (`v5` Section 1 & Layer 1 O6):
+/// `affection` (`0..4`), `friction` (`0..4`), and `arousal` (`0.0..1.0`).
+public struct EmotionalGradation: Codable, Sendable, Equatable {
+    public let affection: Int
+    public let friction: Int
+    public let arousal: Float
+
+    public init(affection: Int, friction: Int, arousal: Float) {
+        self.affection = max(0, min(4, affection))
+        self.friction = max(0, min(4, friction))
+        self.arousal = max(0.0, min(1.0, arousal))
+    }
+
+    public static func inferredDefault(archetype: RelationalArchetype, topology: RelationalTopology) -> EmotionalGradation {
+        let baseAff: Int = switch topology {
+        case .deepAffection: 4
+        case .closeConfidant: 3
+        case .benevolentGuardian: 2
+        case .acquaintedObserver: 1
+        case .unconnectedStranger: 0
+        }
+        switch archetype {
+        case .trueSupporter:
+            return EmotionalGradation(affection: max(1, baseAff), friction: 0, arousal: 0.42)
+        case .gachikoiSafe:
+            return EmotionalGradation(affection: max(2, min(4, baseAff + 1)), friction: 0, arousal: 0.68)
+        case .casualHype:
+            return EmotionalGradation(affection: min(2, max(1, baseAff)), friction: 0, arousal: 0.56)
+        case .gachikoiRisk:
+            return EmotionalGradation(affection: max(2, baseAff), friction: 3, arousal: 0.82)
+        case .hiddenAggressor:
+            return EmotionalGradation(affection: min(1, baseAff), friction: 3, arousal: 0.64)
+        case .indifferentTroll:
+            return EmotionalGradation(affection: 0, friction: baseAff >= 2 ? 2 : 1, arousal: 0.18)
+        }
+    }
+}
+
+/// Span-grounded observable items (`Layer 1 Rubric O1–O5`).
+public struct RelationalObservations: Codable, Sendable, Equatable {
+    public let o1Support: Bool
+    public let o2Specific: Bool
+    public let o3NegMix: Bool
+    public let o4Boundary: String
+    public let o5Substantive: String
+
+    private enum CodingKeys: String, CodingKey {
+        case o1Support = "o1_support"
+        case o2Specific = "o2_specific"
+        case o3NegMix = "o3_neg_mix"
+        case o4Boundary = "o4_boundary"
+        case o5Substantive = "o5_substantive"
+    }
+
+    public init(
+        o1Support: Bool,
+        o2Specific: Bool,
+        o3NegMix: Bool,
+        o4Boundary: String,
+        o5Substantive: String
+    ) {
+        self.o1Support = o1Support
+        self.o2Specific = o2Specific
+        self.o3NegMix = o3NegMix
+        self.o4Boundary = o4Boundary
+        self.o5Substantive = o5Substantive
+    }
+
+    public static func inferredDefault(archetype: RelationalArchetype, topology: RelationalTopology) -> RelationalObservations {
+        let close = (topology == .deepAffection || topology == .closeConfidant)
+        switch archetype {
+        case .trueSupporter:
+            return RelationalObservations(o1Support: true, o2Specific: true, o3NegMix: false, o4Boundary: "RESPECTED", o5Substantive: close ? "MUTUAL" : "ONE_WAY")
+        case .gachikoiSafe:
+            return RelationalObservations(o1Support: true, o2Specific: true, o3NegMix: false, o4Boundary: "RESPECTED", o5Substantive: close ? "MUTUAL" : "ONE_WAY")
+        case .casualHype:
+            return RelationalObservations(o1Support: true, o2Specific: close, o3NegMix: false, o4Boundary: "NONE", o5Substantive: close ? "ONE_WAY" : "NONE")
+        case .gachikoiRisk:
+            return RelationalObservations(o1Support: true, o2Specific: true, o3NegMix: true, o4Boundary: "SEVERE_VIOLATION", o5Substantive: "ONE_WAY")
+        case .hiddenAggressor:
+            return RelationalObservations(o1Support: false, o2Specific: close, o3NegMix: true, o4Boundary: "MILD_INTRUSION", o5Substantive: "NONE")
+        case .indifferentTroll:
+            return RelationalObservations(o1Support: false, o2Specific: false, o3NegMix: false, o4Boundary: "NONE", o5Substantive: "NONE")
+        }
+    }
+}
+
+/// Real-time temporal cadence and multi-partner actor baseline context (`v5` Section 2).
+public struct TemporalRelationalContext: Codable, Sendable, Equatable {
+    public let actorBaselineReplyHours: Float
+    public let actorBaselineInitRatio: Float
+    public let replyLagHoursT2: Float
+    public let replyLagHoursT4: Float
+    public let gapDaysT2ToT3: Float
+    public let initiationRatioT2: Float
+    public let initiationRatioT4: Float
+    public let eventDriven: Bool
+    public let postT4UnansweredProbe: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case actorBaselineReplyHours = "actor_baseline_reply_hours"
+        case actorBaselineInitRatio = "actor_baseline_init_ratio"
+        case replyLagHoursT2 = "reply_lag_hours_t2"
+        case replyLagHoursT4 = "reply_lag_hours_t4"
+        case gapDaysT2ToT3 = "gap_days_t2_to_t3"
+        case initiationRatioT2 = "initiation_ratio_t2"
+        case initiationRatioT4 = "initiation_ratio_t4"
+        case eventDriven = "event_driven"
+        case postT4UnansweredProbe = "post_t4_unanswered_probe"
+    }
+
+    public init(
+        actorBaselineReplyHours: Float = 4.0,
+        actorBaselineInitRatio: Float = 0.50,
+        replyLagHoursT2: Float = 4.0,
+        replyLagHoursT4: Float = 4.0,
+        gapDaysT2ToT3: Float = 3.0,
+        initiationRatioT2: Float = 0.50,
+        initiationRatioT4: Float = 0.50,
+        eventDriven: Bool = false,
+        postT4UnansweredProbe: Bool = false
+    ) {
+        self.actorBaselineReplyHours = max(0.05, actorBaselineReplyHours)
+        self.actorBaselineInitRatio = max(0.0, min(1.0, actorBaselineInitRatio))
+        self.replyLagHoursT2 = max(0.05, replyLagHoursT2)
+        self.replyLagHoursT4 = max(0.05, replyLagHoursT4)
+        self.gapDaysT2ToT3 = max(0.0, gapDaysT2ToT3)
+        self.initiationRatioT2 = max(0.0, min(1.0, initiationRatioT2))
+        self.initiationRatioT4 = max(0.0, min(1.0, initiationRatioT4))
+        self.eventDriven = eventDriven
+        self.postT4UnansweredProbe = postT4UnansweredProbe
+    }
+
+    public static let neutralDefault = TemporalRelationalContext()
+}
+
+/// 10-way relational trajectory & disengagement taxonomy (`v5` Section 1 & Section 3).
+public enum RelationalTrajectoryType: String, Codable, Sendable, Equatable, CaseIterable {
+    case warmDeepening = "WARM_DEEPENING"
+    case steadyDeepBond = "STEADY_DEEP_BOND"
+    case steadyLightSupport = "STEADY_LIGHT_SUPPORT"
+    case casualSurface = "CASUAL_SURFACE"
+    case boundaryEscalation = "BOUNDARY_ESCALATION"
+    case disengageExplicitRejection = "DISENGAGE_A_EXPLICIT_REJECTION"
+    case disengageOneSidedStop = "DISENGAGE_B_ONE_SIDED_STOP"
+    case disengageGradualFadeout = "DISENGAGE_C_GRADUAL_FADEOUT"
+    case disengageAffectionToAntipathy = "DISENGAGE_D_AFFECTION_TO_ANTIPATHY"
+    case resumedAfterGap = "RESUMED_AFTER_GAP"
+}
+
+/// Trajectory metadata and `+30d / +90d` retention labels (`v5` Section 3).
+public struct RelationalTrajectorySpec: Codable, Sendable, Equatable {
+    public let type: RelationalTrajectoryType
+    public let terminalUtteranceKind: String
+    public let retained30d: Bool
+    public let retained90d: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case terminalUtteranceKind = "terminal_utterance_kind"
+        case retained30d = "retained_30d"
+        case retained90d = "retained_90d"
+    }
+
+    public init(
+        type: RelationalTrajectoryType,
+        terminalUtteranceKind: String = "NONE",
+        retained30d: Bool,
+        retained90d: Bool
+    ) {
+        self.type = type
+        self.terminalUtteranceKind = terminalUtteranceKind
+        self.retained30d = retained30d
+        self.retained90d = retained90d
+    }
+
+    public static func inferredDefault(
+        archetypeT2: RelationalArchetype,
+        topologyT2: RelationalTopology,
+        archetypeT4: RelationalArchetype,
+        topologyT4: RelationalTopology
+    ) -> RelationalTrajectorySpec {
+        let rank: (RelationalTopology) -> Int = { t in
+            switch t {
+            case .deepAffection: return 4
+            case .closeConfidant: return 3
+            case .benevolentGuardian: return 2
+            case .acquaintedObserver: return 1
+            case .unconnectedStranger: return 0
+            }
+        }
+        let r2 = rank(topologyT2)
+        let r4 = rank(topologyT4)
+        let warmT2 = (archetypeT2 == .trueSupporter || archetypeT2 == .gachikoiSafe || archetypeT2 == .casualHype)
+        if archetypeT4 == .gachikoiRisk {
+            return RelationalTrajectorySpec(type: .boundaryEscalation, terminalUtteranceKind: "HOSTILE_STING", retained30d: true, retained90d: false)
+        }
+        if archetypeT4 == .hiddenAggressor {
+            if warmT2 && r2 >= 2 {
+                return RelationalTrajectorySpec(type: .disengageAffectionToAntipathy, terminalUtteranceKind: "HOSTILE_STING", retained30d: true, retained90d: false)
+            }
+            return RelationalTrajectorySpec(type: .boundaryEscalation, terminalUtteranceKind: "HOSTILE_STING", retained30d: false, retained90d: false)
+        }
+        if archetypeT4 == .indifferentTroll {
+            if warmT2 {
+                return RelationalTrajectorySpec(type: .disengageGradualFadeout, terminalUtteranceKind: "TAPERING_SHORT", retained30d: false, retained90d: false)
+            }
+            return RelationalTrajectorySpec(type: .casualSurface, terminalUtteranceKind: "NONE", retained30d: false, retained90d: false)
+        }
+        if r4 > r2 && r4 >= 3 {
+            return RelationalTrajectorySpec(type: .warmDeepening, terminalUtteranceKind: "NONE", retained30d: true, retained90d: true)
+        }
+        if r4 >= 3 {
+            return RelationalTrajectorySpec(type: .steadyDeepBond, terminalUtteranceKind: "NONE", retained30d: true, retained90d: true)
+        }
+        if archetypeT4 == .trueSupporter && (topologyT4 == .benevolentGuardian || topologyT4 == .acquaintedObserver) {
+            return RelationalTrajectorySpec(type: .steadyLightSupport, terminalUtteranceKind: "NONE", retained30d: true, retained90d: true)
+        }
+        return RelationalTrajectorySpec(type: .casualSurface, terminalUtteranceKind: "NONE", retained30d: true, retained90d: r4 >= 2)
+    }
+}
+
 /// Subband relational dynamics metrics, Pentagon scores, and Latent Harmonization outputs (`Phase 4 & 5 Section 2 & 3`).
 public struct RelationalDynamicsMetrics: Sendable, Equatable {
     public let dLL: Float
@@ -197,7 +419,7 @@ public struct RelationalDynamicsMetrics: Sendable, Equatable {
     public let llPreservationError: Float
 }
 
-/// Specification for a multi-turn ($T_1 \to T_4$) relational dialogue dynamics case (`Phase 5 Section 2 & 4`), loadable from dataset JSON.
+/// Specification for a multi-turn ($T_1 \to T_4$) relational dialogue dynamics case (`v5`), loadable from dataset JSON/JSONL.
 public struct RelationalDialogueCase: Codable, Sendable, Equatable {
     public let id: String
     public let group: String
@@ -216,6 +438,12 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
     public let insightLevel0: String
     public let insightLevel1: String
     public let insightLevel2: String
+    public let observationsT2: RelationalObservations
+    public let observationsT4: RelationalObservations
+    public let emotionT2: EmotionalGradation
+    public let emotionT4: EmotionalGradation
+    public let temporalContext: TemporalRelationalContext
+    public let trajectory: RelationalTrajectorySpec
     public let isZeroShotUnseen: Bool
 
     private enum CodingKeys: String, CodingKey {
@@ -236,6 +464,12 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         case insightLevel0
         case insightLevel1
         case insightLevel2
+        case observationsT2
+        case observationsT4
+        case emotionT2
+        case emotionT4
+        case temporalContext
+        case trajectory
         case isZeroShotUnseen
     }
 
@@ -280,15 +514,23 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         insightLevel0: String,
         insightLevel1: String,
         insightLevel2: String,
+        observationsT2: RelationalObservations? = nil,
+        observationsT4: RelationalObservations? = nil,
+        emotionT2: EmotionalGradation? = nil,
+        emotionT4: EmotionalGradation? = nil,
+        temporalContext: TemporalRelationalContext = .neutralDefault,
+        trajectory: RelationalTrajectorySpec? = nil,
         isZeroShotUnseen: Bool = false
     ) {
+        let t2Topo = expectedTopologyT2 ?? expectedTopology
+        let t2Arch = expectedArchetypeT2 ?? expectedArchetype
         self.id = id
         self.group = group
         self.personaStyle = personaStyle
         self.topicDomain = topicDomain
         self.title = title
-        self.expectedTopologyT2 = expectedTopologyT2 ?? expectedTopology
-        self.expectedArchetypeT2 = expectedArchetypeT2 ?? expectedArchetype
+        self.expectedTopologyT2 = t2Topo
+        self.expectedArchetypeT2 = t2Arch
         self.expectedTopology = expectedTopology
         self.expectedArchetype = expectedArchetype
         self.hostText = hostText
@@ -303,6 +545,12 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         self.insightLevel0 = insightLevel0
         self.insightLevel1 = insightLevel1
         self.insightLevel2 = insightLevel2
+        self.observationsT2 = observationsT2 ?? .inferredDefault(archetype: t2Arch, topology: t2Topo)
+        self.observationsT4 = observationsT4 ?? .inferredDefault(archetype: expectedArchetype, topology: expectedTopology)
+        self.emotionT2 = emotionT2 ?? .inferredDefault(archetype: t2Arch, topology: t2Topo)
+        self.emotionT4 = emotionT4 ?? .inferredDefault(archetype: expectedArchetype, topology: expectedTopology)
+        self.temporalContext = temporalContext
+        self.trajectory = trajectory ?? .inferredDefault(archetypeT2: t2Arch, topologyT2: t2Topo, archetypeT4: expectedArchetype, topologyT4: expectedTopology)
         self.isZeroShotUnseen = isZeroShotUnseen
     }
 
@@ -317,8 +565,10 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         let archT4 = try container.decode(RelationalArchetype.self, forKey: .expectedArchetype)
         self.expectedTopology = topoT4
         self.expectedArchetype = archT4
-        self.expectedTopologyT2 = (try? container.decode(RelationalTopology.self, forKey: .expectedTopologyT2)) ?? topoT4
-        self.expectedArchetypeT2 = (try? container.decode(RelationalArchetype.self, forKey: .expectedArchetypeT2)) ?? archT4
+        let topoT2 = (try? container.decode(RelationalTopology.self, forKey: .expectedTopologyT2)) ?? topoT4
+        let archT2 = (try? container.decode(RelationalArchetype.self, forKey: .expectedArchetypeT2)) ?? archT4
+        self.expectedTopologyT2 = topoT2
+        self.expectedArchetypeT2 = archT2
         let hText = try container.decode(String.self, forKey: .hostText)
         self.hostText = hText
         if let early = try? container.decode(String.self, forKey: .hostEarlyText), !early.isEmpty {
@@ -332,6 +582,17 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
         self.insightLevel0 = try container.decode(String.self, forKey: .insightLevel0)
         self.insightLevel1 = try container.decode(String.self, forKey: .insightLevel1)
         self.insightLevel2 = try container.decode(String.self, forKey: .insightLevel2)
+        self.observationsT2 = (try? container.decode(RelationalObservations.self, forKey: .observationsT2))
+            ?? .inferredDefault(archetype: archT2, topology: topoT2)
+        self.observationsT4 = (try? container.decode(RelationalObservations.self, forKey: .observationsT4))
+            ?? .inferredDefault(archetype: archT4, topology: topoT4)
+        self.emotionT2 = (try? container.decode(EmotionalGradation.self, forKey: .emotionT2))
+            ?? .inferredDefault(archetype: archT2, topology: topoT2)
+        self.emotionT4 = (try? container.decode(EmotionalGradation.self, forKey: .emotionT4))
+            ?? .inferredDefault(archetype: archT4, topology: topoT4)
+        self.temporalContext = (try? container.decode(TemporalRelationalContext.self, forKey: .temporalContext)) ?? .neutralDefault
+        self.trajectory = (try? container.decode(RelationalTrajectorySpec.self, forKey: .trajectory))
+            ?? .inferredDefault(archetypeT2: archT2, topologyT2: topoT2, archetypeT4: archT4, topologyT4: topoT4)
         self.isZeroShotUnseen = (try? container.decode(Bool.self, forKey: .isZeroShotUnseen)) ?? false
     }
 

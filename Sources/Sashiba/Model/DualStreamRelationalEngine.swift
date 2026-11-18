@@ -75,7 +75,7 @@ public struct RelationalAuditTelemetry: Codable, Sendable, Equatable {
     }
 }
 
-/// Container for calibrated `v4` (`z_rel` 128D) and `v4_hybrid` (160D) linear classification heads serialized alongside model weights.
+/// Container for calibrated `v5` (`z_rel` 128D) and `v5_hybrid` (160D / 350D) classification & gradation heads serialized alongside model weights.
 public struct RelationalCalibratedHeads: Codable, Sendable, Equatable {
     public var archetypeT4: SoftmaxClassifierHead?
     public var topologyT4: SoftmaxClassifierHead?
@@ -85,6 +85,22 @@ public struct RelationalCalibratedHeads: Codable, Sendable, Equatable {
     public var hybridTopologyT4: SoftmaxClassifierHead?
     public var hybridArchetypeT2: SoftmaxClassifierHead?
     public var hybridTopologyT2: SoftmaxClassifierHead?
+    public var affectionT4: SoftmaxClassifierHead?
+    public var frictionT4: SoftmaxClassifierHead?
+    public var arousalT4: SoftmaxClassifierHead?
+    public var affectionT2: SoftmaxClassifierHead?
+    public var frictionT2: SoftmaxClassifierHead?
+    public var arousalT2: SoftmaxClassifierHead?
+    public var hybridAffectionT4: SoftmaxClassifierHead?
+    public var hybridFrictionT4: SoftmaxClassifierHead?
+    public var hybridArousalT4: SoftmaxClassifierHead?
+    public var hybridAffectionT2: SoftmaxClassifierHead?
+    public var hybridFrictionT2: SoftmaxClassifierHead?
+    public var hybridArousalT2: SoftmaxClassifierHead?
+    public var trajectoryTextHead: SoftmaxClassifierHead?
+    public var trajectoryFullHead: SoftmaxClassifierHead?
+    public var retained30dHead: SoftmaxClassifierHead?
+    public var retained90dHead: SoftmaxClassifierHead?
 
     public init(
         archetypeT4: SoftmaxClassifierHead? = nil,
@@ -94,7 +110,23 @@ public struct RelationalCalibratedHeads: Codable, Sendable, Equatable {
         hybridArchetypeT4: SoftmaxClassifierHead? = nil,
         hybridTopologyT4: SoftmaxClassifierHead? = nil,
         hybridArchetypeT2: SoftmaxClassifierHead? = nil,
-        hybridTopologyT2: SoftmaxClassifierHead? = nil
+        hybridTopologyT2: SoftmaxClassifierHead? = nil,
+        affectionT4: SoftmaxClassifierHead? = nil,
+        frictionT4: SoftmaxClassifierHead? = nil,
+        arousalT4: SoftmaxClassifierHead? = nil,
+        affectionT2: SoftmaxClassifierHead? = nil,
+        frictionT2: SoftmaxClassifierHead? = nil,
+        arousalT2: SoftmaxClassifierHead? = nil,
+        hybridAffectionT4: SoftmaxClassifierHead? = nil,
+        hybridFrictionT4: SoftmaxClassifierHead? = nil,
+        hybridArousalT4: SoftmaxClassifierHead? = nil,
+        hybridAffectionT2: SoftmaxClassifierHead? = nil,
+        hybridFrictionT2: SoftmaxClassifierHead? = nil,
+        hybridArousalT2: SoftmaxClassifierHead? = nil,
+        trajectoryTextHead: SoftmaxClassifierHead? = nil,
+        trajectoryFullHead: SoftmaxClassifierHead? = nil,
+        retained30dHead: SoftmaxClassifierHead? = nil,
+        retained90dHead: SoftmaxClassifierHead? = nil
     ) {
         self.archetypeT4 = archetypeT4
         self.topologyT4 = topologyT4
@@ -104,6 +136,22 @@ public struct RelationalCalibratedHeads: Codable, Sendable, Equatable {
         self.hybridTopologyT4 = hybridTopologyT4
         self.hybridArchetypeT2 = hybridArchetypeT2
         self.hybridTopologyT2 = hybridTopologyT2
+        self.affectionT4 = affectionT4
+        self.frictionT4 = frictionT4
+        self.arousalT4 = arousalT4
+        self.affectionT2 = affectionT2
+        self.frictionT2 = frictionT2
+        self.arousalT2 = arousalT2
+        self.hybridAffectionT4 = hybridAffectionT4
+        self.hybridFrictionT4 = hybridFrictionT4
+        self.hybridArousalT4 = hybridArousalT4
+        self.hybridAffectionT2 = hybridAffectionT2
+        self.hybridFrictionT2 = hybridFrictionT2
+        self.hybridArousalT2 = hybridArousalT2
+        self.trajectoryTextHead = trajectoryTextHead
+        self.trajectoryFullHead = trajectoryFullHead
+        self.retained30dHead = retained30dHead
+        self.retained90dHead = retained90dHead
     }
 
     public func serialize() -> String {
@@ -124,7 +172,7 @@ public struct RelationalCalibratedHeads: Codable, Sendable, Equatable {
     }
 }
 
-/// Output of Dual-Stream Relational Inference (`v4` `z_rel` + `v4_hybrid` `160D` descriptor) taking only `(senderTokenIDs: [Int], receiverTokenIDs: [Int])`.
+/// Output of Dual-Stream Relational Inference (`v5` `z_rel` + `v5_hybrid` `160D` descriptor) taking only `(senderTokenIDs: [Int], receiverTokenIDs: [Int])`.
 public struct RelationalInferenceOutput: Sendable, Equatable {
     public let zRel: [Float]          // [128] = [z_LL^rel(64) ; z_HH^rel(64)]
     public let hybridFeatures: [Float]// [160] = z_rel(128) + subbandGeom(8) + echoAndPentagon(8) + rhythm(16)
@@ -145,6 +193,10 @@ public struct RelationalInferenceOutput: Sendable, Equatable {
     public let hybridPredictedTopologyT4: RelationalTopology
     public let hybridPredictedArchetypeT2: RelationalArchetype
     public let hybridPredictedTopologyT2: RelationalTopology
+    public let predictedEmotionT4: EmotionalGradation
+    public let predictedEmotionT2: EmotionalGradation
+    public let hybridPredictedEmotionT4: EmotionalGradation
+    public let hybridPredictedEmotionT2: EmotionalGradation
     public let pentagon: RelationalPentagonScores
     public let sLL: Float
     public let sHH: Float
@@ -510,11 +562,23 @@ public enum DualStreamRelationalEngine {
         archetype: RelationalArchetype,
         topology: RelationalTopology,
         latentDim: Int = SWTHawkShape.relationalLatentDim,
-        isEarlyT2: Bool = false
+        isEarlyT2: Bool = false,
+        emotion: EmotionalGradation? = nil
     ) -> [Float] {
         let half = latentDim / 2
         let quarter = half / 2
-        let geom = targetSubbandGeometry(archetype: archetype, topology: topology)
+        let rawGeom = targetSubbandGeometry(archetype: archetype, topology: topology)
+        let geom: (sLL: Float, sHH: Float, rHH: Float)
+        if let em = emotion {
+            let affNorm = (Float(em.affection) - 2.0) * 0.5
+            let fricNorm = Float(em.friction) * 0.25
+            let sLL = max(-0.95, min(0.98, rawGeom.sLL + 0.035 * affNorm - 0.025 * fricNorm))
+            let sHH = max(-0.96, min(0.96, rawGeom.sHH + 0.040 * affNorm - 0.065 * fricNorm))
+            let rHH = max(0.16, min(1.95, rawGeom.rHH + 0.080 * (em.arousal - 0.50)))
+            geom = (sLL: sLL, sHH: sHH, rHH: rHH)
+        } else {
+            geom = rawGeom
+        }
         let archIdx = RelationalArchetype.allCases.firstIndex(of: archetype) ?? 0
         let topoIdx = RelationalTopology.allCases.firstIndex(of: topology) ?? 0
         let phaseSalt: UInt64 = isEarlyT2 ? 0x0055_AA55_0055_AA55 : 0
@@ -1861,7 +1925,61 @@ public enum DualStreamRelationalEngine {
         return out
     }
 
-    /// Builds the inference output (pentagon + `v4` & `v4_hybrid` calibrated head predictions).
+    /// Predicts `(affection, friction, arousal)` from calibrated emotion heads (falling back to cell default if uncalibrated).
+    public static func predictEmotionFromHeads(
+        features: [Float],
+        affectionHead: SoftmaxClassifierHead?,
+        frictionHead: SoftmaxClassifierHead?,
+        arousalHead: SoftmaxClassifierHead?,
+        fallbackArchetype: RelationalArchetype,
+        fallbackTopology: RelationalTopology
+    ) -> EmotionalGradation {
+        guard let ha = affectionHead, let hf = frictionHead, let hr = arousalHead,
+              ha.featureDim == features.count,
+              hf.featureDim == features.count,
+              hr.featureDim == features.count else {
+            return .inferredDefault(archetype: fallbackArchetype, topology: fallbackTopology)
+        }
+        return EmotionalGradation(
+            affection: ha.predict(features),
+            friction: hf.predict(features),
+            arousal: hr.expectedValue(features, binValues: SoftmaxClassifierHead.arousalBinCenters)
+        )
+    }
+
+    /// §3.1 Counterfactual terminal-utterance operator (`最後の一言の終端効果テスト`):
+    /// moves the final sentence of a multi-sentence dialogue log (`[s1, s2, ..., s_n]`, `n >= 3`) to the middle
+    /// (`[s1, s_n, s2, ..., s_{n-1}]`) while preserving exact character multiset and opening sentence `s1`.
+    public static func counterfactualMoveLastSentenceToMiddle(_ text: String) -> String {
+        let terminators: Set<Character> = ["。", "！", "？", "!", "?"]
+        var sentences: [String] = []
+        var buf = ""
+        for ch in text {
+            buf.append(ch)
+            if terminators.contains(ch) {
+                if !buf.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    sentences.append(buf)
+                }
+                buf = ""
+            }
+        }
+        let tail = buf.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty {
+            sentences.append(buf)
+        }
+        guard sentences.count >= 3 else {
+            if sentences.count == 2 {
+                return sentences[1] + sentences[0]
+            }
+            return text
+        }
+        let last = sentences[sentences.count - 1]
+        var reordered: [String] = [sentences[0], last]
+        reordered.append(contentsOf: sentences[1..<(sentences.count - 1)])
+        return reordered.joined()
+    }
+
+    /// Builds the inference output (pentagon + `v5` & `v5_hybrid` calibrated head & emotional gradation predictions).
     public static func makeInferenceOutput(
         zRel: [Float],
         hybridFeatures: [Float],
@@ -1873,6 +1991,23 @@ public enum DualStreamRelationalEngine {
         let c2 = classifyFromZRel(zRel: zRel, isEarlyT2: true, weights: weights)
         let hc4 = classifyFromHybrid(hybridFeatures: hybridFeatures, zRel: zRel, isEarlyT2: false, weights: weights)
         let hc2 = classifyFromHybrid(hybridFeatures: hybridFeatures, zRel: zRel, isEarlyT2: true, weights: weights)
+        let cal = weights.calibratedHeads
+        let em4 = predictEmotionFromHeads(
+            features: zRel, affectionHead: cal.affectionT4, frictionHead: cal.frictionT4, arousalHead: cal.arousalT4,
+            fallbackArchetype: c4.archetype, fallbackTopology: c4.topology
+        )
+        let em2 = predictEmotionFromHeads(
+            features: zRel, affectionHead: cal.affectionT2, frictionHead: cal.frictionT2, arousalHead: cal.arousalT2,
+            fallbackArchetype: c2.archetype, fallbackTopology: c2.topology
+        )
+        let hem4 = predictEmotionFromHeads(
+            features: hybridFeatures, affectionHead: cal.hybridAffectionT4, frictionHead: cal.hybridFrictionT4, arousalHead: cal.hybridArousalT4,
+            fallbackArchetype: hc4.archetype, fallbackTopology: hc4.topology
+        )
+        let hem2 = predictEmotionFromHeads(
+            features: hybridFeatures, affectionHead: cal.hybridAffectionT2, frictionHead: cal.hybridFrictionT2, arousalHead: cal.hybridArousalT2,
+            fallbackArchetype: hc2.archetype, fallbackTopology: hc2.topology
+        )
         return RelationalInferenceOutput(
             zRel: zRel,
             hybridFeatures: hybridFeatures,
@@ -1893,6 +2028,10 @@ public enum DualStreamRelationalEngine {
             hybridPredictedTopologyT4: hc4.topology,
             hybridPredictedArchetypeT2: hc2.archetype,
             hybridPredictedTopologyT2: hc2.topology,
+            predictedEmotionT4: em4,
+            predictedEmotionT2: em2,
+            hybridPredictedEmotionT4: hem4,
+            hybridPredictedEmotionT2: hem2,
             pentagon: p.pentagon,
             sLL: p.sLL,
             sHH: p.sHH,

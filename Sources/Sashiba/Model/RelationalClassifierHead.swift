@@ -202,6 +202,13 @@ public struct SoftmaxClassifierHead: Codable, Sendable, Equatable {
         return Self.softmax(logits)
     }
 
+    public static let arousalBinCenters: [Float] = [0.10, 0.30, 0.50, 0.70, 0.90]
+
+    public static func arousalBin(_ arousal: Float) -> Int {
+        let clamped = max(0.0, min(0.9999, arousal))
+        return min(4, max(0, Int(floorf(clamped * 5.0))))
+    }
+
     public func predict(_ x: [Float]) -> Int {
         let p = probabilities(x)
         var best = 0
@@ -209,6 +216,16 @@ public struct SoftmaxClassifierHead: Codable, Sendable, Equatable {
             best = c
         }
         return best
+    }
+
+    public func expectedValue(_ x: [Float], binValues: [Float]? = nil) -> Float {
+        let p = probabilities(x)
+        var s: Float = 0.0
+        for c in 0..<p.count {
+            let v = (binValues != nil && c < binValues!.count) ? binValues![c] : Float(c)
+            s += p[c] * v
+        }
+        return s
     }
 
     static func softmax(_ logits: [Float]) -> [Float] {
@@ -277,8 +294,8 @@ public struct SoftmaxClassifierHead: Codable, Sendable, Equatable {
         }
 
         let candidates: [(l2: Float, bal: Bool)] = [
-            (0.01, false), (0.06, false), (0.35, false),
-            (0.01, true),  (0.06, true),  (0.35, true)
+            (0.03, false), (0.15, false), (0.60, false),
+            (0.03, true),  (0.15, true),  (0.60, true)
         ]
         let rawScores = UnsafeMutablePointer<Float>.allocate(capacity: candidates.count)
         rawScores.initialize(repeating: -1e9, count: candidates.count)
@@ -475,6 +492,115 @@ public struct RelationalHybridFeatureExtractor: Sendable {
         out.append(contentsOf: geomFeats)
         out.append(contentsOf: echoFeats)
         out.append(contentsOf: rhythmFeats)
+        return out
+    }
+
+    /// Relative-baseline temporal cadence features (`14D`, `v5` Section 2.1–2.3):
+    /// normalizes pair reply lag and initiation ratio against the actor's multi-partner baseline.
+    public static func extractTemporalContextFeatures(_ temporal: TemporalRelationalContext) -> [Float] {
+        let baseLag = max(0.05, temporal.actorBaselineReplyHours)
+        let lag2 = max(0.05, temporal.replyLagHoursT2)
+        let lag4 = max(0.05, temporal.replyLagHoursT4)
+        let relLag2 = logf((1.0 + lag2) / (1.0 + baseLag))
+        let relLag4 = logf((1.0 + lag4) / (1.0 + baseLag))
+        let lagAccel = logf((1.0 + lag4) / (1.0 + lag2))
+        let relInit2 = temporal.initiationRatioT2 - temporal.actorBaselineInitRatio
+        let relInit4 = temporal.initiationRatioT4 - temporal.actorBaselineInitRatio
+        let initDelta = temporal.initiationRatioT4 - temporal.initiationRatioT2
+        let logGap = logf(1.0 + max(0.0, temporal.gapDaysT2ToT3))
+        let evFlag: Float = temporal.eventDriven ? 1.0 : 0.0
+        let probeFlag: Float = temporal.postT4UnansweredProbe ? 1.0 : 0.0
+        let gapResumedFlag: Float = (temporal.gapDaysT2ToT3 >= 10.0 && !temporal.postT4UnansweredProbe && lag4 <= max(12.0, 2.2 * baseLag)) ? 1.0 : 0.0
+        return [
+            logf(1.0 + lag2),
+            logf(1.0 + lag4),
+            relLag2,
+            relLag4,
+            lagAccel,
+            temporal.initiationRatioT2,
+            temporal.initiationRatioT4,
+            relInit2,
+            relInit4,
+            initDelta,
+            logGap,
+            evFlag,
+            probeFlag,
+            gapResumedFlag
+        ]
+    }
+
+    /// Pure text-transition trajectory feature vector (`336D` for `z_rel ∈ R^128`): `[hybridT2(160); hybridT4(160); deltaSummary(16)]`.
+    public static func extractTrajectoryTextFeatures(
+        hybridT2: [Float],
+        hybridT4: [Float],
+        zT2: [Float],
+        zT4: [Float]
+    ) -> [Float] {
+        let dim = min(zT2.count, zT4.count)
+        let half = dim / 2
+        var dSq: Float = 0.0
+        var dLLSq: Float = 0.0
+        var dHHSq: Float = 0.0
+        var dotLL: Float = 0.0, nLL2: Float = 0.0, nLL4: Float = 0.0
+        var dotHH: Float = 0.0, nHH2: Float = 0.0, nHH4: Float = 0.0
+        for i in 0..<dim {
+            let d = zT4[i] - zT2[i]
+            dSq += d * d
+            if i < half {
+                dLLSq += d * d
+                dotLL += zT2[i] * zT4[i]
+                nLL2 += zT2[i] * zT2[i]
+                nLL4 += zT4[i] * zT4[i]
+            } else {
+                dHHSq += d * d
+                dotHH += zT2[i] * zT4[i]
+                nHH2 += zT2[i] * zT2[i]
+                nHH4 += zT4[i] * zT4[i]
+            }
+        }
+        let cosLL = dotLL / (sqrtf(max(nLL2, 1e-12)) * sqrtf(max(nLL4, 1e-12)) + 1e-6)
+        let cosHH = dotHH / (sqrtf(max(nHH2, 1e-12)) * sqrtf(max(nHH4, 1e-12)) + 1e-6)
+        func delta(_ idx: Int) -> Float {
+            guard idx < hybridT2.count && idx < hybridT4.count else { return 0.0 }
+            return hybridT4[idx] - hybridT2[idx]
+        }
+        let b = zT4.count
+        let deltaSummary: [Float] = [
+            sqrtf(dSq),
+            sqrtf(dLLSq),
+            sqrtf(dHHSq),
+            cosLL,
+            cosHH,
+            delta(b + 0),  // sLL delta
+            delta(b + 1),  // sHH delta
+            delta(b + 2),  // rHH delta
+            delta(b + 12), // contextDepth delta * 0.01
+            delta(b + 13), // empathicResonance delta * 0.01
+            delta(b + 14), // communicativeHarmony delta * 0.01
+            delta(b + 15), // boundaryStability delta * 0.01
+            delta(b + 17), // log receiver length delta
+            delta(b + 8),  // rareEchoRecall delta
+            delta(b + 23), // receiver question rate delta
+            delta(b + 26)  // receiver exclamation rate delta
+        ]
+        var out: [Float] = []
+        out.reserveCapacity(hybridT2.count + hybridT4.count + deltaSummary.count)
+        out.append(contentsOf: hybridT2)
+        out.append(contentsOf: hybridT4)
+        out.append(contentsOf: deltaSummary)
+        return out
+    }
+
+    /// Full `v5_hybrid` trajectory & retention feature vector (`350D` = `336D` text transition + `14D` relative temporal context).
+    public static func extractTrajectoryFullFeatures(
+        hybridT2: [Float],
+        hybridT4: [Float],
+        zT2: [Float],
+        zT4: [Float],
+        temporal: TemporalRelationalContext
+    ) -> [Float] {
+        var out = extractTrajectoryTextFeatures(hybridT2: hybridT2, hybridT4: hybridT4, zT2: zT2, zT4: zT4)
+        out.append(contentsOf: extractTemporalContextFeatures(temporal))
         return out
     }
 }

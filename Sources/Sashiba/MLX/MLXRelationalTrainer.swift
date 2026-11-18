@@ -13,6 +13,7 @@ public struct RelationalTrainingPair: Sendable {
     public let isEarlyT2: Bool
     public let groupKey: String
     public let uniquenessWeight: Float
+    public let emotion: EmotionalGradation?
 
     public init(
         senderTokens: [Int],
@@ -21,7 +22,8 @@ public struct RelationalTrainingPair: Sendable {
         topology: Int,
         isEarlyT2: Bool,
         groupKey: String,
-        uniquenessWeight: Float = 1.0
+        uniquenessWeight: Float = 1.0,
+        emotion: EmotionalGradation? = nil
     ) {
         self.senderTokens = senderTokens
         self.receiverTokens = receiverTokens
@@ -30,6 +32,7 @@ public struct RelationalTrainingPair: Sendable {
         self.isEarlyT2 = isEarlyT2
         self.groupKey = groupKey
         self.uniquenessWeight = uniquenessWeight
+        self.emotion = emotion
     }
 }
 
@@ -216,18 +219,15 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         let ones2D = MLXArray.ones([2 * d])
         let zeros2D = MLXArray.zeros([2 * d])
 
-        // Precompute target prototypes for L_metric
-        var protoCache: [Int: [Float]] = [:]
-        func prototype(_ a: Int, _ t: Int, _ isEarly: Bool = false) -> [Float] {
-            let key = (isEarly ? 1024 : 0) + a * 16 + t
-            if let p = protoCache[key] {
-                return p
-            }
-            let p = DualStreamRelationalEngine.targetPrototype(
-                archetype: archCases[a], topology: topoCases[t], latentDim: lDim, isEarlyT2: isEarly
+        // Precompute continuous emotion-modulated target prototypes for L_metric
+        let rowProtos: [[Float]] = pairs.map { p in
+            DualStreamRelationalEngine.targetPrototype(
+                archetype: archCases[p.archetype],
+                topology: topoCases[p.topology],
+                latentDim: lDim,
+                isEarlyT2: p.isEarlyT2,
+                emotion: p.emotion
             )
-            protoCache[key] = p
-            return p
         }
 
         let initial = snapshotAuditedParameters()
@@ -483,8 +483,8 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
 
                 var protoFlat = [Float]()
                 protoFlat.reserveCapacity(n * lDim)
-                for p in batch {
-                    protoFlat.append(contentsOf: prototype(p.archetype, p.topology, p.isEarlyT2))
+                for idx in idxs {
+                    protoFlat.append(contentsOf: rowProtos[idx])
                 }
 
                 var cfRows: [RelationalCounterfactualPair] = []
@@ -725,6 +725,7 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
         topoT2: [Int],
         hybridT4: [[Float]]? = nil,
         hybridT2: [[Float]]? = nil,
+        cases: [RelationalDialogueCase]? = nil,
         groups: [String]? = nil,
         uniquenessWeights: [Float]? = nil,
         steps: Int = 350,
@@ -751,9 +752,9 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
                 groupFold[g] = idx % 3
             }
             let foldOfRow = gList.map { groupFold[$0] ?? 0 }
-            let candidates: [Float] = [0.005, 0.02, 0.08, 0.25, 0.80, 2.0]
+            let candidates: [Float] = [0.45, 0.90, 1.80, 3.20]
             let balCandidates: [Float] = [0.0, 0.25]
-            var bestL2 = candidates[2]
+            var bestL2 = candidates[1]
             var bestBal: Float = 0.0
             var bestScore: Float = -1.0
 
@@ -821,6 +822,65 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
             SoftmaxClassifierHead.trainGroupCV(features: h2, labels: topoT2, groups: gArr, classCount: RelationalTopology.allCases.count, steps: steps)
         } else { nil }
 
+        var aff4Head: SoftmaxClassifierHead? = nil
+        var fric4Head: SoftmaxClassifierHead? = nil
+        var ar4Head: SoftmaxClassifierHead? = nil
+        var aff2Head: SoftmaxClassifierHead? = nil
+        var fric2Head: SoftmaxClassifierHead? = nil
+        var ar2Head: SoftmaxClassifierHead? = nil
+        var hAff4Head: SoftmaxClassifierHead? = nil
+        var hFric4Head: SoftmaxClassifierHead? = nil
+        var hAr4Head: SoftmaxClassifierHead? = nil
+        var hAff2Head: SoftmaxClassifierHead? = nil
+        var hFric2Head: SoftmaxClassifierHead? = nil
+        var hAr2Head: SoftmaxClassifierHead? = nil
+        var trajTextH: SoftmaxClassifierHead? = nil
+        var trajFullH: SoftmaxClassifierHead? = nil
+        var ret30H: SoftmaxClassifierHead? = nil
+        var ret90H: SoftmaxClassifierHead? = nil
+
+        if let cs = cases, cs.count == zRelT4.count && cs.count == zRelT2.count {
+            let yAff4 = cs.map { max(0, min(4, $0.emotionT4.affection)) }
+            let yFric4 = cs.map { max(0, min(4, $0.emotionT4.friction)) }
+            let yAr4 = cs.map { SoftmaxClassifierHead.arousalBin($0.emotionT4.arousal) }
+            let yAff2 = cs.map { max(0, min(4, $0.emotionT2.affection)) }
+            let yFric2 = cs.map { max(0, min(4, $0.emotionT2.friction)) }
+            let yAr2 = cs.map { SoftmaxClassifierHead.arousalBin($0.emotionT2.arousal) }
+
+            aff4Head = SoftmaxClassifierHead.trainGroupCV(features: zRelT4, labels: yAff4, groups: gArr, classCount: 5, steps: steps)
+            fric4Head = SoftmaxClassifierHead.trainGroupCV(features: zRelT4, labels: yFric4, groups: gArr, classCount: 5, steps: steps)
+            ar4Head = SoftmaxClassifierHead.trainGroupCV(features: zRelT4, labels: yAr4, groups: gArr, classCount: 5, steps: steps)
+            aff2Head = SoftmaxClassifierHead.trainGroupCV(features: zRelT2, labels: yAff2, groups: gArr, classCount: 5, steps: steps)
+            fric2Head = SoftmaxClassifierHead.trainGroupCV(features: zRelT2, labels: yFric2, groups: gArr, classCount: 5, steps: steps)
+            ar2Head = SoftmaxClassifierHead.trainGroupCV(features: zRelT2, labels: yAr2, groups: gArr, classCount: 5, steps: steps)
+
+            if let h4 = hybridT4, let h2 = hybridT2, h4.count == cs.count && h2.count == cs.count {
+                hAff4Head = SoftmaxClassifierHead.trainGroupCV(features: h4, labels: yAff4, groups: gArr, classCount: 5, steps: steps)
+                hFric4Head = SoftmaxClassifierHead.trainGroupCV(features: h4, labels: yFric4, groups: gArr, classCount: 5, steps: steps)
+                hAr4Head = SoftmaxClassifierHead.trainGroupCV(features: h4, labels: yAr4, groups: gArr, classCount: 5, steps: steps)
+                hAff2Head = SoftmaxClassifierHead.trainGroupCV(features: h2, labels: yAff2, groups: gArr, classCount: 5, steps: steps)
+                hFric2Head = SoftmaxClassifierHead.trainGroupCV(features: h2, labels: yFric2, groups: gArr, classCount: 5, steps: steps)
+                hAr2Head = SoftmaxClassifierHead.trainGroupCV(features: h2, labels: yAr2, groups: gArr, classCount: 5, steps: steps)
+
+                let trajCases = RelationalTrajectoryType.allCases
+                let yTraj = cs.map { trajCases.firstIndex(of: $0.trajectory.type) ?? 0 }
+                let yRet30 = cs.map { $0.trajectory.retained30d ? 1 : 0 }
+                let yRet90 = cs.map { $0.trajectory.retained90d ? 1 : 0 }
+                let xTrajText = cs.indices.map { i in
+                    RelationalHybridFeatureExtractor.extractTrajectoryTextFeatures(hybridT2: h2[i], hybridT4: h4[i], zT2: zRelT2[i], zT4: zRelT4[i])
+                }
+                let xTrajFull = cs.indices.map { i in
+                    RelationalHybridFeatureExtractor.extractTrajectoryFullFeatures(
+                        hybridT2: h2[i], hybridT4: h4[i], zT2: zRelT2[i], zT4: zRelT4[i], temporal: cs[i].temporalContext
+                    )
+                }
+                trajTextH = SoftmaxClassifierHead.trainGroupCV(features: xTrajText, labels: yTraj, groups: gArr, classCount: trajCases.count, steps: steps)
+                trajFullH = SoftmaxClassifierHead.trainGroupCV(features: xTrajFull, labels: yTraj, groups: gArr, classCount: trajCases.count, steps: steps)
+                ret30H = SoftmaxClassifierHead.trainGroupCV(features: xTrajFull, labels: yRet30, groups: gArr, classCount: 2, steps: steps)
+                ret90H = SoftmaxClassifierHead.trainGroupCV(features: xTrajFull, labels: yRet90, groups: gArr, classCount: 2, steps: steps)
+            }
+        }
+
         let heads = RelationalCalibratedHeads(
             archetypeT4: fitWithGroupCV(features: zRelT4, labels: archT4, classCount: RelationalArchetype.allCases.count),
             topologyT4: fitWithGroupCV(features: zRelT4, labels: topoT4, classCount: RelationalTopology.allCases.count),
@@ -829,7 +889,23 @@ public final class MLXRelationalTrainer: @unchecked Sendable {
             hybridArchetypeT4: hybA4,
             hybridTopologyT4: hybT4,
             hybridArchetypeT2: hybA2,
-            hybridTopologyT2: hybT2
+            hybridTopologyT2: hybT2,
+            affectionT4: aff4Head,
+            frictionT4: fric4Head,
+            arousalT4: ar4Head,
+            affectionT2: aff2Head,
+            frictionT2: fric2Head,
+            arousalT2: ar2Head,
+            hybridAffectionT4: hAff4Head,
+            hybridFrictionT4: hFric4Head,
+            hybridArousalT4: hAr4Head,
+            hybridAffectionT2: hAff2Head,
+            hybridFrictionT2: hFric2Head,
+            hybridArousalT2: hAr2Head,
+            trajectoryTextHead: trajTextH,
+            trajectoryFullHead: trajFullH,
+            retained30dHead: ret30H,
+            retained90dHead: ret90H
         )
         model.relational.calibratedHeads = heads
     }

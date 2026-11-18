@@ -16,6 +16,7 @@ struct RelationalHeadCLI {
     var relLR: Float = 1.4e-3
     var skipFolds: Bool = true
     var useGPU: Bool = false
+    var recalibrate: Bool = false
 
     static func parse(_ args: [String]) -> RelationalHeadCLI {
         var cli = RelationalHeadCLI()
@@ -55,6 +56,8 @@ struct RelationalHeadCLI {
                 cli.useGPU = true
             case "--cpu":
                 cli.useGPU = false
+            case "--recalibrate":
+                cli.recalibrate = true
             default:
                 break
             }
@@ -106,7 +109,7 @@ let seqLen = allCases
     .reduce(4, max)
 
 print("==================================================================")
-print("Relational Head Evaluation [v4 & v4_hybrid] (Mode: \(cli.useGPU ? "GPU" : "Pure Multi-Core CPU (0 GPU VRAM)"))")
+print("Relational Head Evaluation [v5 & v5_hybrid] (Mode: \(cli.useGPU ? "GPU" : "Pure Multi-Core CPU (0 GPU VRAM)"))")
 print("==================================================================")
 print("Train cases: \(trainCasesAll.count) | Unseen cases: \(unseenCasesAll.count) | seqLen: \(seqLen)")
 
@@ -229,14 +232,30 @@ let hybridT4All = allCases.indices.map { i in
     hybridExtractor.extract(senderTokens: hostTok[i], receiverTokens: currentTok[i], zRel: zT4All[i], weights: weights)
 }
 
+let trainGroups = trainIndices.map { allCases[$0].group }
+var didCalibrateHybrid = false
 var splitResults: [EvalResult] = []
 var predictionsA: [String: [String: Int]] = [:]
 for task in tasks {
-    guard let h = zHead(weights.relational.calibratedHeads, task) else {
+    let z = task.useEarlyText ? zT2All : zT4All
+    let h: SoftmaxClassifierHead
+    if !cli.recalibrate, let existing = zHead(weights.relational.calibratedHeads, task) {
+        h = existing
+    } else if cli.recalibrate {
+        let trX = trainIndices.map { z[$0] }
+        let trY = trainIndices.map { task.label(allCases[$0]) }
+        h = SoftmaxClassifierHead.trainGroupCV(features: trX, labels: trY, groups: trainGroups, classCount: task.classNames.count, steps: cli.steps)
+        switch task.name {
+        case "archetype_t4": weights.relational.calibratedHeads.archetypeT4 = h
+        case "topology_t4": weights.relational.calibratedHeads.topologyT4 = h
+        case "archetype_t2": weights.relational.calibratedHeads.archetypeT2 = h
+        default: weights.relational.calibratedHeads.topologyT2 = h
+        }
+        didCalibrateHybrid = true
+    } else {
         print("Calibrated head missing for \(task.name); run `make train` with --rel-epochs > 0")
         exit(1)
     }
-    let z = task.useEarlyText ? zT2All : zT4All
     let trainCorrect = trainIndices.filter { h.predict(z[$0]) == task.label(allCases[$0]) }.count
     let preds = unseenIndices.map { h.predict(z[$0]) }
     var perCase: [String: Int] = [:]
@@ -246,21 +265,19 @@ for task in tasks {
     predictionsA[task.name] = perCase
     let maj = majorityClass(trainIndices.map { task.label(allCases[$0]) }, classCount: task.classNames.count)
     let r = summarize(
-        task: task, featurizer: "v4", testIdx: unseenIndices, preds: preds,
+        task: task, featurizer: "v5", testIdx: unseenIndices, preds: preds,
         majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
     )
     splitResults.append(r)
-    print("[split   ][v4       ] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+    print("[split   ][v5       ] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
 }
 
-let trainGroups = trainIndices.map { allCases[$0].group }
-var didCalibrateHybrid = false
 for task in tasks {
     let hyb = task.useEarlyText ? hybridT2All : hybridT4All
     let trainX = trainIndices.map { hyb[$0] }
     let trainY = trainIndices.map { task.label(allCases[$0]) }
     let h: SoftmaxClassifierHead
-    if let existing = hybridHead(weights.relational.calibratedHeads, task), existing.featureDim == trainX[0].count {
+    if !cli.recalibrate, let existing = hybridHead(weights.relational.calibratedHeads, task), existing.featureDim == trainX[0].count {
         h = existing
     } else {
         h = SoftmaxClassifierHead.trainGroupCV(features: trainX, labels: trainY, groups: trainGroups, classCount: task.classNames.count, steps: cli.steps)
@@ -276,12 +293,95 @@ for task in tasks {
     let preds = unseenIndices.map { h.predict(hyb[$0]) }
     let maj = majorityClass(trainY, classCount: task.classNames.count)
     let r = summarize(
-        task: task, featurizer: "v4_hybrid", testIdx: unseenIndices, preds: preds,
+        task: task, featurizer: "v5_hybrid", testIdx: unseenIndices, preds: preds,
         majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
     )
     splitResults.append(r)
-    print("[split   ][v4_hybrid] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+    print("[split   ][v5_hybrid] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
 }
+
+// ------------------------------------------------------------------
+// (A2) v5 Emotional Gradation, 10-way Trajectory & +30d/+90d Retention
+// ------------------------------------------------------------------
+let trajCases = RelationalTrajectoryType.allCases
+let trajTextAll = allCases.indices.map { i in
+    RelationalHybridFeatureExtractor.extractTrajectoryTextFeatures(hybridT2: hybridT2All[i], hybridT4: hybridT4All[i], zT2: zT2All[i], zT4: zT4All[i])
+}
+let trajFullAll = allCases.indices.map { i in
+    RelationalHybridFeatureExtractor.extractTrajectoryFullFeatures(
+        hybridT2: hybridT2All[i], hybridT4: hybridT4All[i], zT2: zT2All[i], zT4: zT4All[i], temporal: allCases[i].temporalContext
+    )
+}
+
+@MainActor
+func resolveOrTrainHead(_ existing: SoftmaxClassifierHead?, _ bank: [[Float]], _ yOf: (RelationalDialogueCase) -> Int, _ classes: Int) -> SoftmaxClassifierHead {
+    let trX = trainIndices.map { bank[$0] }
+    let trY = trainIndices.map { yOf(allCases[$0]) }
+    if !cli.recalibrate, let ex = existing, ex.featureDim == trX[0].count && ex.classCount == classes { return ex }
+    didCalibrateHybrid = true
+    return SoftmaxClassifierHead.trainGroupCV(features: trX, labels: trY, groups: trainGroups, classCount: classes, steps: cli.steps)
+}
+
+weights.relational.calibratedHeads.hybridAffectionT4 = resolveOrTrainHead(weights.relational.calibratedHeads.hybridAffectionT4, hybridT4All, { $0.emotionT4.affection }, 5)
+weights.relational.calibratedHeads.hybridFrictionT4 = resolveOrTrainHead(weights.relational.calibratedHeads.hybridFrictionT4, hybridT4All, { $0.emotionT4.friction }, 5)
+weights.relational.calibratedHeads.hybridArousalT4 = resolveOrTrainHead(weights.relational.calibratedHeads.hybridArousalT4, hybridT4All, { SoftmaxClassifierHead.arousalBin($0.emotionT4.arousal) }, 5)
+weights.relational.calibratedHeads.hybridAffectionT2 = resolveOrTrainHead(weights.relational.calibratedHeads.hybridAffectionT2, hybridT2All, { $0.emotionT2.affection }, 5)
+weights.relational.calibratedHeads.hybridFrictionT2 = resolveOrTrainHead(weights.relational.calibratedHeads.hybridFrictionT2, hybridT2All, { $0.emotionT2.friction }, 5)
+weights.relational.calibratedHeads.hybridArousalT2 = resolveOrTrainHead(weights.relational.calibratedHeads.hybridArousalT2, hybridT2All, { SoftmaxClassifierHead.arousalBin($0.emotionT2.arousal) }, 5)
+weights.relational.calibratedHeads.trajectoryTextHead = resolveOrTrainHead(weights.relational.calibratedHeads.trajectoryTextHead, trajTextAll, { trajCases.firstIndex(of: $0.trajectory.type) ?? 0 }, trajCases.count)
+weights.relational.calibratedHeads.trajectoryFullHead = resolveOrTrainHead(weights.relational.calibratedHeads.trajectoryFullHead, trajFullAll, { trajCases.firstIndex(of: $0.trajectory.type) ?? 0 }, trajCases.count)
+weights.relational.calibratedHeads.retained30dHead = resolveOrTrainHead(weights.relational.calibratedHeads.retained30dHead, trajFullAll, { $0.trajectory.retained30d ? 1 : 0 }, 2)
+weights.relational.calibratedHeads.retained90dHead = resolveOrTrainHead(weights.relational.calibratedHeads.retained90dHead, trajFullAll, { $0.trajectory.retained90d ? 1 : 0 }, 2)
+
+@MainActor
+func evalOrdinal5(_ name: String, _ head: SoftmaxClassifierHead, _ bank: [[Float]], _ yOf: (RelationalDialogueCase) -> Int) -> String {
+    let ys = unseenIndices.map { yOf(allCases[$0]) }
+    let ps = unseenIndices.map { head.predict(bank[$0]) }
+    let evs = unseenIndices.map { head.expectedValue(bank[$0]) }
+    let exact = Float(zip(ps, ys).filter { $0 == $1 }.count) / Float(max(1, ys.count))
+    let within1 = Float(zip(ps, ys).filter { abs($0 - $1) <= 1 }.count) / Float(max(1, ys.count))
+    let mae = zip(evs, ys).reduce(Float(0.0)) { $0 + abs($1.0 - Float($1.1)) } / Float(max(1, ys.count))
+    print(String(format: "[emotion ][v5_hybrid] %-13@: exact %@ | ±1-lvl %@ | MAE %.3f", name as NSString, pct(exact) as NSString, pct(within1) as NSString, mae))
+    return "| `\(name)` | **\(String(format: "%.2f%%", exact * 100.0))** | **\(String(format: "%.2f%%", within1 * 100.0))** | `\(String(format: "%.3f", mae))` |\n"
+}
+
+var v5ExtraSection = "\n## (C) 感情強度グラデーション・離脱軌跡・継続予測（unseen_test）\n\n"
+v5ExtraSection += "### 感情強度グラデーション（`affection 0..4` × `friction 0..4` × `arousal 0..1`）\n\n"
+v5ExtraSection += "| 軸 | 完全一致率 | ±1段階以内一致率 | 期待値 MAE |\n| :--- | ---: | ---: | ---: |\n"
+v5ExtraSection += evalOrdinal5("affection_t2", weights.relational.calibratedHeads.hybridAffectionT2!, hybridT2All) { $0.emotionT2.affection }
+v5ExtraSection += evalOrdinal5("friction_t2", weights.relational.calibratedHeads.hybridFrictionT2!, hybridT2All) { $0.emotionT2.friction }
+v5ExtraSection += evalOrdinal5("affection_t4", weights.relational.calibratedHeads.hybridAffectionT4!, hybridT4All) { $0.emotionT4.affection }
+v5ExtraSection += evalOrdinal5("friction_t4", weights.relational.calibratedHeads.hybridFrictionT4!, hybridT4All) { $0.emotionT4.friction }
+do {
+    let ar2Err = unseenIndices.reduce(Float(0.0)) { acc, i in
+        let p = weights.relational.calibratedHeads.hybridArousalT2!.expectedValue(hybridT2All[i], binValues: SoftmaxClassifierHead.arousalBinCenters)
+        return acc + abs(p - allCases[i].emotionT2.arousal)
+    } / Float(max(1, unseenIndices.count))
+    let ar4Err = unseenIndices.reduce(Float(0.0)) { acc, i in
+        let p = weights.relational.calibratedHeads.hybridArousalT4!.expectedValue(hybridT4All[i], binValues: SoftmaxClassifierHead.arousalBinCenters)
+        return acc + abs(p - allCases[i].emotionT4.arousal)
+    } / Float(max(1, unseenIndices.count))
+    print(String(format: "[emotion ][v5_hybrid] arousal MAE   : T2 %.3f | T4 %.3f", ar2Err, ar4Err))
+    v5ExtraSection += "| `arousal_t2 (0..1)` | - | - | `\(String(format: "%.3f", ar2Err))` |\n"
+    v5ExtraSection += "| `arousal_t4 (0..1)` | - | - | `\(String(format: "%.3f", ar4Err))` |\n"
+}
+
+do {
+    let yTraj = unseenIndices.map { trajCases.firstIndex(of: allCases[$0].trajectory.type) ?? 0 }
+    let pText = unseenIndices.map { weights.relational.calibratedHeads.trajectoryTextHead!.predict(trajTextAll[$0]) }
+    let pFull = unseenIndices.map { weights.relational.calibratedHeads.trajectoryFullHead!.predict(trajFullAll[$0]) }
+    let accText = Float(zip(pText, yTraj).filter { $0 == $1 }.count) / Float(max(1, yTraj.count))
+    let accFull = Float(zip(pFull, yTraj).filter { $0 == $1 }.count) / Float(max(1, yTraj.count))
+    let accR30 = Float(unseenIndices.filter { (weights.relational.calibratedHeads.retained30dHead!.predict(trajFullAll[$0]) == 1) == allCases[$0].trajectory.retained30d }.count) / Float(max(1, unseenIndices.count))
+    let accR90 = Float(unseenIndices.filter { (weights.relational.calibratedHeads.retained90dHead!.predict(trajFullAll[$0]) == 1) == allCases[$0].trajectory.retained90d }.count) / Float(max(1, unseenIndices.count))
+    print("[traj 10c][text_only ] unseen \(pct(accText)) | [text+temporal] unseen \(pct(accFull)) (Δ \(String(format: "%+.2f pt", (accFull - accText) * 100.0)))")
+    print("[retain  ][v5_hybrid ] retained_30d \(pct(accR30)) | retained_90d \(pct(accR90))")
+    v5ExtraSection += "\n### 10分類・距離感＆離脱軌跡（テキスト単独 vs 相対基準線つき時間文脈併用）\n\n"
+    v5ExtraSection += "- `v5_text_only (336D)`: **\(String(format: "%.2f%%", accText * 100.0))**\n"
+    v5ExtraSection += "- `v5_hybrid_full (350D = text + relative temporal)`: **\(String(format: "%.2f%%", accFull * 100.0))**（時間文脈併用効果 `\(String(format: "%+.2f pt", (accFull - accText) * 100.0))`）\n"
+    v5ExtraSection += "- `+30d` 継続予測精度: **\(String(format: "%.2f%%", accR30 * 100.0))** / `+90d` 継続予測精度: **\(String(format: "%.2f%%", accR90 * 100.0))**\n"
+}
+
 if didCalibrateHybrid {
     try weights.save(to: URL(fileURLWithPath: cli.weightsPath))
     saveZCache(
@@ -296,7 +396,7 @@ if didCalibrateHybrid {
             "\(Int64(((try? FileManager.default.attributesOfItem(atPath: cli.weightsPath)[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0))).bin"),
         matrix: zT4All
     )
-    print("Persisted calibrated v4_hybrid (160D) heads into \(cli.weightsPath)")
+    print("Persisted calibrated v5_hybrid heads into \(cli.weightsPath)")
 }
 
 let predData = try JSONEncoder().encode(predictionsA)
@@ -395,7 +495,7 @@ if !cli.skipFolds {
                 majorityPredsByTask[task.name, default: [:]][i] = maj
             }
             let foldAcc = Float(foldTest.filter { hybPreds[task.name]![$0] == task.label(allCases[$0]) }.count) / Float(max(1, foldTest.count))
-            print("  [fold \(fold)] \(task.name): v4_hybrid held-out \(pct(foldAcc))")
+            print("  [fold \(fold)] \(task.name): v5_hybrid held-out \(pct(foldAcc))")
         }
         let line = String(format: "fold %d: %d categories, train %d, test %d, %.1fs", fold, foldCats.count, foldTrain.count, foldTest.count, Date().timeIntervalSince(start))
         foldLog.append(line)
@@ -404,7 +504,7 @@ if !cli.skipFolds {
     }
 
     let allTest = allCases.indices.filter { foldOfCategory[allCases[$0].group] != nil }
-    for (fName, pMap, tcMap) in [("v4", v4Preds, v4TrainCorrect), ("v4_hybrid", hybPreds, hybTrainCorrect)] {
+    for (fName, pMap, tcMap) in [("v5", v4Preds, v4TrainCorrect), ("v5_hybrid", hybPreds, hybTrainCorrect)] {
         for task in tasks {
             let r = summarize(
                 task: task, featurizer: fName, testIdx: allTest,
@@ -449,7 +549,7 @@ if !cli.skipFolds {
         }
     }
     let unseenHoldoutIdx = unseenIndices.filter { foldOfCategory[allCases[$0].group] != nil }
-    for (featName, pMap, tcMap) in [("v4_frozen", zPreds, zTrC), ("v4_hybrid_frozen", hPreds, hTrC)] {
+    for (featName, pMap, tcMap) in [("v5_frozen", zPreds, zTrC), ("v5_hybrid_frozen", hPreds, hTrC)] {
         for task in tasks {
             let r = summarize(
                 task: task, featurizer: featName, testIdx: unseenHoldoutIdx,
@@ -482,10 +582,10 @@ func perClassList(_ rs: [EvalResult]) -> String {
     return s
 }
 
-var report = "# 関係性分類の汎化評価（`v4` & `v4_hybrid` 標準構成）\n\n"
+var report = "# 関係性分類・感情グラデーション・離脱軌跡の汎化評価（`v5` & `v5_hybrid` 標準構成）\n\n"
 report += "- 入力: `(senderTokenIDs, receiverTokenIDs)` の2配列のみ（連結しない Dual-Stream。$T_4$ は受信側全文、$T_2$ は受信側前半）\n"
-report += "- `v4`: `z_rel = [z_LL^rel(\(weights.relational.latentDim / 2)); z_HH^rel(\(weights.relational.latentDim / 2))] ∈ R^\(weights.relational.latentDim)`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
-report += "- `v4_hybrid`: `z_rel` + 非線形サブバンド幾何(8) + トピック置換不変エコー・Pentagon(8) + 非語彙対話リズム(16) = `\(weights.relational.latentDim + 32)` 次元（`weights.safetensors` 内蔵 Group-CV 校正ヘッド）\n\n"
+report += "- `v5`: `z_rel = [z_LL^rel(\(weights.relational.latentDim / 2)); z_HH^rel(\(weights.relational.latentDim / 2))] ∈ R^\(weights.relational.latentDim)`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
+report += "- `v5_hybrid`: `z_rel` + 非線形サブバンド幾何(8) + トピック置換不変エコー・Pentagon(8) + 非語彙対話リズム(16) = `\(weights.relational.latentDim + 32)` 次元、および軌跡用 `336D / 350D` 特徴\n\n"
 report += "## (A) シナリオ分割: train → unseen_test\n\n"
 report += "学習 `\(trainIndices.count)` 件、評価 `\(unseenIndices.count)` 件。\n\n"
 report += resultTable(splitResults, testLabel: "未学習精度")
@@ -501,6 +601,7 @@ report += "\n### フォールド実行ログ\n\n"
 report += foldLog.map { "- \($0)" }.joined(separator: "\n")
 report += "\n\n### クラス別正解数\n\n"
 report += perClassList(holdoutResults)
+report += v5ExtraSection
 
 try report.write(to: URL(fileURLWithPath: cli.reportPath), atomically: true, encoding: .utf8)
 let headsData = try JSONEncoder().encode(weights.relational.calibratedHeads)

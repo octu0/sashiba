@@ -134,7 +134,8 @@ public enum RelationalPipeline {
                 topology: topologyIndex(rc.expectedTopologyT2),
                 isEarlyT2: true,
                 groupKey: rc.group,
-                uniquenessWeight: uw
+                uniquenessWeight: uw,
+                emotion: rc.emotionT2
             ))
             pairs.append(RelationalTrainingPair(
                 senderTokens: host[i],
@@ -143,16 +144,33 @@ public enum RelationalPipeline {
                 topology: topologyIndex(rc.expectedTopology),
                 isEarlyT2: false,
                 groupKey: rc.group,
-                uniquenessWeight: uw
+                uniquenessWeight: uw,
+                emotion: rc.emotionT4
             ))
             if includeHarmonized {
+                let sepHH = rc.expectedArchetype == .gachikoiRisk
+                    || rc.expectedArchetype == .hiddenAggressor
+                    || rc.trajectory.type == .disengageExplicitRejection
+                    || rc.trajectory.type == .disengageAffectionToAntipathy
                 cfs.append(RelationalCounterfactualPair(
                     senderTokens: host[i],
                     receiverTokens: current[i],
                     harmonizedTokens: harm[i],
-                    preserveLL: rc.expectedArchetype != .indifferentTroll,
-                    separateHH: rc.expectedArchetype == .gachikoiRisk || rc.expectedArchetype == .hiddenAggressor
+                    preserveLL: rc.expectedArchetype != .indifferentTroll || rc.expectedArchetypeT2 != .indifferentTroll,
+                    separateHH: sepHH
                 ))
+                if rc.trajectory.type == .disengageExplicitRejection {
+                    let midMoved = DualStreamRelationalEngine.counterfactualMoveLastSentenceToMiddle(rc.partnerCurrentText)
+                    if midMoved != rc.partnerCurrentText {
+                        cfs.append(RelationalCounterfactualPair(
+                            senderTokens: host[i],
+                            receiverTokens: current[i],
+                            harmonizedTokens: encodeTokens(midMoved, vocab: vocab, time: time),
+                            preserveLL: true,
+                            separateHH: true
+                        ))
+                    }
+                }
             }
             if cases.count > 1 && mismatchPerCase > 0 && i % 2 == 0 {
                 for k in 0..<mismatchPerCase {
@@ -269,6 +287,7 @@ public enum RelationalPipeline {
             topoT2: trainCases.map { topologyIndex($0.expectedTopologyT2) },
             hybridT4: hyb4,
             hybridT2: hyb2,
+            cases: trainCases,
             groups: trainCases.map(\.group),
             uniquenessWeights: uWeights,
             steps: 350,

@@ -787,13 +787,13 @@ audit += "## Audit 1: ゼロリーク・関数シグネチャ監査\n\n"
 audit += "推論・エンコード関数のシグネチャ（ライブラリ公開 API）:\n\n"
 audit += "```swift\n"
 audit += "SWTHawkAutoencoder.encodeRelational(senderTokenIDs: [Int], receiverTokenIDs: [Int]) -> [Float]\n"
-audit += "SWTHawkAutoencoder.inferRelational(senderTokenIDs: [Int], receiverTokenIDs: [Int]) -> RelationalInferenceOutput // v4 & v4_hybrid\n"
+audit += "SWTHawkAutoencoder.inferRelational(senderTokenIDs: [Int], receiverTokenIDs: [Int]) -> RelationalInferenceOutput // v5 & v5_hybrid\n"
 audit += "SWTHawkAutoencoder.encodeRelationalBatch(senderTokens: [Int], receiverTokens: [Int], batch: Int, time: Int) -> [Float]\n"
 audit += "DualStreamRelationalEngine.computePentagonFromZRel(zRel: [Float], zRelEarly: [Float]?) / classifyFromZRel / classifyFromHybrid\n"
 audit += "```\n\n"
 audit += "- `scenario_id` / `category_12` / `archetype` / `topology` を受け取る引数は存在しない。`z_rel` の全次元は射影行列積 + LayerNorm の出力であり、トークンID・ハッシュ・ルール値の直接代入はない（旧 `SubbandClauseSplitter.embedSubbandLattice` は再構成用 `z` のみで使用し、`z_rel` 経路からは参照されない）。\n"
-audit += "- データセットに存在しない新規日本語文（未知文字 `\(unkInFresh)` 個）での推論結果（`v4` / `v4_hybrid`）:\n\n"
-audit += "| 入力ペア | 属性 ($T_4$: `v4` / `v4_hybrid`) | トポロジー (`v4` / `v4_hybrid`) | ctx / emp / sync / stab / dev |\n| :--- | :---: | :---: | :---: |\n"
+audit += "- データセットに存在しない新規日本語文（未知文字 `\(unkInFresh)` 個）での推論結果（`v5` / `v5_hybrid`）:\n\n"
+audit += "| 入力ペア | 属性 ($T_4$: `v5` / `v5_hybrid`) | トポロジー (`v5` / `v5_hybrid`) | ctx / emp / sync / stab / dev |\n| :--- | :---: | :---: | :---: |\n"
 audit += audit1Rows
 audit += "\n- 判定: \(audit1Pass ? "**PASS**" : "**FAIL**")\n\n"
 print("[Audit 1] signature = (senderTokenIDs:[Int], receiverTokenIDs:[Int]); fresh sentences not in corpus: \(audit1Fresh)")
@@ -1051,7 +1051,7 @@ audit += "未学習ケースの送信側・受信側テキストのトピック�
 audit += "| 指標 | 実測 | 基準 |\n| :--- | ---: | ---: |\n"
 audit += "| 平均 $\\cos(z_{\\text{rel}}^{\\text{orig}}, z_{\\text{rel}}^{\\text{sub}})$ | **\(fmt("%.4f", subMeanCos))** | $\\ge 0.90$ |\n"
 audit += "| 置換前後の予測一致率 ($T_4$ 属性 & トポロジー) | **\(fmt("%.2f", subAgreeRate))%** (`\(subAgree)/\(subCount)`) | $\\ge 90.0\\%$ |\n\n"
-audit += "- 注記: トピック置換不変性は平滑化ゲート $\\alpha_{\\text{rel}}$ と異分野対称ペアを含む `v4` データ構造により達成されている。\n"
+audit += "- 注記: トピック置換不変性は平滑化ゲート $\\alpha_{\\text{rel}}$ と異分野対称ペアを含む `v5` データ構造により達成されている。\n"
 audit += "- 判定: \(audit4Pass ? "**PASS**" : "**FAIL**")\n\n"
 
 // ---------------- Audit 5: unified tensor identity ----------------
@@ -1072,10 +1072,59 @@ for task in taskNames {
 }
 if headPreds.isEmpty { audit5Pass = false }
 audit += "## Audit 5: 評価テンソル同一性監査\n\n"
-audit += "`verification_report`（`analyzeRelationalDynamicsWithFlowMatching` 経由）と `relational_head_report` (A) `v4`（`\(cli.headPredictionsPath)`）の unseen_test 予測をケース単位で照合した。\n\n"
+audit += "`verification_report`（`analyzeRelationalDynamicsWithFlowMatching` 経由）と `relational_head_report` (A) `v5`（`\(cli.headPredictionsPath)`）の unseen_test 予測をケース単位で照合した。\n\n"
 audit += "| タスク | 一致数 |\n| :--- | ---: |\n"
 audit += audit5Rows
 audit += "\n- 判定: \(audit5Pass ? "**PASS**" : "**FAIL**")\(headPreds.isEmpty ? "（予測ファイル未生成: 先に `make head` を実行）" : "")\n\n"
+
+// ---------------- Audit 6: §3.1 Terminal-Position Effect Counterfactual ----------------
+let typeAIdx = unseenCases.indices.filter { unseenCases[$0].trajectory.type == .disengageExplicitRejection }
+let typeBIdx = unseenCases.indices.filter { unseenCases[$0].trajectory.type == .disengageOneSidedStop }
+func hhShift(_ zA: [Float], _ zB: [Float]) -> Float {
+    let half = zA.count / 2
+    var sq: Float = 0.0
+    for i in half..<zA.count {
+        let d = zA[i] - zB[i]
+        sq += d * d
+    }
+    return sqrtf(sq)
+}
+var audit6Ran = !typeAIdx.isEmpty && !typeBIdx.isEmpty
+var audit6Pass = true
+var meanTermA: Float = 0.0, meanMidA: Float = 0.0, meanEffA: Float = 0.0
+var meanTermB: Float = 0.0, meanMidB: Float = 0.0, meanEffB: Float = 0.0
+if audit6Ran {
+    let combIdx = typeAIdx + typeBIdx
+    let midSenders = combIdx.map { tokensOf(unseenCases[$0].hostText) }
+    let midRecvs = combIdx.map { tokensOf(DualStreamRelationalEngine.counterfactualMoveLastSentenceToMiddle(unseenCases[$0].partnerCurrentText)) }
+    let zMidAll = encodeZRelBatch(senders: midSenders, receivers: midRecvs, time: seqLen)
+    for (k, uIdx) in typeAIdx.enumerated() {
+        let sTerm = hhShift(zOrigT4All[uIdx], zOrigT2All[uIdx])
+        let sMid = hhShift(zMidAll[k], zOrigT2All[uIdx])
+        meanTermA += sTerm; meanMidA += sMid; meanEffA += (sTerm - sMid)
+    }
+    meanTermA /= Float(typeAIdx.count); meanMidA /= Float(typeAIdx.count); meanEffA /= Float(typeAIdx.count)
+    let offB = typeAIdx.count
+    for (k, uIdx) in typeBIdx.enumerated() {
+        let sTerm = hhShift(zOrigT4All[uIdx], zOrigT2All[uIdx])
+        let sMid = hhShift(zMidAll[offB + k], zOrigT2All[uIdx])
+        meanTermB += sTerm; meanMidB += sMid; meanEffB += (sTerm - sMid)
+    }
+    meanTermB /= Float(typeBIdx.count); meanMidB /= Float(typeBIdx.count); meanEffB /= Float(typeBIdx.count)
+    audit6Pass = (meanEffA > 0.0) && (meanEffA > meanEffB) && (meanTermA > meanTermB)
+    print(String(format: "[Audit 6] Type A (n=%d) term=%.4f mid=%.4f eff=%+.4f | Type B (n=%d) term=%.4f mid=%.4f eff=%+.4f -> %@",
+                 typeAIdx.count, meanTermA, meanMidA, meanEffA, typeBIdx.count, meanTermB, meanMidB, meanEffB, audit6Pass ? "PASS" : "FAIL"))
+}
+audit += "## Audit 6: 最後の一言の終端効果監査（§3.1 反事実位置入替テスト）\n\n"
+if audit6Ran {
+    audit += "未学習テストの **類型A（明示的拒絶: `\(typeAIdx.count)` 件）** と **類型B（一方的停止: `\(typeBIdx.count)` 件）** に対し、最終文を終端位置に置いた実データと、同一文字集合のまま対話中盤へ移動した反事実系列で $\\Delta z_{HH} = \\|z_{HH}(T_4) - z_{HH}(T_2)\\|_2$ を比較した。\n\n"
+    audit += "| 離脱類型 | 件数 | 終端配置 $\\Delta z_{HH}^{\\text{term}}$ | 中盤移動 $\\Delta z_{HH}^{\\text{mid}}$ | 終端位置効果 $E_{\\text{term}}$ |\n| :--- | ---: | ---: | ---: | ---: |\n"
+    audit += "| `DISENGAGE_A_EXPLICIT_REJECTION` | \(typeAIdx.count) | **\(fmt("%.4f", meanTermA))** | \(fmt("%.4f", meanMidA)) | **\(fmt("%+.4f", meanEffA))** |\n"
+    audit += "| `DISENGAGE_B_ONE_SIDED_STOP` | \(typeBIdx.count) | \(fmt("%.4f", meanTermB)) | \(fmt("%.4f", meanMidB)) | \(fmt("%+.4f", meanEffB)) |\n\n"
+    audit += "- 判定基準: $E_{\\text{term}}(A) > 0$ かつ $E_{\\text{term}}(A) > E_{\\text{term}}(B)$ かつ $\\Delta z_{HH}^{\\text{term}}(A) > \\Delta z_{HH}^{\\text{term}}(B)$。判定: \(audit6Pass ? "**PASS**" : "**FAIL**")\n\n"
+} else {
+    audit += "_unseen_test に類型A/Bが含まれる `v5` データセットで自動評価_\n\n"
+}
 
 // ---------------- Summary ----------------
 audit += "## 監査サマリ\n\n"
@@ -1086,7 +1135,8 @@ audit += "| Audit 3a: ミスマッチ | \(audit3aPass ? "PASS" : "FAIL") |\n"
 audit += "| Audit 3b: 順序シャッフル | \(audit3bPass ? "PASS" : "FAIL") |\n"
 audit += "| Audit 3c: ラベル置換 | \(audit3cRan ? (audit3cPass ? "PASS" : "FAIL") : "未実行") |\n"
 audit += "| Audit 4: 語彙置換不変性 | \(audit4Pass ? "PASS" : "FAIL") |\n"
-audit += "| Audit 5: テンソル同一性 | \(audit5Pass ? "PASS" : "FAIL") |\n\n"
+audit += "| Audit 5: テンソル同一性 | \(audit5Pass ? "PASS" : "FAIL") |\n"
+audit += "| Audit 6: 最後の一言の終端効果 (§3.1) | \(audit6Ran ? (audit6Pass ? "PASS" : "FAIL") : "未実行") |\n\n"
 audit += "---\n\n"
 audit += report
 

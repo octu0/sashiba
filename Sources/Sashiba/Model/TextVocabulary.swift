@@ -464,6 +464,12 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
         let receiver_log_t3_t4: String
         let receiver_log_harmonized: String
         let insights: Insights
+        let observations_t2: RelationalObservations?
+        let observations_t4: RelationalObservations?
+        let emotion_t2: EmotionalGradation?
+        let emotion_t4: EmotionalGradation?
+        let temporal_context: TemporalRelationalContext?
+        let trajectory: RelationalTrajectorySpec?
 
         enum CodingKeys: String, CodingKey {
             case scenario_id
@@ -481,6 +487,12 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
             case receiver_log_t3_t4
             case receiver_log_harmonized
             case insights
+            case observations_t2
+            case observations_t4
+            case emotion_t2
+            case emotion_t4
+            case temporal_context
+            case trajectory
         }
 
         init(from decoder: Decoder) throws {
@@ -501,6 +513,12 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
             self.receiver_log_t3_t4 = try c.decode(String.self, forKey: .receiver_log_t3_t4)
             self.receiver_log_harmonized = try c.decode(String.self, forKey: .receiver_log_harmonized)
             self.insights = try c.decode(Insights.self, forKey: .insights)
+            self.observations_t2 = try? c.decode(RelationalObservations.self, forKey: .observations_t2)
+            self.observations_t4 = try? c.decode(RelationalObservations.self, forKey: .observations_t4)
+            self.emotion_t2 = try? c.decode(EmotionalGradation.self, forKey: .emotion_t2)
+            self.emotion_t4 = try? c.decode(EmotionalGradation.self, forKey: .emotion_t4)
+            self.temporal_context = try? c.decode(TemporalRelationalContext.self, forKey: .temporal_context)
+            self.trajectory = try? c.decode(RelationalTrajectorySpec.self, forKey: .trajectory)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -520,6 +538,12 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
             try c.encode(receiver_log_t3_t4, forKey: .receiver_log_t3_t4)
             try c.encode(receiver_log_harmonized, forKey: .receiver_log_harmonized)
             try c.encode(insights, forKey: .insights)
+            try c.encodeIfPresent(observations_t2, forKey: .observations_t2)
+            try c.encodeIfPresent(observations_t4, forKey: .observations_t4)
+            try c.encodeIfPresent(emotion_t2, forKey: .emotion_t2)
+            try c.encodeIfPresent(emotion_t4, forKey: .emotion_t4)
+            try c.encodeIfPresent(temporal_context, forKey: .temporal_context)
+            try c.encodeIfPresent(trajectory, forKey: .trajectory)
         }
     }
 
@@ -668,6 +692,12 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
                     insightLevel0: rec.insights.level_0_core,
                     insightLevel1: rec.insights.level_1_mid,
                     insightLevel2: rec.insights.level_2_deep,
+                    observationsT2: rec.observations_t2,
+                    observationsT4: rec.observations_t4,
+                    emotionT2: rec.emotion_t2,
+                    emotionT4: rec.emotion_t4,
+                    temporalContext: rec.temporal_context ?? .neutralDefault,
+                    trajectory: rec.trajectory,
                     isZeroShotUnseen: rec.split != "train"
                 )
             )
