@@ -718,17 +718,48 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
     public let decodedVocabulary: TextVocabulary
     public let hybridExtractor: RelationalHybridFeatureExtractor
 
+    /// Optional pure-CPU Small Conditional Griffin LM for generating inner-psychology descriptions.
+    public var psychologicalLM: PsychologicalStateLM? = nil
+
     /// Optional accelerated (MLX GPU) backend for `encode(tokens:batch:time:)`; when set, replaces the CPU encoder.
     public var latentEncoderBackend: (([Int], Int, Int) -> [Float])? = nil
 
     /// Optional accelerated (MLX GPU) backend for the Dual-Stream relational encoder returning `(zRel, zContent)`.
     public var relationalEncoderBackend: (([Int], [Int], Int, Int) -> (zRel: [Float], zContent: [Float]))? = nil
 
-    public init(weights: SWTHawkWeights) {
+    public init(weights: SWTHawkWeights, psychologicalLM: PsychologicalStateLM? = nil) {
         self.weights = weights
         let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
         self.decodedVocabulary = vocab
         self.hybridExtractor = RelationalHybridFeatureExtractor(vocabulary: vocab)
+        self.psychologicalLM = psychologicalLM
+    }
+
+    /// Loads and attaches a trained `PsychologicalStateLM` from a `.safetensors` file.
+    public func loadPsychologicalStateLM(from url: URL) throws {
+        let lmWeights = try PsychologicalStateLMWeights.load(from: url)
+        self.psychologicalLM = PsychologicalStateLM(weights: lmWeights)
+    }
+
+    /// Evaluates `v6 / v6_hybrid` relational state and generates a natural inner-psychology description using the attached `PsychologicalStateLM`.
+    public func inferRelationalWithPsychology(
+        senderEarlyText: String? = nil,
+        receiverEarlyText: String? = nil,
+        senderCurrentText: String,
+        receiverCurrentText: String,
+        temporalContext: TemporalRelationalContext? = nil,
+        temperature: Float = 0.0
+    ) -> PsychologicalStateResult? {
+        guard let lm = psychologicalLM else { return nil }
+        return lm.describePsychology(
+            relationalModel: self,
+            senderEarlyText: senderEarlyText,
+            receiverEarlyText: receiverEarlyText,
+            senderCurrentText: senderCurrentText,
+            receiverCurrentText: receiverCurrentText,
+            temporalContext: temporalContext,
+            temperature: temperature
+        )
     }
 
     /// Embeds token ID sequences `[B, T]` with sinusoidal positional encoding into `[B, T, D]`.

@@ -17,7 +17,8 @@ let package = Package(
         .executable(name: "verify_latent_space", targets: ["verify_latent_space"]),
         .executable(name: "benchmark", targets: ["benchmark"]),
         .executable(name: "relational_head", targets: ["relational_head"]),
-        .executable(name: "validate_benchmarks", targets: ["validate_benchmarks"])
+        .executable(name: "validate_benchmarks", targets: ["validate_benchmarks"]),
+        .executable(name: "psych_lm", targets: ["psych_lm"])
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.33.0")
@@ -76,6 +77,15 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift")
             ],
             path: "script/validate_benchmarks",
+            swiftSettings: linuxSIMDFlags
+        ),
+        .executableTarget(
+            name: "psych_lm",
+            dependencies: [
+                "Sashiba",
+                .product(name: "MLX", package: "mlx-swift")
+            ],
+            path: "script/psych_lm",
             swiftSettings: linuxSIMDFlags
         ),
         .testTarget(
