@@ -1,6 +1,10 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
+let linuxSIMDFlags: [SwiftSetting] = [
+    .unsafeFlags(["-Xcc", "-mavx2", "-Xcc", "-mfma", "-Xllvm", "-mattr=+avx2,+fma"], .when(platforms: [.linux]))
+]
+
 let package = Package(
     name: "sashiba",
     platforms: [
@@ -26,7 +30,8 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift")
             ],
-            path: "Sources/Sashiba"
+            path: "Sources/Sashiba",
+            swiftSettings: linuxSIMDFlags
         ),
         .executableTarget(
             name: "train",
@@ -34,22 +39,26 @@ let package = Package(
                 "Sashiba",
                 .product(name: "MLX", package: "mlx-swift")
             ],
-            path: "script/train"
+            path: "script/train",
+            swiftSettings: linuxSIMDFlags
         ),
         .executableTarget(
             name: "reconstruct",
             dependencies: ["Sashiba"],
-            path: "script/reconstruct"
+            path: "script/reconstruct",
+            swiftSettings: linuxSIMDFlags
         ),
         .executableTarget(
             name: "verify_latent_space",
             dependencies: ["Sashiba"],
-            path: "script/verify_latent_space"
+            path: "script/verify_latent_space",
+            swiftSettings: linuxSIMDFlags
         ),
         .executableTarget(
             name: "benchmark",
             dependencies: ["Sashiba"],
-            path: "script/benchmark"
+            path: "script/benchmark",
+            swiftSettings: linuxSIMDFlags
         ),
         .executableTarget(
             name: "relational_head",
@@ -57,7 +66,8 @@ let package = Package(
                 "Sashiba",
                 .product(name: "MLX", package: "mlx-swift")
             ],
-            path: "script/relational_head"
+            path: "script/relational_head",
+            swiftSettings: linuxSIMDFlags
         ),
         .executableTarget(
             name: "validate_benchmarks",
@@ -65,7 +75,8 @@ let package = Package(
                 "Sashiba",
                 .product(name: "MLX", package: "mlx-swift")
             ],
-            path: "script/validate_benchmarks"
+            path: "script/validate_benchmarks",
+            swiftSettings: linuxSIMDFlags
         ),
         .testTarget(
             name: "SashibaTests",
@@ -74,7 +85,8 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift")
             ],
-            path: "Tests/SashibaTests"
+            path: "Tests/SashibaTests",
+            swiftSettings: linuxSIMDFlags
         )
     ]
 )

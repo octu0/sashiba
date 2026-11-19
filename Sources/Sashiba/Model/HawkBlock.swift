@@ -321,29 +321,66 @@ public enum RGLRULayer {
         let initialH = h0 ?? [Float](repeating: 0.0, count: batch * dim)
         var h = [Float](repeating: 0.0, count: total)
         var hLast = [Float](repeating: 0.0, count: batch * dim)
+        var prevH = [Float](repeating: 0.0, count: dim)
 
-        for b in 0..<batch {
-            let bOff = b * time * dim
-            let h0Off = b * dim
-            var prevH = Array(initialH[h0Off..<(h0Off + dim)])
+        let onePlusEps = SIMD8<Float>(repeating: 1.0 + RGLRUWeights.scaleEps)
+        let epsVec = SIMD8<Float>(repeating: RGLRUWeights.scaleEps)
 
-            for t in 0..<time {
-                let rowOff = bOff + t * dim
-                for c in 0..<dim {
-                    let idx = rowOff + c
-                    let rVal = 1.0 / (1.0 + expf(-rPre[idx]))
-                    let iVal = 1.0 / (1.0 + expf(-iPre[idx]))
-                    let logAt = rVal * logDecayBase[c]
-                    let aVal = expf(logAt)
-                    let oneMinusA2 = max(RGLRUWeights.scaleEps, 1.0 - aVal * aVal + RGLRUWeights.scaleEps)
-                    let sVal = sqrtf(oneMinusA2)
-                    let hCur = aVal * prevH[c] + sVal * (iVal * x[idx])
-                    h[idx] = hCur
-                    prevH[c] = hCur
+        x.withUnsafeBufferPointer { xBuf in
+            rPre.withUnsafeBufferPointer { rBuf in
+                iPre.withUnsafeBufferPointer { iBuf in
+                    logDecayBase.withUnsafeBufferPointer { ldBuf in
+                        initialH.withUnsafeBufferPointer { h0Buf in
+                            h.withUnsafeMutableBufferPointer { hBuf in
+                                hLast.withUnsafeMutableBufferPointer { hlBuf in
+                                    prevH.withUnsafeMutableBufferPointer { phBuf in
+                                        let xp = xBuf.baseAddress!, rp = rBuf.baseAddress!, ip = iBuf.baseAddress!
+                                        let ldp = ldBuf.baseAddress!, h0p = h0Buf.baseAddress!
+                                        let hp = hBuf.baseAddress!, hlp = hlBuf.baseAddress!, php = phBuf.baseAddress!
+
+                                        for b in 0..<batch {
+                                            let bOff = b * time * dim
+                                            let h0Off = b * dim
+                                            php.update(from: h0p + h0Off, count: dim)
+
+                                            for t in 0..<time {
+                                                let rowOff = bOff + t * dim
+                                                var c = 0
+                                                while c + 8 <= dim {
+                                                    let idx = rowOff + c
+                                                    let rVec = SIMDMath.sigmoid(SWTHawkAutoencoder.load(rp + idx))
+                                                    let iVec = SIMDMath.sigmoid(SWTHawkAutoencoder.load(ip + idx))
+                                                    let aVec = SIMDMath.exp(rVec * SWTHawkAutoencoder.load(ldp + c))
+                                                    let raw1mA2 = onePlusEps - aVec * aVec
+                                                    let clamped1mA2 = raw1mA2.replacing(with: epsVec, where: raw1mA2 .< epsVec)
+                                                    let sVec = clamped1mA2.squareRoot()
+                                                    let pVec = SWTHawkAutoencoder.load(php + c)
+                                                    let xVec = SWTHawkAutoencoder.load(xp + idx)
+                                                    let hCur = aVec * pVec + sVec * (iVec * xVec)
+                                                    SWTHawkAutoencoder.store(hCur, hp + idx)
+                                                    SWTHawkAutoencoder.store(hCur, php + c)
+                                                    c += 8
+                                                }
+                                                while c < dim {
+                                                    let idx = rowOff + c
+                                                    let rVal = 1.0 / (1.0 + expf(-rp[idx]))
+                                                    let iVal = 1.0 / (1.0 + expf(-ip[idx]))
+                                                    let aVal = expf(rVal * ldp[c])
+                                                    let oneMinusA2 = max(RGLRUWeights.scaleEps, 1.0 - aVal * aVal + RGLRUWeights.scaleEps)
+                                                    let hCur = aVal * php[c] + sqrtf(oneMinusA2) * (iVal * xp[idx])
+                                                    hp[idx] = hCur
+                                                    php[c] = hCur
+                                                    c += 1
+                                                }
+                                            }
+                                            (hlp + h0Off).update(from: UnsafePointer(php), count: dim)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-            for c in 0..<dim {
-                hLast[h0Off + c] = prevH[c]
             }
         }
 
@@ -434,47 +471,100 @@ public enum LocalSlidingWindowAttention {
 
         let scale = 1.0 / sqrtf(Float(max(1, headDim)))
         var context = [Float](repeating: 0.0, count: total)
+        var scores = [Float](repeating: 0.0, count: max(1, windowSize))
 
-        for b in 0..<batch {
-            let bOff = b * time * dim
-            for t in 0..<time {
-                let sStart = max(0, t - windowSize + 1)
-                let winLen = t - sStart + 1
-                let qRowOff = bOff + t * dim
+        q.withUnsafeBufferPointer { qBuf in
+            k.withUnsafeBufferPointer { kBuf in
+                v.withUnsafeBufferPointer { vBuf in
+                    context.withUnsafeMutableBufferPointer { ctxBuf in
+                        scores.withUnsafeMutableBufferPointer { scBuf in
+                            let qp = qBuf.baseAddress!, kp = kBuf.baseAddress!, vp = vBuf.baseAddress!
+                            let cp = ctxBuf.baseAddress!, sp = scBuf.baseAddress!
 
-                for h in 0..<numHeads {
-                    let hOff = h * headDim
-                    let qHeadOff = qRowOff + hOff
-                    var scores = [Float](repeating: 0.0, count: winLen)
-                    var maxScore: Float = -.greatestFiniteMagnitude
+                            for b in 0..<batch {
+                                let bOff = b * time * dim
+                                for t in 0..<time {
+                                    let sStart = max(0, t - windowSize + 1)
+                                    let winLen = t - sStart + 1
+                                    let qRowOff = bOff + t * dim
 
-                    for idx in 0..<winLen {
-                        let s = sStart + idx
-                        let kHeadOff = bOff + s * dim + hOff
-                        var dot: Float = 0.0
-                        for d in 0..<headDim {
-                            dot += q[qHeadOff + d] * k[kHeadOff + d]
-                        }
-                        let sc = dot * scale
-                        scores[idx] = sc
-                        if sc > maxScore { maxScore = sc }
-                    }
+                                    for h in 0..<numHeads {
+                                        let hOff = h * headDim
+                                        let qHeadPtr = qp + qRowOff + hOff
+                                        var maxScore: Float = -.greatestFiniteMagnitude
 
-                    var sumExp: Float = 0.0
-                    for idx in 0..<winLen {
-                        let e = expf(scores[idx] - maxScore)
-                        scores[idx] = e
-                        sumExp += e
-                    }
-                    let invSum = 1.0 / max(sumExp, 1e-12)
-
-                    let outHeadOff = qRowOff + hOff
-                    for idx in 0..<winLen {
-                        let p = scores[idx] * invSum
-                        let s = sStart + idx
-                        let vHeadOff = bOff + s * dim + hOff
-                        for d in 0..<headDim {
-                            context[outHeadOff + d] += p * v[vHeadOff + d]
+                                        if headDim == 32 {
+                                            let q0 = SWTHawkAutoencoder.load(qHeadPtr)
+                                            let q1 = SWTHawkAutoencoder.load(qHeadPtr + 8)
+                                            let q2 = SWTHawkAutoencoder.load(qHeadPtr + 16)
+                                            let q3 = SWTHawkAutoencoder.load(qHeadPtr + 24)
+                                            for idx in 0..<winLen {
+                                                let kPtr = kp + bOff + (sStart + idx) * dim + hOff
+                                                var acc = q0 * SWTHawkAutoencoder.load(kPtr)
+                                                acc.addProduct(q1, SWTHawkAutoencoder.load(kPtr + 8))
+                                                acc.addProduct(q2, SWTHawkAutoencoder.load(kPtr + 16))
+                                                acc.addProduct(q3, SWTHawkAutoencoder.load(kPtr + 24))
+                                                let sc = acc.sum() * scale
+                                                sp[idx] = sc
+                                                if sc > maxScore { maxScore = sc }
+                                            }
+                                            var sumExp: Float = 0.0
+                                            for idx in 0..<winLen {
+                                                let e = expf(sp[idx] - maxScore)
+                                                sp[idx] = e
+                                                sumExp += e
+                                            }
+                                            let invSum = 1.0 / max(sumExp, 1e-12)
+                                            var o0 = SIMD8<Float>(repeating: 0.0)
+                                            var o1 = SIMD8<Float>(repeating: 0.0)
+                                            var o2 = SIMD8<Float>(repeating: 0.0)
+                                            var o3 = SIMD8<Float>(repeating: 0.0)
+                                            for idx in 0..<winLen {
+                                                let pVec = SIMD8<Float>(repeating: sp[idx] * invSum)
+                                                let vPtr = vp + bOff + (sStart + idx) * dim + hOff
+                                                o0.addProduct(pVec, SWTHawkAutoencoder.load(vPtr))
+                                                o1.addProduct(pVec, SWTHawkAutoencoder.load(vPtr + 8))
+                                                o2.addProduct(pVec, SWTHawkAutoencoder.load(vPtr + 16))
+                                                o3.addProduct(pVec, SWTHawkAutoencoder.load(vPtr + 24))
+                                            }
+                                            let outPtr = cp + qRowOff + hOff
+                                            SWTHawkAutoencoder.store(o0, outPtr)
+                                            SWTHawkAutoencoder.store(o1, outPtr + 8)
+                                            SWTHawkAutoencoder.store(o2, outPtr + 16)
+                                            SWTHawkAutoencoder.store(o3, outPtr + 24)
+                                        } else {
+                                            for idx in 0..<winLen {
+                                                let kPtr = kp + bOff + (sStart + idx) * dim + hOff
+                                                let sc = VectorOperations.dotProduct(a: qHeadPtr, b: kPtr, count: headDim) * scale
+                                                sp[idx] = sc
+                                                if sc > maxScore { maxScore = sc }
+                                            }
+                                            var sumExp: Float = 0.0
+                                            for idx in 0..<winLen {
+                                                let e = expf(sp[idx] - maxScore)
+                                                sp[idx] = e
+                                                sumExp += e
+                                            }
+                                            let invSum = 1.0 / max(sumExp, 1e-12)
+                                            let outPtr = cp + qRowOff + hOff
+                                            for idx in 0..<winLen {
+                                                let p = sp[idx] * invSum
+                                                let vPtr = vp + bOff + (sStart + idx) * dim + hOff
+                                                var d = 0
+                                                let pVec = SIMD8<Float>(repeating: p)
+                                                while d + 8 <= headDim {
+                                                    SWTHawkAutoencoder.store(SWTHawkAutoencoder.load(outPtr + d) + pVec * SWTHawkAutoencoder.load(vPtr + d), outPtr + d)
+                                                    d += 8
+                                                }
+                                                while d < headDim {
+                                                    outPtr[d] += p * vPtr[d]
+                                                    d += 1
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -482,11 +572,21 @@ public enum LocalSlidingWindowAttention {
         }
 
         let attnOut = SWTHawkAutoencoder.linear(x: context, w: weights.wOut, b: weights.bOut, rows: rows, inDim: dim, outDim: dim)
-        var out = [Float](repeating: 0.0, count: total)
-        for i in 0..<total {
-            out[i] = x[i] + attnOut[i]
+        return [Float](unsafeUninitializedCapacity: total) { outBuf, initCount in
+            let op = outBuf.baseAddress!
+            x.withUnsafeBufferPointer { xBuf in
+                attnOut.withUnsafeBufferPointer { aBuf in
+                    let xp = xBuf.baseAddress!, ap = aBuf.baseAddress!
+                    var i = 0
+                    while i + 8 <= total {
+                        SWTHawkAutoencoder.store(SWTHawkAutoencoder.load(xp + i) + SWTHawkAutoencoder.load(ap + i), op + i)
+                        i += 8
+                    }
+                    while i < total { op[i] = xp[i] + ap[i]; i += 1 }
+                }
+            }
+            initCount = total
         }
-        return out
     }
 }
 

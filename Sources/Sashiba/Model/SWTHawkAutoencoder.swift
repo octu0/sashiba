@@ -715,6 +715,8 @@ public struct SWTHawkWeights: Sendable, Equatable {
 /// CPU inference engine for the SWT-Griffin Text Autoencoder & Conditional Flow Matcher (`Section 2 & 3`).
 public final class SWTHawkAutoencoder: @unchecked Sendable {
     public let weights: SWTHawkWeights
+    public let decodedVocabulary: TextVocabulary
+    public let hybridExtractor: RelationalHybridFeatureExtractor
 
     /// Optional accelerated (MLX GPU) backend for `encode(tokens:batch:time:)`; when set, replaces the CPU encoder.
     public var latentEncoderBackend: (([Int], Int, Int) -> [Float])? = nil
@@ -724,6 +726,9 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
 
     public init(weights: SWTHawkWeights) {
         self.weights = weights
+        let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
+        self.decodedVocabulary = vocab
+        self.hybridExtractor = RelationalHybridFeatureExtractor(vocabulary: vocab)
     }
 
     /// Embeds token ID sequences `[B, T]` with sinusoidal positional encoding into `[B, T, D]`.
@@ -885,26 +890,34 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
             return zNeural
         }
 
-        var zOut = [Float](repeating: 0.0, count: batch * latentDim)
+        var splits: [SubbandClauseSplitter.SplitResult] = []
+        splits.reserveCapacity(batch)
+        var llPaddedBatch = [Int](repeating: TextVocabulary.padId, count: batch * time)
         for b in 0..<batch {
             let tokSlice = Array(tokens[(b * time)..<((b + 1) * time)])
             let split = SubbandClauseSplitter.split(tokens: tokSlice, classifier: weights.subbandClassifier)
-
-            // Compute neural LL features strictly on the LL main-clause stream so z_LL(X_full) == z_LL(X_base)
-            var llPadded = Array(split.llTokens.prefix(time))
-            if llPadded.count < time {
-                llPadded.append(contentsOf: repeatElement(TextVocabulary.padId, count: time - llPadded.count))
+            splits.append(split)
+            let copyLen = min(time, split.llTokens.count)
+            let rowOff = b * time
+            for k in 0..<copyLen {
+                llPaddedBatch[rowOff + k] = split.llTokens[k]
             }
-            let llEmb = embedWithPositionalEncoding(tokens: llPadded, batch: 1, time: time)
-            let llSWT = SWTFrequencyBranch.forward(x: llEmb, weights: weights.swtBranch, batch: 1, time: time)
-            let (llTFeat, llHLast) = forwardTemporalBranch(embedded: llEmb, batch: 1, time: time)
-            let llUFused = GatedTimeFrequencyFusion.forward(fSWT: llSWT, tFeat: llTFeat, weights: weights.fusion, batch: 1, time: time)
-            let llNeuralFull = MultiScaleAttentionPooling.forward(uFused: llUFused, hLast: llHLast, weights: weights.pooling, batch: 1, time: time)
+        }
 
-            let neuralLL = Array(llNeuralFull[0..<half])
-            let neuralHH = Array(zNeural[(b * latentDim + half)..<((b + 1) * latentDim)])
+        // Batched neural LL forward pass across all B rows simultaneously
+        let llEmb = embedWithPositionalEncoding(tokens: llPaddedBatch, batch: batch, time: time)
+        let llSWT = SWTFrequencyBranch.forward(x: llEmb, weights: weights.swtBranch, batch: batch, time: time)
+        let (llTFeat, llHLast) = forwardTemporalBranch(embedded: llEmb, batch: batch, time: time)
+        let llUFused = GatedTimeFrequencyFusion.forward(fSWT: llSWT, tFeat: llTFeat, weights: weights.fusion, batch: batch, time: time)
+        let llNeuralAll = MultiScaleAttentionPooling.forward(uFused: llUFused, hLast: llHLast, weights: weights.pooling, batch: batch, time: time)
+
+        var zOut = [Float](repeating: 0.0, count: batch * latentDim)
+        for b in 0..<batch {
+            let bOff = b * latentDim
+            let neuralLL = Array(llNeuralAll[bOff..<(bOff + half)])
+            let neuralHH = Array(zNeural[(bOff + half)..<(bOff + latentDim)])
             let zCal = SubbandClauseSplitter.embedSubbandLattice(
-                split: split,
+                split: splits[b],
                 neuralLL: neuralLL,
                 neuralHH: neuralHH,
                 gamma: weights.pooling.normGamma,
@@ -912,7 +925,7 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
                 latentDim: latentDim
             )
             for c in 0..<latentDim {
-                zOut[b * latentDim + c] = zCal[c]
+                zOut[bOff + c] = zCal[c]
             }
         }
         return zOut
@@ -1145,7 +1158,12 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         senderTokenIDs: [Int],
         receiverTokenIDs: [Int]
     ) -> [Float] {
-        let time = max(DualStreamRelationalWeights.canonicalSeqLen, max(senderTokenIDs.count, receiverTokenIDs.count))
+        let rawMax = max(senderTokenIDs.count, receiverTokenIDs.count)
+        let time: Int = if relationalEncoderBackend != nil {
+            max(DualStreamRelationalWeights.canonicalSeqLen, rawMax)
+        } else {
+            max(8, ((rawMax + 8 + 3) / 4) * 4)
+        }
         return encodeRelationalBatch(
             senderTokens: DualStreamRelationalEngine.padOrTruncate(senderTokenIDs, to: time),
             receiverTokens: DualStreamRelationalEngine.padOrTruncate(receiverTokenIDs, to: time),
@@ -1184,12 +1202,17 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         return (res.zRel, res.zContent)
     }
 
-    /// Runs Dual-Stream Relational Inference (`v4` + `v4_hybrid`) taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])`.
+    /// Runs Dual-Stream Relational Inference (`v6` + `v6_hybrid`) taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])`.
     public func inferRelational(
         senderTokenIDs: [Int],
         receiverTokenIDs: [Int]
     ) -> RelationalInferenceOutput {
-        let time = max(DualStreamRelationalWeights.canonicalSeqLen, max(senderTokenIDs.count, receiverTokenIDs.count))
+        let rawMax = max(senderTokenIDs.count, receiverTokenIDs.count)
+        let time: Int = if relationalEncoderBackend != nil {
+            max(DualStreamRelationalWeights.canonicalSeqLen, rawMax)
+        } else {
+            max(8, ((rawMax + 8 + 3) / 4) * 4)
+        }
         let sPad = DualStreamRelationalEngine.padOrTruncate(senderTokenIDs, to: time)
         let rPad = DualStreamRelationalEngine.padOrTruncate(receiverTokenIDs, to: time)
         let res = encodeRelationalBatchWithContent(
@@ -1198,8 +1221,7 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
             batch: 1,
             time: time
         )
-        let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
-        let hyb = RelationalHybridFeatureExtractor(vocabulary: vocab).extract(
+        let hyb = hybridExtractor.extract(
             senderTokens: sPad, receiverTokens: rPad, zRel: res.zRel, weights: weights
         )
         return DualStreamRelationalEngine.makeInferenceOutput(zRel: res.zRel, hybridFeatures: hyb, zContent: res.zContent, weights: weights.relational)
@@ -1235,9 +1257,15 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
     ) {
         let hEarlyTokens = hostEarlyTokens ?? hostTokens
         precondition(hEarlyTokens.count == time && hostTokens.count == time && partnerEarlyTokens.count == time && partnerCurrentTokens.count == time)
-        let zHost = encode(tokens: hostTokens, batch: 1, time: time)
-        let zPartnerEarly = encode(tokens: partnerEarlyTokens, batch: 1, time: time)
-        let zPartnerCurrent = encode(tokens: partnerCurrentTokens, batch: 1, time: time)
+        let zTriple = encode(
+            tokens: hostTokens + partnerEarlyTokens + partnerCurrentTokens,
+            batch: 3,
+            time: time
+        )
+        let lDimAE = weights.latentDim
+        let zHost = Array(zTriple[0..<lDimAE])
+        let zPartnerEarly = Array(zTriple[lDimAE..<(2 * lDimAE)])
+        let zPartnerCurrent = Array(zTriple[(2 * lDimAE)..<(3 * lDimAE)])
 
         let cHarm = ConditionalFlowMatcher.computeRelationalHarmonizationCondition(
             zHost: zHost,
@@ -1426,50 +1454,168 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
             1.0, a, Int32(lda), b, Int32(ldb), beta, c, Int32(ldc)
         )
         #else
-        let nSimd = n - (n % 8)
-        var row = 0
-        while row < m {
-            let cRow = c + row * ldc
-            let aRow = a + row * lda
+        guard m > 0 && n > 0 else { return }
+        if k == 0 {
             if beta == 0.0 {
-                var col = 0
-                while col < nSimd {
-                    store(SIMD8<Float>(repeating: 0.0), cRow + col)
-                    col += 8
-                }
-                while col < n {
-                    cRow[col] = 0.0
-                    col += 1
-                }
+                for r in 0..<m { (c + r * ldc).update(repeating: 0.0, count: n) }
             } else if beta != 1.0 {
-                let bVec = SIMD8<Float>(repeating: beta)
-                var col = 0
-                while col < nSimd {
-                    store(load(cRow + col) * bVec, cRow + col)
-                    col += 8
-                }
-                while col < n {
-                    cRow[col] *= beta
-                    col += 1
+                for r in 0..<m {
+                    let cRow = c + r * ldc
+                    for col in 0..<n { cRow[col] *= beta }
                 }
             }
-            var p = 0
-            while p < k {
-                let aVal = aRow[p]
-                if aVal != 0.0 {
-                    let aVec = SIMD8<Float>(repeating: aVal)
-                    let bRow = b + p * ldb
-                    var col = 0
-                    while col < nSimd {
-                        store(load(cRow + col) + aVec * load(bRow + col), cRow + col)
-                        col += 8
-                    }
-                    while col < n {
-                        cRow[col] += aVal * bRow[col]
-                        col += 1
-                    }
+            return
+        }
+
+        let bVec = SIMD8<Float>(repeating: beta)
+        var row = 0
+
+        // Register-blocked 4x16 (4 rows x 2 SIMD8<Float>) AVX2 FMA micro-kernel
+        while row + 4 <= m {
+            let a0 = a + (row + 0) * lda
+            let a1 = a + (row + 1) * lda
+            let a2 = a + (row + 2) * lda
+            let a3 = a + (row + 3) * lda
+            let c0 = c + (row + 0) * ldc
+            let c1 = c + (row + 1) * ldc
+            let c2 = c + (row + 2) * ldc
+            let c3 = c + (row + 3) * ldc
+
+            var col = 0
+            while col + 16 <= n {
+                var acc00 = SIMD8<Float>(repeating: 0.0), acc01 = SIMD8<Float>(repeating: 0.0)
+                var acc10 = SIMD8<Float>(repeating: 0.0), acc11 = SIMD8<Float>(repeating: 0.0)
+                var acc20 = SIMD8<Float>(repeating: 0.0), acc21 = SIMD8<Float>(repeating: 0.0)
+                var acc30 = SIMD8<Float>(repeating: 0.0), acc31 = SIMD8<Float>(repeating: 0.0)
+                var p = 0
+                while p < k {
+                    let bPtr = b + p * ldb + col
+                    let b0 = load(bPtr)
+                    let b1 = load(bPtr + 8)
+                    let v0 = SIMD8<Float>(repeating: a0[p])
+                    let v1 = SIMD8<Float>(repeating: a1[p])
+                    let v2 = SIMD8<Float>(repeating: a2[p])
+                    let v3 = SIMD8<Float>(repeating: a3[p])
+                    acc00.addProduct(v0, b0); acc01.addProduct(v0, b1)
+                    acc10.addProduct(v1, b0); acc11.addProduct(v1, b1)
+                    acc20.addProduct(v2, b0); acc21.addProduct(v2, b1)
+                    acc30.addProduct(v3, b0); acc31.addProduct(v3, b1)
+                    p += 1
                 }
-                p += 1
+                if beta == 0.0 {
+                    store(acc00, c0 + col); store(acc01, c0 + col + 8)
+                    store(acc10, c1 + col); store(acc11, c1 + col + 8)
+                    store(acc20, c2 + col); store(acc21, c2 + col + 8)
+                    store(acc30, c3 + col); store(acc31, c3 + col + 8)
+                } else if beta == 1.0 {
+                    store(load(c0 + col) + acc00, c0 + col); store(load(c0 + col + 8) + acc01, c0 + col + 8)
+                    store(load(c1 + col) + acc10, c1 + col); store(load(c1 + col + 8) + acc11, c1 + col + 8)
+                    store(load(c2 + col) + acc20, c2 + col); store(load(c2 + col + 8) + acc21, c2 + col + 8)
+                    store(load(c3 + col) + acc30, c3 + col); store(load(c3 + col + 8) + acc31, c3 + col + 8)
+                } else {
+                    store(load(c0 + col) * bVec + acc00, c0 + col); store(load(c0 + col + 8) * bVec + acc01, c0 + col + 8)
+                    store(load(c1 + col) * bVec + acc10, c1 + col); store(load(c1 + col + 8) * bVec + acc11, c1 + col + 8)
+                    store(load(c2 + col) * bVec + acc20, c2 + col); store(load(c2 + col + 8) * bVec + acc21, c2 + col + 8)
+                    store(load(c3 + col) * bVec + acc30, c3 + col); store(load(c3 + col + 8) * bVec + acc31, c3 + col + 8)
+                }
+                col += 16
+            }
+
+            while col + 8 <= n {
+                var acc0 = SIMD8<Float>(repeating: 0.0)
+                var acc1 = SIMD8<Float>(repeating: 0.0)
+                var acc2 = SIMD8<Float>(repeating: 0.0)
+                var acc3 = SIMD8<Float>(repeating: 0.0)
+                var p = 0
+                while p < k {
+                    let b0 = load(b + p * ldb + col)
+                    acc0.addProduct(SIMD8<Float>(repeating: a0[p]), b0)
+                    acc1.addProduct(SIMD8<Float>(repeating: a1[p]), b0)
+                    acc2.addProduct(SIMD8<Float>(repeating: a2[p]), b0)
+                    acc3.addProduct(SIMD8<Float>(repeating: a3[p]), b0)
+                    p += 1
+                }
+                if beta == 0.0 {
+                    store(acc0, c0 + col); store(acc1, c1 + col); store(acc2, c2 + col); store(acc3, c3 + col)
+                } else if beta == 1.0 {
+                    store(load(c0 + col) + acc0, c0 + col); store(load(c1 + col) + acc1, c1 + col)
+                    store(load(c2 + col) + acc2, c2 + col); store(load(c3 + col) + acc3, c3 + col)
+                } else {
+                    store(load(c0 + col) * bVec + acc0, c0 + col); store(load(c1 + col) * bVec + acc1, c1 + col)
+                    store(load(c2 + col) * bVec + acc2, c2 + col); store(load(c3 + col) * bVec + acc3, c3 + col)
+                }
+                col += 8
+            }
+
+            while col < n {
+                var s0: Float = 0.0, s1: Float = 0.0, s2: Float = 0.0, s3: Float = 0.0
+                var p = 0
+                while p < k {
+                    let bv = b[p * ldb + col]
+                    s0 += a0[p] * bv; s1 += a1[p] * bv; s2 += a2[p] * bv; s3 += a3[p] * bv
+                    p += 1
+                }
+                if beta == 0.0 {
+                    c0[col] = s0; c1[col] = s1; c2[col] = s2; c3[col] = s3
+                } else {
+                    c0[col] = beta * c0[col] + s0; c1[col] = beta * c1[col] + s1
+                    c2[col] = beta * c2[col] + s2; c3[col] = beta * c3[col] + s3
+                }
+                col += 1
+            }
+            row += 4
+        }
+
+        // Remaining rows (0..3)
+        while row < m {
+            let aRow = a + row * lda
+            let cRow = c + row * ldc
+            var col = 0
+            while col + 16 <= n {
+                var acc0 = SIMD8<Float>(repeating: 0.0)
+                var acc1 = SIMD8<Float>(repeating: 0.0)
+                var p = 0
+                while p < k {
+                    let aVec = SIMD8<Float>(repeating: aRow[p])
+                    let bPtr = b + p * ldb + col
+                    acc0.addProduct(aVec, load(bPtr))
+                    acc1.addProduct(aVec, load(bPtr + 8))
+                    p += 1
+                }
+                if beta == 0.0 {
+                    store(acc0, cRow + col); store(acc1, cRow + col + 8)
+                } else if beta == 1.0 {
+                    store(load(cRow + col) + acc0, cRow + col); store(load(cRow + col + 8) + acc1, cRow + col + 8)
+                } else {
+                    store(load(cRow + col) * bVec + acc0, cRow + col); store(load(cRow + col + 8) * bVec + acc1, cRow + col + 8)
+                }
+                col += 16
+            }
+            while col + 8 <= n {
+                var acc0 = SIMD8<Float>(repeating: 0.0)
+                var p = 0
+                while p < k {
+                    acc0.addProduct(SIMD8<Float>(repeating: aRow[p]), load(b + p * ldb + col))
+                    p += 1
+                }
+                if beta == 0.0 {
+                    store(acc0, cRow + col)
+                } else if beta == 1.0 {
+                    store(load(cRow + col) + acc0, cRow + col)
+                } else {
+                    store(load(cRow + col) * bVec + acc0, cRow + col)
+                }
+                col += 8
+            }
+            while col < n {
+                var s: Float = 0.0
+                var p = 0
+                while p < k {
+                    s += aRow[p] * b[p * ldb + col]
+                    p += 1
+                }
+                cRow[col] = (beta == 0.0) ? s : (beta * cRow[col] + s)
+                col += 1
             }
             row += 1
         }
@@ -1485,19 +1631,34 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         inDim: Int,
         outDim: Int
     ) -> [Float] {
-        var y = [Float](repeating: 0.0, count: rows * outDim)
+        guard rows > 0 && outDim > 0 else { return [] }
         if let bias = b {
-            for r in 0..<rows {
-                let base = r * outDim
-                for c in 0..<outDim {
-                    y[base + c] = bias[c]
+            return [Float](unsafeUninitializedCapacity: rows * outDim) { yBuf, initializedCount in
+                let yPtr = yBuf.baseAddress!
+                bias.withUnsafeBufferPointer { bBuf in
+                    let bPtr = bBuf.baseAddress!
+                    for r in 0..<rows {
+                        (yPtr + r * outDim).initialize(from: bPtr, count: outDim)
+                    }
                 }
+                x.withUnsafeBufferPointer { xBuf in
+                    w.withUnsafeBufferPointer { wBuf in
+                        gemmRaw(xBuf.baseAddress!, inDim, wBuf.baseAddress!, outDim, yPtr, outDim, m: rows, n: outDim, k: inDim, beta: 1.0)
+                    }
+                }
+                initializedCount = rows * outDim
             }
-            gemm(x, w, &y, m: rows, n: outDim, k: inDim, beta: 1.0)
         } else {
-            gemm(x, w, &y, m: rows, n: outDim, k: inDim, beta: 0.0)
+            return [Float](unsafeUninitializedCapacity: rows * outDim) { yBuf, initializedCount in
+                let yPtr = yBuf.baseAddress!
+                x.withUnsafeBufferPointer { xBuf in
+                    w.withUnsafeBufferPointer { wBuf in
+                        gemmRaw(xBuf.baseAddress!, inDim, wBuf.baseAddress!, outDim, yPtr, outDim, m: rows, n: outDim, k: inDim, beta: 0.0)
+                    }
+                }
+                initializedCount = rows * outDim
+            }
         }
-        return y
     }
 
     /// Feature-wise LayerNorm over `x: [rows, dim]` with affine parameters `gamma: [dim]` and `beta: [dim]`.
@@ -1509,36 +1670,89 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         dim: Int,
         eps: Float = SWTHawkShape.layerNormEps
     ) -> [Float] {
-        var y = [Float](repeating: 0.0, count: rows * dim)
-        let invD = 1.0 / Float(max(1, dim))
-        for r in 0..<rows {
-            let base = r * dim
-            var sum: Float = 0.0
-            for c in 0..<dim {
-                sum += x[base + c]
+        guard rows > 0 && dim > 0 else { return [] }
+        let invD = 1.0 / Float(dim)
+        return [Float](unsafeUninitializedCapacity: rows * dim) { yBuf, initializedCount in
+            let yBase = yBuf.baseAddress!
+            x.withUnsafeBufferPointer { xBuf in
+                gamma.withUnsafeBufferPointer { gBuf in
+                    beta.withUnsafeBufferPointer { bBuf in
+                        let xBase = xBuf.baseAddress!
+                        let gBase = gBuf.baseAddress!
+                        let bBase = bBuf.baseAddress!
+                        for r in 0..<rows {
+                            let xRow = xBase + r * dim
+                            let yRow = yBase + r * dim
+                            var sumVec = SIMD8<Float>(repeating: 0.0)
+                            var c = 0
+                            while c + 8 <= dim {
+                                sumVec += load(xRow + c)
+                                c += 8
+                            }
+                            var sum = sumVec.sum()
+                            while c < dim {
+                                sum += xRow[c]
+                                c += 1
+                            }
+                            let mean = sum * invD
+                            let meanVec = SIMD8<Float>(repeating: mean)
+
+                            var varVec = SIMD8<Float>(repeating: 0.0)
+                            c = 0
+                            while c + 8 <= dim {
+                                let d = load(xRow + c) - meanVec
+                                varVec.addProduct(d, d)
+                                c += 8
+                            }
+                            var varSum = varVec.sum()
+                            while c < dim {
+                                let d = xRow[c] - mean
+                                varSum += d * d
+                                c += 1
+                            }
+                            let invStd = 1.0 / sqrtf(varSum * invD + eps)
+                            let invStdVec = SIMD8<Float>(repeating: invStd)
+
+                            c = 0
+                            while c + 8 <= dim {
+                                let norm = (load(xRow + c) - meanVec) * invStdVec
+                                store(norm * load(gBase + c) + load(bBase + c), yRow + c)
+                                c += 8
+                            }
+                            while c < dim {
+                                yRow[c] = (xRow[c] - mean) * invStd * gBase[c] + bBase[c]
+                                c += 1
+                            }
+                        }
+                    }
+                }
             }
-            let mean = sum * invD
-            var varSum: Float = 0.0
-            for c in 0..<dim {
-                let d = x[base + c] - mean
-                varSum += d * d
-            }
-            let invStd = 1.0 / sqrtf(varSum * invD + eps)
-            for c in 0..<dim {
-                y[base + c] = (x[base + c] - mean) * invStd * gamma[c] + beta[c]
-            }
+            initializedCount = rows * dim
         }
-        return y
     }
 
-    /// Element-wise SiLU `x * σ(x)`.
+    /// Element-wise SiLU `x * σ(x)` (`SIMD8<Float>` via `SIMDMath.sigmoid`).
     public static func silu(_ x: [Float]) -> [Float] {
-        var out = [Float](repeating: 0.0, count: x.count)
-        for i in 0..<x.count {
-            let v = x[i]
-            out[i] = v / (1.0 + expf(-v))
+        let n = x.count
+        guard n > 0 else { return [] }
+        return [Float](unsafeUninitializedCapacity: n) { outBuf, initializedCount in
+            let outPtr = outBuf.baseAddress!
+            x.withUnsafeBufferPointer { xBuf in
+                let xPtr = xBuf.baseAddress!
+                var i = 0
+                while i + 8 <= n {
+                    let v = load(xPtr + i)
+                    store(v * SIMDMath.sigmoid(v), outPtr + i)
+                    i += 8
+                }
+                while i < n {
+                    let v = xPtr[i]
+                    outPtr[i] = v / (1.0 + expf(-v))
+                    i += 1
+                }
+            }
+            initializedCount = n
         }
-        return out
     }
 
     @inline(__always)

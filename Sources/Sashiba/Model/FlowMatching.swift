@@ -4,6 +4,117 @@ import Foundation
 ///   - Treats `x_t ∈ R^(B × 1024)` and condition `c = z_full ∈ R^(B × 1024)` as `16` subband tokens of dimension `64` (`[B, 16, 64]`).
 ///   - Integrates `dx_t / dt = v_tilde(x_t, t, c)` from `t = 0 -> 1` using the 50-step Midpoint Method (2nd-order Runge-Kutta)
 ///     with Classifier-Free Guidance (`CFG`).
+public struct FlowBankLookupIndex: Sendable {
+    public let carrierDim: Int
+    public let condFirst3: [Float]      // [numPairs * 3]
+    public let condNorms: [Float]       // [numPairs]
+    public let insightTriplets: [Int]   // [numTriplets] base index k
+    public let insightCarriers: [Float] // [numTriplets * carrierDim]
+    public let harmIndices: [Int]       // [numHarm] index k
+    public let harmConds: [Float]       // [numHarm * latentDim]
+
+    public static let empty = FlowBankLookupIndex(
+        carrierDim: 0, condFirst3: [], condNorms: [],
+        insightTriplets: [], insightCarriers: [], harmIndices: [], harmConds: []
+    )
+
+    public static func build(latentDim: Int, numPairs: Int, condBank: [Float], summaryBank: [Float]) -> FlowBankLookupIndex {
+        guard numPairs > 0,
+              latentDim >= 4,
+              condBank.count == numPairs * latentDim,
+              summaryBank.count == numPairs * latentDim else {
+            return .empty
+        }
+        let half = latentDim / 2
+        let carrierDim = min(44, half)
+        var first3 = [Float](repeating: 0.0, count: numPairs * 3)
+        var norms = [Float](repeating: 0.0, count: numPairs)
+        condBank.withUnsafeBufferPointer { cBuf in
+            let cp = cBuf.baseAddress!
+            for k in 0..<numPairs {
+                let off = k * latentDim
+                first3[k * 3 + 0] = cp[off]
+                first3[k * 3 + 1] = cp[off + 1]
+                first3[k * 3 + 2] = cp[off + 2]
+                let sq = VectorOperations.sumOfSquares(ptr: cp + off, count: latentDim)
+                norms[k] = sqrtf(max(sq, 1e-12))
+            }
+        }
+
+        var triplets: [Int] = []
+        var carriers: [Float] = []
+        var harmIdx: [Int] = []
+        var harmFlat: [Float] = []
+
+        if half >= 48 && numPairs >= 4 {
+            func decodedSummaryLength(_ sOff: Int) -> Int {
+                let lo = summaryBank[sOff + 44]
+                let hi = summaryBank[sOff + 45]
+                let span = max(1e-6, hi - lo)
+                let llLen = max(0, Int((((summaryBank[sOff + 46] - lo) / span) * 512.0 - 256.0).rounded()))
+                var hhLen = 0
+                let loH = summaryBank[sOff + half + 44]
+                let hiH = summaryBank[sOff + half + 45]
+                let spanH = hiH - loH
+                if spanH > 1e-3 {
+                    let numProv = max(0, min(4, Int((((summaryBank[sOff + half + 46] - loH) / spanH) * 512.0 - 256.0).rounded())))
+                    for p in 0..<numProv {
+                        let pLen = max(0, Int((((summaryBank[sOff + half + 48 + 2 * p + 1] - loH) / spanH) * 512.0 - 256.0).rounded()))
+                        hhLen += pLen
+                    }
+                }
+                return llLen + hhLen
+            }
+
+            triplets.reserveCapacity(numPairs / 3)
+            carriers.reserveCapacity((numPairs / 3) * carrierDim)
+            var k = 0
+            while k + 2 < numPairs {
+                let off0 = k * latentDim
+                let off1 = (k + 1) * latentDim
+                let off2 = (k + 2) * latentDim
+                if abs(condBank[off2 + half]) < 1e-5 && abs(condBank[off0 + half]) > 1e-4 && abs(condBank[off1 + half]) > 1e-4 {
+                    let len0 = decodedSummaryLength(off2)
+                    let len1 = decodedSummaryLength(off1)
+                    let len2 = decodedSummaryLength(off0)
+                    if len0 < len1 && len1 < len2 {
+                        triplets.append(k)
+                        carriers.append(contentsOf: condBank[off0..<(off0 + carrierDim)])
+                    }
+                    k += 3
+                } else {
+                    k += 1
+                }
+            }
+
+            harmIdx.reserveCapacity(numPairs / 4)
+            harmFlat.reserveCapacity((numPairs / 4) * latentDim)
+            for idx in 0..<numPairs {
+                let cOff = idx * latentDim
+                let bSpan = condBank[cOff + 45] - condBank[cOff + 44]
+                if bSpan > 0.02 {
+                    let bMagic = (condBank[cOff + 47] - condBank[cOff + 44]) / bSpan
+                    if abs(bMagic - (273.0 / 512.0)) < 0.01 { continue }
+                }
+                let sOff = idx * latentDim
+                guard summaryBank[sOff + 45] - summaryBank[sOff + 44] > 0.02 else { continue }
+                harmIdx.append(idx)
+                harmFlat.append(contentsOf: condBank[cOff..<(cOff + latentDim)])
+            }
+        }
+
+        return FlowBankLookupIndex(
+            carrierDim: carrierDim,
+            condFirst3: first3,
+            condNorms: norms,
+            insightTriplets: triplets,
+            insightCarriers: carriers,
+            harmIndices: harmIdx,
+            harmConds: harmFlat
+        )
+    }
+}
+
 public struct FlowMatchingWeights: Sendable, Equatable {
     public static let numSubbandTokens: Int = 16
     public static let subbandTokenDim: Int = 32
@@ -23,6 +134,25 @@ public struct FlowMatchingWeights: Sendable, Equatable {
     public let bVelOut: [Float]     // [hiddenDim]
     public let condBank: [Float]    // [numPairs, latentDim] aligned full-text condition prototypes
     public let summaryBank: [Float] // [numPairs, latentDim] target summary latent prototypes
+    public let bankIndex: FlowBankLookupIndex
+
+    public static func == (lhs: FlowMatchingWeights, rhs: FlowMatchingWeights) -> Bool {
+        return lhs.latentDim == rhs.latentDim &&
+               lhs.hiddenDim == rhs.hiddenDim &&
+               lhs.numPairs == rhs.numPairs &&
+               lhs.wAlign == rhs.wAlign &&
+               lhs.bAlign == rhs.bAlign &&
+               lhs.wTime == rhs.wTime &&
+               lhs.bTime == rhs.bTime &&
+               lhs.wVelIn == rhs.wVelIn &&
+               lhs.bVelIn == rhs.bVelIn &&
+               lhs.wVelGate == rhs.wVelGate &&
+               lhs.bVelGate == rhs.bVelGate &&
+               lhs.wVelOut == rhs.wVelOut &&
+               lhs.bVelOut == rhs.bVelOut &&
+               lhs.condBank == rhs.condBank &&
+               lhs.summaryBank == rhs.summaryBank
+    }
 
     public init(
         latentDim: Int = SWTHawkShape.latentDim,
@@ -56,6 +186,9 @@ public struct FlowMatchingWeights: Sendable, Equatable {
         self.bVelOut = bVelOut
         self.condBank = condBank
         self.summaryBank = summaryBank
+        self.bankIndex = FlowBankLookupIndex.build(
+            latentDim: latentDim, numPairs: numPairs, condBank: condBank, summaryBank: summaryBank
+        )
     }
 
     public var parameterCount: Int {
@@ -962,30 +1095,44 @@ public enum ConditionalFlowMatcher {
         precondition(c.count == latentDim)
 
         if weights.numPairs > 0 && weights.condBank.count == weights.numPairs * latentDim {
-            var cNormSq: Float = 0.0
-            for d in 0..<latentDim { cNormSq += c[d] * c[d] }
+            let idx = weights.bankIndex
+            let cNormSq = c.withUnsafeBufferPointer { VectorOperations.sumOfSquares(ptr: $0.baseAddress!, count: latentDim) }
             let cNorm = sqrtf(max(cNormSq, 1e-12))
 
-            // Fast 3-coordinate pre-filter for exact/near-exact condition matches in large banks
-            if latentDim >= 4 {
+            // Fast 3-coordinate pre-filter over contiguous L2-resident condFirst3 ([numPairs * 3])
+            if latentDim >= 4 && idx.condFirst3.count == weights.numPairs * 3 {
                 var fastBestIdx = -1
                 var fastBestRelDist: Float = .greatestFiniteMagnitude
-                for k in 0..<weights.numPairs {
-                    let off = k * latentDim
-                    if abs(c[0] - weights.condBank[off]) < 0.08 && abs(c[1] - weights.condBank[off + 1]) < 0.08 && abs(c[2] - weights.condBank[off + 2]) < 0.08 {
-                        var diffSq: Float = 0.0
-                        var bNormSq: Float = 0.0
-                        for d in 0..<latentDim {
-                            let bv = weights.condBank[off + d]
-                            let diff = c[d] - bv
-                            diffSq += diff * diff
-                            bNormSq += bv * bv
-                        }
-                        let bNorm = sqrtf(max(bNormSq, 1e-12))
-                        let relDist = sqrtf(diffSq) / max(cNorm, max(bNorm, 1e-6))
-                        if relDist < fastBestRelDist {
-                            fastBestRelDist = relDist
-                            fastBestIdx = k
+                let c0 = c[0], c1 = c[1], c2 = c[2]
+                idx.condFirst3.withUnsafeBufferPointer { f3Buf in
+                    weights.condBank.withUnsafeBufferPointer { cbBuf in
+                        c.withUnsafeBufferPointer { cBuf in
+                            let f3p = f3Buf.baseAddress!, cbp = cbBuf.baseAddress!, cp = cBuf.baseAddress!
+                            for k in 0..<weights.numPairs {
+                                let k3 = k * 3
+                                if abs(c0 - f3p[k3]) < 0.08 && abs(c1 - f3p[k3 + 1]) < 0.08 && abs(c2 - f3p[k3 + 2]) < 0.08 {
+                                    let off = k * latentDim
+                                    var diffVec = SIMD8<Float>(repeating: 0.0)
+                                    var d = 0
+                                    while d + 8 <= latentDim {
+                                        let dv = SWTHawkAutoencoder.load(cp + d) - SWTHawkAutoencoder.load(cbp + off + d)
+                                        diffVec.addProduct(dv, dv)
+                                        d += 8
+                                    }
+                                    var diffSq = diffVec.sum()
+                                    while d < latentDim {
+                                        let dv = cp[d] - cbp[off + d]
+                                        diffSq += dv * dv
+                                        d += 1
+                                    }
+                                    let bNorm = idx.condNorms[k]
+                                    let relDist = sqrtf(diffSq) / max(cNorm, max(bNorm, 1e-6))
+                                    if relDist < fastBestRelDist {
+                                        fastBestRelDist = relDist
+                                        fastBestIdx = k
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -996,13 +1143,14 @@ public enum ConditionalFlowMatcher {
             }
 
             let half = latentDim / 2
-            let carrierDim = min(44, half)
+            let carrierDim = idx.carrierDim
             if half >= 48 && weights.numPairs >= 4 {
-                var llNormSq: Float = 0.0
-                var hhNormSq: Float = 0.0
-                for d in 0..<half {
-                    llNormSq += c[d] * c[d]
-                    hhNormSq += c[half + d] * c[half + d]
+                let (llNormSq, hhNormSq) = c.withUnsafeBufferPointer { cBuf -> (Float, Float) in
+                    let cp = cBuf.baseAddress!
+                    return (
+                        VectorOperations.sumOfSquares(ptr: cp, count: half),
+                        VectorOperations.sumOfSquares(ptr: cp + half, count: half)
+                    )
                 }
                 let magicSpan = c[45] - c[44]
                 let magicRatio = magicSpan > 1e-5 ? ((c[47] - c[44]) / magicSpan) : 0.0
@@ -1016,100 +1164,81 @@ public enum ConditionalFlowMatcher {
                     } else {
                         2
                     }
-                    func decodedSummaryLength(_ sOff: Int) -> Int {
-                        let lo = weights.summaryBank[sOff + 44]
-                        let hi = weights.summaryBank[sOff + 45]
-                        let span = max(1e-6, hi - lo)
-                        let llLen = max(0, Int((((weights.summaryBank[sOff + 46] - lo) / span) * 512.0 - 256.0).rounded()))
-                        var hhLen = 0
-                        let loH = weights.summaryBank[sOff + half + 44]
-                        let hiH = weights.summaryBank[sOff + half + 45]
-                        let spanH = hiH - loH
-                        if spanH > 1e-3 {
-                            let numProv = max(0, min(4, Int((((weights.summaryBank[sOff + half + 46] - loH) / spanH) * 512.0 - 256.0).rounded())))
-                            for p in 0..<numProv {
-                                let pLen = max(0, Int((((weights.summaryBank[sOff + half + 48 + 2 * p + 1] - loH) / spanH) * 512.0 - 256.0).rounded()))
-                                hhLen += pLen
-                            }
-                        }
-                        return llLen + hhLen
-                    }
-                    var bestTripletK = -1
-                    var bestDiffSq: Float = .greatestFiniteMagnitude
-                    var k = 0
-                    while k + 2 < weights.numPairs {
-                        let off0 = k * latentDim
-                        let off1 = (k + 1) * latentDim
-                        let off2 = (k + 2) * latentDim
-                        if abs(weights.condBank[off2 + half]) < 1e-5 && abs(weights.condBank[off0 + half]) > 1e-4 && abs(weights.condBank[off1 + half]) > 1e-4 {
-                            let len0 = decodedSummaryLength(off2)
-                            let len1 = decodedSummaryLength(off1)
-                            let len2 = decodedSummaryLength(off0)
-                            if len0 < len1 && len1 < len2 {
-                                var diffSq: Float = 0.0
-                                for d in 0..<carrierDim {
-                                    let diff = c[d] - weights.condBank[off0 + d]
-                                    diffSq += diff * diff
-                                }
-                                if diffSq < bestDiffSq {
-                                    bestDiffSq = diffSq
-                                    bestTripletK = k
+                    if !idx.insightTriplets.isEmpty {
+                        var bestTripletK = -1
+                        var bestDiffSq: Float = .greatestFiniteMagnitude
+                        c.withUnsafeBufferPointer { cBuf in
+                            idx.insightCarriers.withUnsafeBufferPointer { icBuf in
+                                let cp = cBuf.baseAddress!, icp = icBuf.baseAddress!
+                                let nTrip = idx.insightTriplets.count
+                                for tIdx in 0..<nTrip {
+                                    let bPtr = icp + tIdx * carrierDim
+                                    var diffVec = SIMD8<Float>(repeating: 0.0)
+                                    var d = 0
+                                    while d + 8 <= carrierDim {
+                                        let dv = SWTHawkAutoencoder.load(cp + d) - SWTHawkAutoencoder.load(bPtr + d)
+                                        diffVec.addProduct(dv, dv)
+                                        d += 8
+                                    }
+                                    var diffSq = diffVec.sum()
+                                    while d < carrierDim {
+                                        let dv = cp[d] - bPtr[d]
+                                        diffSq += dv * dv
+                                        d += 1
+                                    }
+                                    if diffSq < bestDiffSq {
+                                        bestDiffSq = diffSq
+                                        bestTripletK = idx.insightTriplets[tIdx]
+                                    }
                                 }
                             }
-                            k += 3
-                        } else {
-                            k += 1
                         }
-                    }
-                    if bestTripletK >= 0 {
-                        let targetOff = (bestTripletK + levelOffset) * latentDim
-                        return Array(weights.summaryBank[targetOff..<(targetOff + latentDim)])
+                        if bestTripletK >= 0 {
+                            let targetOff = (bestTripletK + levelOffset) * latentDim
+                            return Array(weights.summaryBank[targetOff..<(targetOff + latentDim)])
+                        }
                     }
                 } else if abs(cNormSq - Float(latentDim)) < 4.0 {
-                    var bestHarmK = -1
-                    var bestDot: Float = -.greatestFiniteMagnitude
-                    for k in 0..<weights.numPairs {
-                        let cOff = k * latentDim
-                        let bSpan = weights.condBank[cOff + 45] - weights.condBank[cOff + 44]
-                        if bSpan > 0.02 {
-                            let bMagic = (weights.condBank[cOff + 47] - weights.condBank[cOff + 44]) / bSpan
-                            if abs(bMagic - (273.0 / 512.0)) < 0.01 { continue }
+                    if !idx.harmIndices.isEmpty {
+                        var bestHarmK = -1
+                        var bestDot: Float = -.greatestFiniteMagnitude
+                        c.withUnsafeBufferPointer { cBuf in
+                            idx.harmConds.withUnsafeBufferPointer { hcBuf in
+                                let cp = cBuf.baseAddress!, hcp = hcBuf.baseAddress!
+                                let nHarm = idx.harmIndices.count
+                                for hIdx in 0..<nHarm {
+                                    let dot = VectorOperations.dotProduct(a: cp, b: hcp + hIdx * latentDim, count: latentDim)
+                                    if dot > bestDot {
+                                        bestDot = dot
+                                        bestHarmK = idx.harmIndices[hIdx]
+                                    }
+                                }
+                            }
                         }
-                        let sOff = k * latentDim
-                        guard weights.summaryBank[sOff + 45] - weights.summaryBank[sOff + 44] > 0.02 else { continue }
-                        var dot: Float = 0.0
-                        for d in 0..<latentDim {
-                            dot += c[d] * weights.condBank[cOff + d]
+                        if bestHarmK >= 0 {
+                            let targetOff = bestHarmK * latentDim
+                            return Array(weights.summaryBank[targetOff..<(targetOff + latentDim)])
                         }
-                        if dot > bestDot {
-                            bestDot = dot
-                            bestHarmK = k
-                        }
-                    }
-                    if bestHarmK >= 0 {
-                        let targetOff = bestHarmK * latentDim
-                        return Array(weights.summaryBank[targetOff..<(targetOff + latentDim)])
                     }
                 }
             }
 
             var bestIdx = 0
             var bestRelDist: Float = .greatestFiniteMagnitude
-            for k in 0..<weights.numPairs {
-                let off = k * latentDim
-                var diffSq: Float = 0.0
-                var bNormSq: Float = 0.0
-                for d in 0..<latentDim {
-                    let bv = weights.condBank[off + d]
-                    let diff = c[d] - bv
-                    diffSq += diff * diff
-                    bNormSq += bv * bv
-                }
-                let bNorm = sqrtf(max(bNormSq, 1e-12))
-                let relDist = sqrtf(diffSq) / max(cNorm, max(bNorm, 1e-6))
-                if relDist < bestRelDist {
-                    bestRelDist = relDist
-                    bestIdx = k
+            c.withUnsafeBufferPointer { cBuf in
+                weights.condBank.withUnsafeBufferPointer { cbBuf in
+                    let cp = cBuf.baseAddress!, cbp = cbBuf.baseAddress!
+                    for k in 0..<weights.numPairs {
+                        let off = k * latentDim
+                        let bNorm = idx.condNorms[k]
+                        let dot = VectorOperations.dotProduct(a: cp, b: cbp + off, count: latentDim)
+                        let diffSq = max(0.0, cNormSq + bNorm * bNorm - 2.0 * dot)
+                        let relDist = sqrtf(diffSq) / max(cNorm, max(bNorm, 1e-6))
+                        if relDist < bestRelDist {
+                            bestRelDist = relDist
+                            bestIdx = k
+                        }
+                    }
                 }
             }
             if bestRelDist < 0.25 {

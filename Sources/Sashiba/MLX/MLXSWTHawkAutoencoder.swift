@@ -1062,7 +1062,6 @@ public final class MLXSWTHawkAutoencoder: Module, @unchecked Sendable {
         let fStride = DualStreamRelationalWeights.frameStride
         let frameCount = max(1, (time + fStride - 1) / fStride)
         let padLen = frameCount * fStride - time
-        let halfD = d / 2
 
         func buildSequenceFrames(_ eRel: MLXArray, _ pm: MLXArray) -> (frameLL: MLXArray, frameHH: MLXArray, fMask: MLXArray) {
             let (ca1, cd1, ca2, cd2) = swtBranch.decompose(eRel)

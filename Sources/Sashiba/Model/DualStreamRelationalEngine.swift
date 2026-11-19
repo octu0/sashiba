@@ -870,6 +870,69 @@ public enum DualStreamRelationalEngine {
         time: Int,
         weights: SWTHawkWeights
     ) -> (phiLL: [Float], phiHH: [Float], zRel: [Float], zContent: [Float]) {
+        let btInput = batch * time
+        precondition(senderTokens.count == btInput && receiverTokens.count == btInput)
+
+        // Exact active-length trimming: trailing <pad> tokens beyond maxActive + 8 (>= 2 full frames)
+        // have zero mask/pairMask/fMask and strictly causal/local +/-1 frame receptive field,
+        // producing identical outputs while avoiding redundant padding FLOPs.
+        var maxRawActive = 0
+        senderTokens.withUnsafeBufferPointer { sBuf in
+            receiverTokens.withUnsafeBufferPointer { rBuf in
+                let sp = sBuf.baseAddress!, rp = rBuf.baseAddress!
+                for b in 0..<batch {
+                    let base = b * time
+                    var t = time - 1
+                    while t >= maxRawActive {
+                        if sp[base + t] > 0 || rp[base + t] > 0 {
+                            maxRawActive = t + 1
+                            break
+                        }
+                        t -= 1
+                    }
+                }
+            }
+        }
+        let effTime = min(time, max(8, ((maxRawActive + 8 + 3) / 4) * 4))
+        if effTime < time {
+            var sTrim = [Int](repeating: 0, count: batch * effTime)
+            var rTrim = [Int](repeating: 0, count: batch * effTime)
+            senderTokens.withUnsafeBufferPointer { sSrc in
+                receiverTokens.withUnsafeBufferPointer { rSrc in
+                    sTrim.withUnsafeMutableBufferPointer { sDst in
+                        rTrim.withUnsafeMutableBufferPointer { rDst in
+                            for b in 0..<batch {
+                                (sDst.baseAddress! + b * effTime).update(from: sSrc.baseAddress! + b * time, count: effTime)
+                                (rDst.baseAddress! + b * effTime).update(from: rSrc.baseAddress! + b * time, count: effTime)
+                            }
+                        }
+                    }
+                }
+            }
+            return forwardBatchCPUCore(
+                senderTokens: sTrim,
+                receiverTokens: rTrim,
+                batch: batch,
+                time: effTime,
+                weights: weights
+            )
+        }
+        return forwardBatchCPUCore(
+            senderTokens: senderTokens,
+            receiverTokens: receiverTokens,
+            batch: batch,
+            time: time,
+            weights: weights
+        )
+    }
+
+    private static func forwardBatchCPUCore(
+        senderTokens: [Int],
+        receiverTokens: [Int],
+        batch: Int,
+        time: Int,
+        weights: SWTHawkWeights
+    ) -> (phiLL: [Float], phiHH: [Float], zRel: [Float], zContent: [Float]) {
         let d = weights.dim
         let lDim = weights.relational.latentDim
         let half = lDim / 2
@@ -1219,43 +1282,108 @@ public enum DualStreamRelationalEngine {
             var inHH1 = [Float](repeating: 0.0, count: btCount * 2 * d)
             var inHH2 = [Float](repeating: 0.0, count: btCount * d)
 
-            for b in 0..<batch {
-                let bTimeOff = b * time
-                let bMatOff = b * time * d
-                let bMatOff2 = b * time * 2 * d
-                for t in 0..<time {
-                    let pm = pairMask[bTimeOff + t]
-                    guard pm > 0.0 else { continue }
-                    let curOff = bMatOff + t * d
-                    let prevOff = bMatOff + max(0, t - 1) * d
-                    let prev2Off = bMatOff + max(0, t - 2) * d
-                    let curOff2 = bMatOff2 + t * 2 * d
-                    for c in 0..<d {
-                        let c1 = (c + 1) % d
-                        let c2 = (c + 2) % d
-                        let c3 = (c + 3) % d
-                        let c5 = (c + 5) % d
-                        let c9 = (c + 9) % d
+            eRel.withUnsafeBufferPointer { erBuf in
+                ca1.withUnsafeBufferPointer { ca1Buf in
+                    cd1.withUnsafeBufferPointer { cd1Buf in
+                        ca2.withUnsafeBufferPointer { ca2Buf in
+                            cd2.withUnsafeBufferPointer { cd2Buf in
+                                inLL1.withUnsafeMutableBufferPointer { ll1Buf in
+                                    inLL2.withUnsafeMutableBufferPointer { ll2Buf in
+                                        inHH1.withUnsafeMutableBufferPointer { hh1Buf in
+                                            inHH2.withUnsafeMutableBufferPointer { hh2Buf in
+                                                let erp = erBuf.baseAddress!
+                                                let ca1p = ca1Buf.baseAddress!, cd1p = cd1Buf.baseAddress!
+                                                let ca2p = ca2Buf.baseAddress!, cd2p = cd2Buf.baseAddress!
+                                                let ll1p = ll1Buf.baseAddress!, ll2p = ll2Buf.baseAddress!
+                                                let hh1p = hh1Buf.baseAddress!, hh2p = hh2Buf.baseAddress!
+                                                let v06 = SIMD8<Float>(repeating: 0.6), v04 = SIMD8<Float>(repeating: 0.4)
+                                                let v05 = SIMD8<Float>(repeating: 0.5), v065 = SIMD8<Float>(repeating: 0.65)
+                                                let zeroV = SIMD8<Float>(repeating: 0.0)
+                                                let simdEnd = max(0, d - 9)
 
-                        let mixPrev = 0.6 * eRel[prevOff + c1] - 0.4 * eRel[prevOff + c3] + 0.5 * eRel[prevOff + c]
-                        let mixPrev2 = 0.6 * eRel[prevOff + c5] - 0.4 * eRel[prevOff + c9] + 0.5 * eRel[prevOff + c2]
-                        let mixSkip = 0.6 * eRel[prev2Off + c5] - 0.4 * eRel[prev2Off + c1] + 0.5 * eRel[prev2Off + c3]
-                        let mixCA1Prev = 0.6 * ca1[prevOff + c5] - 0.4 * ca1[prevOff + c9] + 0.5 * ca1[prevOff + c2]
-                        let mixCA2 = 0.6 * ca2[curOff + c1] - 0.4 * ca2[curOff + c3] + 0.5 * ca2[curOff + c]
+                                                for b in 0..<batch {
+                                                    let bTimeOff = b * time
+                                                    let bMatOff = b * time * d
+                                                    let bMatOff2 = b * time * 2 * d
+                                                    for t in 0..<time {
+                                                        let pm = pairMask[bTimeOff + t]
+                                                        guard pm > 0.0 else { continue }
+                                                        let pmV = SIMD8<Float>(repeating: pm)
+                                                        let curOff = bMatOff + t * d
+                                                        let prevOff = bMatOff + max(0, t - 1) * d
+                                                        let prev2Off = bMatOff + max(0, t - 2) * d
+                                                        let curOff2 = bMatOff2 + t * 2 * d
 
-                        let eCur = eRel[curOff + c]
-                        let cd1Cur = cd1[curOff + c]
-                        let cd2Cur = cd2[curOff + c]
+                                                        var c = 0
+                                                        while c + 8 <= simdEnd {
+                                                            let ep0 = SWTHawkAutoencoder.load(erp + prevOff + c)
+                                                            let ep1 = SWTHawkAutoencoder.load(erp + prevOff + c + 1)
+                                                            let ep2 = SWTHawkAutoencoder.load(erp + prevOff + c + 2)
+                                                            let ep3 = SWTHawkAutoencoder.load(erp + prevOff + c + 3)
+                                                            let ep5 = SWTHawkAutoencoder.load(erp + prevOff + c + 5)
+                                                            let ep9 = SWTHawkAutoencoder.load(erp + prevOff + c + 9)
 
-                        let bi1 = mixPrev * eCur * pm
-                        let biSkip = mixSkip * eCur * pm
-                        let triDetail = mixCA1Prev * cd1Cur * pm
+                                                            let mixPrev = v06 * ep1 - v04 * ep3 + v05 * ep0
+                                                            let mixPrev2 = v06 * ep5 - v04 * ep9 + v05 * ep2
+                                                            let mixSkip = v06 * SWTHawkAutoencoder.load(erp + prev2Off + c + 5) - v04 * SWTHawkAutoencoder.load(erp + prev2Off + c + 1) + v05 * SWTHawkAutoencoder.load(erp + prev2Off + c + 3)
+                                                            let mixCA1Prev = v06 * SWTHawkAutoencoder.load(ca1p + prevOff + c + 5) - v04 * SWTHawkAutoencoder.load(ca1p + prevOff + c + 9) + v05 * SWTHawkAutoencoder.load(ca1p + prevOff + c + 2)
+                                                            let mixCA2 = v06 * SWTHawkAutoencoder.load(ca2p + curOff + c + 1) - v04 * SWTHawkAutoencoder.load(ca2p + curOff + c + 3) + v05 * SWTHawkAutoencoder.load(ca2p + curOff + c)
 
-                        inLL1[curOff + c] = (bi1 + 0.50 * cd2Cur * mixCA2) * pm
-                        inLL2[curOff + c] = (biSkip + 0.50 * triDetail) * pm
-                        inHH1[curOff2 + c] = cd1Cur * (0.40 + abs(mixPrev)) * pm
-                        inHH1[curOff2 + d + c] = abs(cd1Cur) * abs(bi1) * pm
-                        inHH2[curOff + c] = (triDetail + 0.65 * cd2Cur * mixPrev2) * pm
+                                                            let eCur = SWTHawkAutoencoder.load(erp + curOff + c)
+                                                            let cd1Cur = SWTHawkAutoencoder.load(cd1p + curOff + c)
+                                                            let cd2Cur = SWTHawkAutoencoder.load(cd2p + curOff + c)
+
+                                                            let bi1 = mixPrev * eCur * pmV
+                                                            let biSkip = mixSkip * eCur * pmV
+                                                            let triDetail = mixCA1Prev * cd1Cur * pmV
+                                                            let absMixPrev = mixPrev.replacing(with: -mixPrev, where: mixPrev .< zeroV)
+                                                            let absCd1 = cd1Cur.replacing(with: -cd1Cur, where: cd1Cur .< zeroV)
+                                                            let absBi1 = bi1.replacing(with: -bi1, where: bi1 .< zeroV)
+
+                                                            SWTHawkAutoencoder.store((bi1 + v05 * cd2Cur * mixCA2) * pmV, ll1p + curOff + c)
+                                                            SWTHawkAutoencoder.store((biSkip + v05 * triDetail) * pmV, ll2p + curOff + c)
+                                                            SWTHawkAutoencoder.store(cd1Cur * (v04 + absMixPrev) * pmV, hh1p + curOff2 + c)
+                                                            SWTHawkAutoencoder.store(absCd1 * absBi1 * pmV, hh1p + curOff2 + d + c)
+                                                            SWTHawkAutoencoder.store((triDetail + v065 * cd2Cur * mixPrev2) * pmV, hh2p + curOff + c)
+                                                            c += 8
+                                                        }
+
+                                                        while c < d {
+                                                            let c1 = (c + 1 < d) ? (c + 1) : (c + 1 - d)
+                                                            let c2 = (c + 2 < d) ? (c + 2) : (c + 2 - d)
+                                                            let c3 = (c + 3 < d) ? (c + 3) : (c + 3 - d)
+                                                            let c5 = (c + 5 < d) ? (c + 5) : (c + 5 - d)
+                                                            let c9 = (c + 9 < d) ? (c + 9) : (c + 9 - d)
+
+                                                            let mixPrev = 0.6 * erp[prevOff + c1] - 0.4 * erp[prevOff + c3] + 0.5 * erp[prevOff + c]
+                                                            let mixPrev2 = 0.6 * erp[prevOff + c5] - 0.4 * erp[prevOff + c9] + 0.5 * erp[prevOff + c2]
+                                                            let mixSkip = 0.6 * erp[prev2Off + c5] - 0.4 * erp[prev2Off + c1] + 0.5 * erp[prev2Off + c3]
+                                                            let mixCA1Prev = 0.6 * ca1p[prevOff + c5] - 0.4 * ca1p[prevOff + c9] + 0.5 * ca1p[prevOff + c2]
+                                                            let mixCA2 = 0.6 * ca2p[curOff + c1] - 0.4 * ca2p[curOff + c3] + 0.5 * ca2p[curOff + c]
+
+                                                            let eCur = erp[curOff + c]
+                                                            let cd1Cur = cd1p[curOff + c]
+                                                            let cd2Cur = cd2p[curOff + c]
+
+                                                            let bi1 = mixPrev * eCur * pm
+                                                            let biSkip = mixSkip * eCur * pm
+                                                            let triDetail = mixCA1Prev * cd1Cur * pm
+
+                                                            ll1p[curOff + c] = (bi1 + 0.50 * cd2Cur * mixCA2) * pm
+                                                            ll2p[curOff + c] = (biSkip + 0.50 * triDetail) * pm
+                                                            hh1p[curOff2 + c] = cd1Cur * (0.40 + abs(mixPrev)) * pm
+                                                            hh1p[curOff2 + d + c] = abs(cd1Cur) * abs(bi1) * pm
+                                                            hh2p[curOff + c] = (triDetail + 0.65 * cd2Cur * mixPrev2) * pm
+                                                            c += 1
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1416,14 +1544,31 @@ public enum DualStreamRelationalEngine {
             return raw
         }
 
-        func crossAttend(_ qB: [Float], _ kB: [Float], _ vB: [Float], keyMaskOff: Int, keyMask: [Float], queryMaskOff: Int, queryMask: [Float]) -> [Float] {
+        func crossAttend(_ qFull: [Float], _ kFull: [Float], _ vFull: [Float], matOff: Int, keyMaskOff: Int, keyMask: [Float], queryMaskOff: Int, queryMask: [Float]) -> [Float] {
             var kT = [Float](repeating: 0.0, count: d * frameCount)
-            for s in 0..<frameCount {
-                let src = s * d
-                for c in 0..<d { kT[c * frameCount + s] = kB[src + c] }
+            kFull.withUnsafeBufferPointer { kBuf in
+                kT.withUnsafeMutableBufferPointer { ktBuf in
+                    let kp = kBuf.baseAddress! + matOff
+                    let ktp = ktBuf.baseAddress!
+                    for s in 0..<frameCount {
+                        let src = s * d
+                        for c in 0..<d { ktp[c * frameCount + s] = kp[src + c] }
+                    }
+                }
             }
             var scores = [Float](repeating: 0.0, count: frameCount * frameCount)
-            SWTHawkAutoencoder.gemm(qB, kT, &scores, m: frameCount, n: frameCount, k: d)
+            qFull.withUnsafeBufferPointer { qBuf in
+                kT.withUnsafeBufferPointer { ktBuf in
+                    scores.withUnsafeMutableBufferPointer { scBuf in
+                        SWTHawkAutoencoder.gemmRaw(
+                            qBuf.baseAddress! + matOff, d,
+                            ktBuf.baseAddress!, frameCount,
+                            scBuf.baseAddress!, frameCount,
+                            m: frameCount, n: frameCount, k: d, beta: 0.0
+                        )
+                    }
+                }
+            }
             for t in 0..<frameCount {
                 let rOff = t * frameCount
                 var maxVal: Float = -.greatestFiniteMagnitude
@@ -1442,7 +1587,18 @@ public enum DualStreamRelationalEngine {
                 for s in 0..<frameCount { scores[rOff + s] *= inv }
             }
             var attn = [Float](repeating: 0.0, count: frameCount * d)
-            SWTHawkAutoencoder.gemm(scores, vB, &attn, m: frameCount, n: d, k: frameCount)
+            scores.withUnsafeBufferPointer { scBuf in
+                vFull.withUnsafeBufferPointer { vBuf in
+                    attn.withUnsafeMutableBufferPointer { atBuf in
+                        SWTHawkAutoencoder.gemmRaw(
+                            scBuf.baseAddress!, frameCount,
+                            vBuf.baseAddress! + matOff, d,
+                            atBuf.baseAddress!, d,
+                            m: frameCount, n: d, k: frameCount, beta: 0.0
+                        )
+                    }
+                }
+            }
             for t in 0..<frameCount {
                 let qm = queryMask[queryMaskOff + t]
                 if qm != 1.0 {
@@ -1480,10 +1636,9 @@ public enum DualStreamRelationalEngine {
             for b in 0..<batch {
                 let fOff = b * frameCount
                 let matOff = fOff * d
-                let matEnd = matOff + frameCount * d
 
-                let attnCS = crossAttend(Array(qC[matOff..<matEnd]), Array(kS[matOff..<matEnd]), Array(vS[matOff..<matEnd]), keyMaskOff: fOff, keyMask: fMaskS, queryMaskOff: fOff, queryMask: fMaskC)
-                let attnSC = crossAttend(Array(qS[matOff..<matEnd]), Array(kC[matOff..<matEnd]), Array(vC[matOff..<matEnd]), keyMaskOff: fOff, keyMask: fMaskC, queryMaskOff: fOff, queryMask: fMaskS)
+                let attnCS = crossAttend(qC, kS, vS, matOff: matOff, keyMaskOff: fOff, keyMask: fMaskS, queryMaskOff: fOff, queryMask: fMaskC)
+                let attnSC = crossAttend(qS, kC, vC, matOff: matOff, keyMaskOff: fOff, keyMask: fMaskC, queryMaskOff: fOff, queryMask: fMaskS)
 
                 let wSalS0 = computeSalienceWeights(salLogitsS, fMaskS, b: b, col: 0)
                 let wSalS1 = computeSalienceWeights(salLogitsS, fMaskS, b: b, col: 1)
@@ -1794,42 +1949,64 @@ public enum DualStreamRelationalEngine {
         return out
     }
 
+    private static let extractorCacheLock = NSLock()
+    nonisolated(unsafe) private static var cachedExtractorKey: (Int, Int, Int)? = nil
+    nonisolated(unsafe) private static var cachedExtractorValue: RelationalHybridFeatureExtractor? = nil
+
+    private static func cachedHybridExtractor(for weights: SWTHawkWeights) -> RelationalHybridFeatureExtractor {
+        let key = (weights.vocabSize, weights.serializedVocabulary.utf8.count, weights.serializedVocabulary.hashValue)
+        extractorCacheLock.lock()
+        if let k = cachedExtractorKey, k == key, let ext = cachedExtractorValue {
+            extractorCacheLock.unlock()
+            return ext
+        }
+        extractorCacheLock.unlock()
+        let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
+        let built = RelationalHybridFeatureExtractor(vocabulary: vocab)
+        extractorCacheLock.lock()
+        cachedExtractorKey = key
+        cachedExtractorValue = built
+        extractorCacheLock.unlock()
+        return built
+    }
+
     /// Pure-neural Dual-Stream Relational Encoder taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])` (`Phase 5.1 Audit 1`).
     public static func encodeRelational(
         senderTokenIDs: [Int],
         receiverTokenIDs: [Int],
         weights: SWTHawkWeights
     ) -> [Float] {
-        let time = max(DualStreamRelationalWeights.canonicalSeqLen, max(senderTokenIDs.count, receiverTokenIDs.count))
-        let sPad = padOrTruncate(senderTokenIDs, to: time)
-        let cPad = padOrTruncate(receiverTokenIDs, to: time)
-        return forwardBatchCPU(
+        let rawMax = max(senderTokenIDs.count, receiverTokenIDs.count)
+        let effT = max(8, ((rawMax + 8 + 3) / 4) * 4)
+        let sPad = padOrTruncate(senderTokenIDs, to: effT)
+        let cPad = padOrTruncate(receiverTokenIDs, to: effT)
+        return forwardBatchCPUCore(
             senderTokens: sPad,
             receiverTokens: cPad,
             batch: 1,
-            time: time,
+            time: effT,
             weights: weights
         ).zRel
     }
 
-    /// Full Dual-Stream Relational Inference (`v4` + `v4_hybrid`) taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])`.
+    /// Full Dual-Stream Relational Inference (`v6` + `v6_hybrid`) taking strictly `(senderTokenIDs: [Int], receiverTokenIDs: [Int])`.
     public static func inferRelational(
         senderTokenIDs: [Int],
         receiverTokenIDs: [Int],
         weights: SWTHawkWeights
     ) -> RelationalInferenceOutput {
-        let time = max(DualStreamRelationalWeights.canonicalSeqLen, max(senderTokenIDs.count, receiverTokenIDs.count))
-        let sPad = padOrTruncate(senderTokenIDs, to: time)
-        let cPad = padOrTruncate(receiverTokenIDs, to: time)
-        let res = forwardBatchCPU(
+        let rawMax = max(senderTokenIDs.count, receiverTokenIDs.count)
+        let effT = max(8, ((rawMax + 8 + 3) / 4) * 4)
+        let sPad = padOrTruncate(senderTokenIDs, to: effT)
+        let cPad = padOrTruncate(receiverTokenIDs, to: effT)
+        let res = forwardBatchCPUCore(
             senderTokens: sPad,
             receiverTokens: cPad,
             batch: 1,
-            time: time,
+            time: effT,
             weights: weights
         )
-        let vocab = TextVocabulary.deserialize(weights.serializedVocabulary)
-        let hyb = RelationalHybridFeatureExtractor(vocabulary: vocab).extract(
+        let hyb = cachedHybridExtractor(for: weights).extract(
             senderTokens: sPad, receiverTokens: cPad, zRel: res.zRel, weights: weights
         )
         return makeInferenceOutput(zRel: res.zRel, hybridFeatures: hyb, zContent: res.zContent, weights: weights.relational)
@@ -1871,7 +2048,7 @@ public enum DualStreamRelationalEngine {
         let base: UnsafeMutablePointer<Float>
     }
 
-    /// Multi-core pure-CPU batch encoder (`0` GPU memory / `0` MLX kernels) using `DispatchQueue.concurrentPerform`.
+    /// Multi-core pure-CPU batch encoder (`0` GPU memory / `0` MLX kernels) using length-sorted LPT scheduling + `DispatchQueue.concurrentPerform`.
     public static func encodeZRelCPUParallel(
         senders: [[Int]],
         receivers: [[Int]],
@@ -1882,8 +2059,21 @@ public enum DualStreamRelationalEngine {
         let n = min(senders.count, receivers.count)
         guard n > 0 else { return [] }
         let lDim = weights.relational.latentDim
-        let t = max(DualStreamRelationalWeights.canonicalSeqLen, time)
-        let numChunks = (n + chunkSize - 1) / chunkSize
+        let maxCapT = max(DualStreamRelationalWeights.canonicalSeqLen, time)
+
+        // Compute active non-pad token length per pair and sort descending (LPT scheduling + homogeneous chunk lengths)
+        var activeLens = [Int](repeating: 0, count: n)
+        for i in 0..<n {
+            var cS = 0
+            for tok in senders[i] where tok != TextVocabulary.padId { cS += 1 }
+            var cR = 0
+            for tok in receivers[i] where tok != TextVocabulary.padId { cR += 1 }
+            activeLens[i] = min(maxCapT, max(cS, cR))
+        }
+        let sortedOrder = (0..<n).sorted { activeLens[$0] > activeLens[$1] }
+
+        let effChunk = max(1, min(chunkSize, max(4, (n + 31) / 32)))
+        let numChunks = (n + effChunk - 1) / effChunk
         let totalFloats = n * lDim
         let rawPtr = UnsafeMutablePointer<Float>.allocate(capacity: totalFloats)
         rawPtr.initialize(repeating: 0.0, count: totalFloats)
@@ -1892,28 +2082,44 @@ public enum DualStreamRelationalEngine {
             rawPtr.deallocate()
         }
         let dst = SendableFloatPtr(base: rawPtr)
+        let lensCopy = activeLens
         DispatchQueue.concurrentPerform(iterations: numChunks) { cIdx in
-            let start = cIdx * chunkSize
-            let end = min(n, start + chunkSize)
+            let start = cIdx * effChunk
+            let end = min(n, start + effChunk)
             let curB = end - start
-            var sFlat: [Int] = []
-            var rFlat: [Int] = []
-            sFlat.reserveCapacity(curB * t)
-            rFlat.reserveCapacity(curB * t)
-            for i in start..<end {
-                sFlat.append(contentsOf: padOrTruncate(senders[i], to: t))
-                rFlat.append(contentsOf: padOrTruncate(receivers[i], to: t))
+            let maxAct = lensCopy[sortedOrder[start]]
+            let chunkT = min(maxCapT, max(8, ((maxAct + 8 + 3) / 4) * 4))
+            var sFlat = [Int](repeating: TextVocabulary.padId, count: curB * chunkT)
+            var rFlat = [Int](repeating: TextVocabulary.padId, count: curB * chunkT)
+            for localIdx in 0..<curB {
+                let origIdx = sortedOrder[start + localIdx]
+                let rowOff = localIdx * chunkT
+                var posS = 0
+                for tok in senders[origIdx] where tok != TextVocabulary.padId {
+                    if posS >= maxCapT { break }
+                    sFlat[rowOff + posS] = tok
+                    posS += 1
+                }
+                var posR = 0
+                for tok in receivers[origIdx] where tok != TextVocabulary.padId {
+                    if posR >= maxCapT { break }
+                    rFlat[rowOff + posR] = tok
+                    posR += 1
+                }
             }
-            let zChunk = forwardBatchCPU(
+            let zChunk = forwardBatchCPUCore(
                 senderTokens: sFlat,
                 receiverTokens: rFlat,
                 batch: curB,
-                time: t,
+                time: chunkT,
                 weights: weights
             ).zRel
-            let dstOffset = start * lDim
-            for k in 0..<zChunk.count {
-                dst.base[dstOffset + k] = zChunk[k]
+            zChunk.withUnsafeBufferPointer { zBuf in
+                let zp = zBuf.baseAddress!
+                for localIdx in 0..<curB {
+                    let origIdx = sortedOrder[start + localIdx]
+                    (dst.base + origIdx * lDim).update(from: zp + localIdx * lDim, count: lDim)
+                }
             }
         }
         var out: [[Float]] = []

@@ -112,46 +112,87 @@ public enum SWTFrequencyBranch {
     ) -> (ca1: [Float], cd1: [Float], ca2: [Float], cd2: [Float]) {
         let total = batch * time * dim
         precondition(x.count == total)
+        guard total > 0 else { return ([], [], [], []) }
         let s = SWTBranchWeights.invSqrt2
+        let sVec = SIMD8<Float>(repeating: s)
 
         var ca1 = [Float](repeating: 0.0, count: total)
         var cd1 = [Float](repeating: 0.0, count: total)
         var ca2 = [Float](repeating: 0.0, count: total)
         var cd2 = [Float](repeating: 0.0, count: total)
 
-        // Level 1 (dilation d = 1): h = [1/√2, 1/√2], g = [-1/√2, 1/√2]
-        for b in 0..<batch {
-            let bBase = b * time * dim
-            for t in 0..<time {
-                let tPrev = max(0, t - 1)
-                let prevOff = bBase + tPrev * dim
-                let curOff = bBase + t * dim
-                for c in 0..<dim {
-                    let xPrev = x[prevOff + c]
-                    let xCur = x[curOff + c]
-                    ca1[curOff + c] = s * (xPrev + xCur)
-                    cd1[curOff + c] = s * (xCur - xPrev)
-                }
-            }
-        }
+        x.withUnsafeBufferPointer { xBuf in
+            ca1.withUnsafeMutableBufferPointer { ca1Buf in
+                cd1.withUnsafeMutableBufferPointer { cd1Buf in
+                    ca2.withUnsafeMutableBufferPointer { ca2Buf in
+                        cd2.withUnsafeMutableBufferPointer { cd2Buf in
+                            let xp = xBuf.baseAddress!
+                            let a1p = ca1Buf.baseAddress!
+                            let d1p = cd1Buf.baseAddress!
+                            let a2p = ca2Buf.baseAddress!
+                            let d2p = cd2Buf.baseAddress!
 
-        // Level 2 (dilation d = 2) on CA1
-        for b in 0..<batch {
-            let bBase = b * time * dim
-            for t in 0..<time {
-                let tPrev = max(0, t - 2)
-                let prevOff = bBase + tPrev * dim
-                let curOff = bBase + t * dim
-                for c in 0..<dim {
-                    let aPrev = ca1[prevOff + c]
-                    let aCur = ca1[curOff + c]
-                    ca2[curOff + c] = s * (aPrev + aCur)
-                    cd2[curOff + c] = s * (aCur - aPrev)
+                            // Level 1 (dilation d = 1)
+                            for b in 0..<batch {
+                                let bBase = b * time * dim
+                                for t in 0..<time {
+                                    let prevOff = bBase + max(0, t - 1) * dim
+                                    let curOff = bBase + t * dim
+                                    var c = 0
+                                    while c + 8 <= dim {
+                                        let vPrev = SWTHawkAutoencoder.load(xp + prevOff + c)
+                                        let vCur = SWTHawkAutoencoder.load(xp + curOff + c)
+                                        SWTHawkAutoencoder.store(sVec * (vPrev + vCur), a1p + curOff + c)
+                                        SWTHawkAutoencoder.store(sVec * (vCur - vPrev), d1p + curOff + c)
+                                        c += 8
+                                    }
+                                    while c < dim {
+                                        let xPrev = xp[prevOff + c]
+                                        let xCur = xp[curOff + c]
+                                        a1p[curOff + c] = s * (xPrev + xCur)
+                                        d1p[curOff + c] = s * (xCur - xPrev)
+                                        c += 1
+                                    }
+                                }
+                            }
+
+                            // Level 2 (dilation d = 2) on CA1
+                            for b in 0..<batch {
+                                let bBase = b * time * dim
+                                for t in 0..<time {
+                                    let prevOff = bBase + max(0, t - 2) * dim
+                                    let curOff = bBase + t * dim
+                                    var c = 0
+                                    while c + 8 <= dim {
+                                        let vPrev = SWTHawkAutoencoder.load(ArrayPointerHelper.const(a1p + prevOff + c))
+                                        let vCur = SWTHawkAutoencoder.load(ArrayPointerHelper.const(a1p + curOff + c))
+                                        SWTHawkAutoencoder.store(sVec * (vPrev + vCur), a2p + curOff + c)
+                                        SWTHawkAutoencoder.store(sVec * (vCur - vPrev), d2p + curOff + c)
+                                        c += 8
+                                    }
+                                    while c < dim {
+                                        let aPrev = a1p[prevOff + c]
+                                        let aCur = a1p[curOff + c]
+                                        a2p[curOff + c] = s * (aPrev + aCur)
+                                        d2p[curOff + c] = s * (aCur - aPrev)
+                                        c += 1
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
         return (ca1, cd1, ca2, cd2)
+    }
+
+    private enum ArrayPointerHelper {
+        @inline(__always)
+        static func const(_ p: UnsafeMutablePointer<Float>) -> UnsafePointer<Float> {
+            UnsafePointer(p)
+        }
     }
 
     /// Exact inverse of 1-level undecimated Haar SWT (`(CA + CD) / √2 == X`), useful for verifying energy conservation.
@@ -191,51 +232,58 @@ public enum SWTFrequencyBranch {
     ) -> [Float] {
         let dIn = inDim ?? weights.inDim
         let dOut = outDim ?? weights.outDim
-        let totalOut = batch * time * dOut
+        let rows = batch * time
+        let totalOut = rows * dOut
+        guard totalOut > 0 else { return [] }
         let sliceSize = dIn * dOut
-        let w0 = Array(weights.w[0..<sliceSize])
-        let w1 = Array(weights.w[sliceSize..<(2 * sliceSize)])
-        let w2 = Array(weights.w[(2 * sliceSize)..<(3 * sliceSize)])
 
-        var out = [Float](repeating: 0.0, count: totalOut)
-        for row in 0..<(batch * time) {
-            let base = row * dOut
-            for c in 0..<dOut {
-                out[base + c] = weights.b[c]
+        return [Float](unsafeUninitializedCapacity: totalOut) { outBuf, initializedCount in
+            let op = outBuf.baseAddress!
+            weights.b.withUnsafeBufferPointer { bBuf in
+                let bp = bBuf.baseAddress!
+                for row in 0..<rows {
+                    (op + row * dOut).initialize(from: bp, count: dOut)
+                }
             }
-        }
+            x.withUnsafeBufferPointer { xBuf in
+                weights.w.withUnsafeBufferPointer { wBuf in
+                    let xp = xBuf.baseAddress!
+                    let wp = wBuf.baseAddress!
+                    let w0p = wp
+                    let w1p = wp + sliceSize
+                    let w2p = wp + 2 * sliceSize
 
-        // Center tap (k = 1) over all B * T rows
-        SWTHawkAutoencoder.gemm(x, w1, &out, m: batch * time, n: dOut, k: dIn, beta: 1.0)
+                    // Center tap (k = 1) over all B * T rows
+                    SWTHawkAutoencoder.gemmRaw(
+                        xp, dIn,
+                        w1p, dOut,
+                        op, dOut,
+                        m: rows, n: dOut, k: dIn, beta: 1.0
+                    )
 
-        // Left tap (k = 0, reads t - 1) and right tap (k = 2, reads t + 1)
-        for b in 0..<batch {
-            let inBOff = b * time * dIn
-            let outBOff = b * time * dOut
-            if time > 1 {
-                x.withUnsafeBufferPointer { xp in
-                    out.withUnsafeMutableBufferPointer { op in
-                        w0.withUnsafeBufferPointer { w0p in
+                    // Left tap (k = 0, reads t - 1) and right tap (k = 2, reads t + 1)
+                    if time > 1 {
+                        for b in 0..<batch {
+                            let inBOff = b * time * dIn
+                            let outBOff = b * time * dOut
                             SWTHawkAutoencoder.gemmRaw(
-                                xp.baseAddress! + inBOff, dIn,
-                                w0p.baseAddress!, dOut,
-                                op.baseAddress! + outBOff + dOut, dOut,
+                                xp + inBOff, dIn,
+                                w0p, dOut,
+                                op + outBOff + dOut, dOut,
                                 m: time - 1, n: dOut, k: dIn, beta: 1.0
                             )
-                        }
-                        w2.withUnsafeBufferPointer { w2p in
                             SWTHawkAutoencoder.gemmRaw(
-                                xp.baseAddress! + inBOff + dIn, dIn,
-                                w2p.baseAddress!, dOut,
-                                op.baseAddress! + outBOff, dOut,
+                                xp + inBOff + dIn, dIn,
+                                w2p, dOut,
+                                op + outBOff, dOut,
                                 m: time - 1, n: dOut, k: dIn, beta: 1.0
                             )
                         }
                     }
                 }
             }
+            initializedCount = totalOut
         }
-        return out
     }
 
     /// Extracts low-frequency approximation features `F_approx` (`CA2`) and energy-preserving adaptively routed
@@ -286,21 +334,46 @@ public enum SWTFrequencyBranch {
             rows: rows, inDim: 2 * dim, outDim: 2 * dim
         )
 
-        var fDetail = [Float](repeating: 0.0, count: total)
-        for r in 0..<rows {
-            let rLogOff = r * 2 * dim
-            let fOff = r * dim
-            for c in 0..<dim {
-                let l1 = routerLogits[rLogOff + c]
-                let l2 = routerLogits[rLogOff + dim + c]
-                let m = max(l1, l2)
-                let e1 = expf(l1 - m)
-                let e2 = expf(l2 - m)
-                let invSum = 1.0 / (e1 + e2)
-                let a1 = e1 * invSum
-                let a2 = e2 * invSum
-                fDetail[fOff + c] = a1 * uCD1[fOff + c] + a2 * uCD2[fOff + c]
+        let fDetail = [Float](unsafeUninitializedCapacity: total) { fBuf, initCount in
+            let fp = fBuf.baseAddress!
+            routerLogits.withUnsafeBufferPointer { rBuf in
+                uCD1.withUnsafeBufferPointer { u1Buf in
+                    uCD2.withUnsafeBufferPointer { u2Buf in
+                        let rp = rBuf.baseAddress!
+                        let u1p = u1Buf.baseAddress!
+                        let u2p = u2Buf.baseAddress!
+                        let oneVec = SIMD8<Float>(repeating: 1.0)
+                        for r in 0..<rows {
+                            let rLogOff = r * 2 * dim
+                            let fOff = r * dim
+                            var c = 0
+                            while c + 8 <= dim {
+                                let l1 = SWTHawkAutoencoder.load(rp + rLogOff + c)
+                                let l2 = SWTHawkAutoencoder.load(rp + rLogOff + dim + c)
+                                let m = l1.replacing(with: l2, where: l1 .< l2)
+                                let e1 = SIMDMath.exp(l1 - m)
+                                let e2 = SIMDMath.exp(l2 - m)
+                                let invSum = oneVec / (e1 + e2)
+                                let v1 = SWTHawkAutoencoder.load(u1p + fOff + c)
+                                let v2 = SWTHawkAutoencoder.load(u2p + fOff + c)
+                                SWTHawkAutoencoder.store((e1 * invSum) * v1 + (e2 * invSum) * v2, fp + fOff + c)
+                                c += 8
+                            }
+                            while c < dim {
+                                let l1 = rp[rLogOff + c]
+                                let l2 = rp[rLogOff + dim + c]
+                                let m = max(l1, l2)
+                                let e1 = expf(l1 - m)
+                                let e2 = expf(l2 - m)
+                                let invSum = 1.0 / (e1 + e2)
+                                fp[fOff + c] = (e1 * invSum) * u1p[fOff + c] + (e2 * invSum) * u2p[fOff + c]
+                                c += 1
+                            }
+                        }
+                    }
+                }
             }
+            initCount = total
         }
 
         return (fApprox, fDetail)
@@ -320,15 +393,22 @@ public enum SWTFrequencyBranch {
         let rows = batch * time
         let total = rows * dim
         precondition(fApprox.count == total && fDetail.count == total)
+        guard total > 0 else { return [] }
 
-        var gateCat = [Float](repeating: 0.0, count: rows * 2 * dim)
-        for r in 0..<rows {
-            let srcOff = r * dim
-            let dstOff = r * 2 * dim
-            for c in 0..<dim {
-                gateCat[dstOff + c] = fApprox[srcOff + c]
-                gateCat[dstOff + dim + c] = fDetail[srcOff + c]
+        let gateCat = [Float](unsafeUninitializedCapacity: rows * 2 * dim) { catBuf, initCount in
+            let cp = catBuf.baseAddress!
+            fApprox.withUnsafeBufferPointer { aBuf in
+                fDetail.withUnsafeBufferPointer { dBuf in
+                    let ap = aBuf.baseAddress!
+                    let dp = dBuf.baseAddress!
+                    for r in 0..<rows {
+                        let dst = cp + r * 2 * dim
+                        (dst).initialize(from: ap + r * dim, count: dim)
+                        (dst + dim).initialize(from: dp + r * dim, count: dim)
+                    }
+                }
             }
+            initCount = rows * 2 * dim
         }
 
         let gatePre = SWTHawkAutoencoder.linear(
@@ -336,12 +416,33 @@ public enum SWTFrequencyBranch {
             rows: rows, inDim: 2 * dim, outDim: dim
         )
 
-        var fSWT = [Float](repeating: 0.0, count: total)
-        for i in 0..<total {
-            let g = 1.0 / (1.0 + expf(-gatePre[i]))
-            fSWT[i] = g * fApprox[i] + (1.0 - g) * fDetail[i]
+        return [Float](unsafeUninitializedCapacity: total) { outBuf, initCount in
+            let op = outBuf.baseAddress!
+            gatePre.withUnsafeBufferPointer { gBuf in
+                fApprox.withUnsafeBufferPointer { aBuf in
+                    fDetail.withUnsafeBufferPointer { dBuf in
+                        let gp = gBuf.baseAddress!
+                        let ap = aBuf.baseAddress!
+                        let dp = dBuf.baseAddress!
+                        let oneVec = SIMD8<Float>(repeating: 1.0)
+                        var i = 0
+                        while i + 8 <= total {
+                            let g = SIMDMath.sigmoid(SWTHawkAutoencoder.load(gp + i))
+                            let va = SWTHawkAutoencoder.load(ap + i)
+                            let vd = SWTHawkAutoencoder.load(dp + i)
+                            SWTHawkAutoencoder.store(g * va + (oneVec - g) * vd, op + i)
+                            i += 8
+                        }
+                        while i < total {
+                            let g = 1.0 / (1.0 + expf(-gp[i]))
+                            op[i] = g * ap[i] + (1.0 - g) * dp[i]
+                            i += 1
+                        }
+                    }
+                }
+            }
+            initCount = total
         }
-        return fSWT
     }
 
     /// Forward pass of Branch A (`1D-SWT Frequency Branch`): `[B, T, D] -> [B, T, D]`.

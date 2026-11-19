@@ -73,14 +73,21 @@ public enum GatedTimeFrequencyFusion {
         let total = rows * dim
         precondition(fSWT.count == total && tFeat.count == total)
 
-        var concatFT = [Float](repeating: 0.0, count: rows * 2 * dim)
-        for r in 0..<rows {
-            let srcOff = r * dim
-            let dstOff = r * 2 * dim
-            for c in 0..<dim {
-                concatFT[dstOff + c] = fSWT[srcOff + c]
-                concatFT[dstOff + dim + c] = tFeat[srcOff + c]
+        guard total > 0 else { return ([], [], []) }
+        let concatFT = [Float](unsafeUninitializedCapacity: rows * 2 * dim) { catBuf, initCount in
+            let cp = catBuf.baseAddress!
+            fSWT.withUnsafeBufferPointer { fBuf in
+                tFeat.withUnsafeBufferPointer { tBuf in
+                    let fp = fBuf.baseAddress!
+                    let tp = tBuf.baseAddress!
+                    for r in 0..<rows {
+                        let dst = cp + r * 2 * dim
+                        dst.initialize(from: fp + r * dim, count: dim)
+                        (dst + dim).initialize(from: tp + r * dim, count: dim)
+                    }
+                }
             }
+            initCount = rows * 2 * dim
         }
 
         let gatePre = SWTHawkAutoencoder.linear(
@@ -92,19 +99,50 @@ public enum GatedTimeFrequencyFusion {
             rows: rows, inDim: 2 * dim, outDim: dim
         )
 
-        // Bidirectional cross-interaction gate between frequency and temporal streams
         var fResidual = [Float](repeating: 0.0, count: total)
         var tResidual = [Float](repeating: 0.0, count: total)
         var residualSum = [Float](repeating: 0.0, count: total)
-        for i in 0..<total {
-            let g = gatePre[i]
-            let sigG = 1.0 / (1.0 + expf(-g))
-            let siluG = g * sigG
-            let hFus = siluG * up[i]
-            let crossFT = sigG * tFeat[i] + (1.0 - sigG) * fSWT[i]
-            fResidual[i] = fSWT[i] + hFus + 0.25 * crossFT
-            tResidual[i] = tFeat[i] + hFus + 0.25 * crossFT
-            residualSum[i] = fSWT[i] + tFeat[i] + hFus
+        gatePre.withUnsafeBufferPointer { gBuf in
+            up.withUnsafeBufferPointer { uBuf in
+                fSWT.withUnsafeBufferPointer { fBuf in
+                    tFeat.withUnsafeBufferPointer { tBuf in
+                        fResidual.withUnsafeMutableBufferPointer { frBuf in
+                            tResidual.withUnsafeMutableBufferPointer { trBuf in
+                                residualSum.withUnsafeMutableBufferPointer { rsBuf in
+                                    let gp = gBuf.baseAddress!, upPtr = uBuf.baseAddress!
+                                    let fp = fBuf.baseAddress!, tp = tBuf.baseAddress!
+                                    let frp = frBuf.baseAddress!, trp = trBuf.baseAddress!, rsp = rsBuf.baseAddress!
+                                    let oneVec = SIMD8<Float>(repeating: 1.0)
+                                    let qVec = SIMD8<Float>(repeating: 0.25)
+                                    var i = 0
+                                    while i + 8 <= total {
+                                        let g = SWTHawkAutoencoder.load(gp + i)
+                                        let sigG = SIMDMath.sigmoid(g)
+                                        let hFus = (g * sigG) * SWTHawkAutoencoder.load(upPtr + i)
+                                        let vf = SWTHawkAutoencoder.load(fp + i)
+                                        let vt = SWTHawkAutoencoder.load(tp + i)
+                                        let crossFT = sigG * vt + (oneVec - sigG) * vf
+                                        SWTHawkAutoencoder.store(vf + hFus + qVec * crossFT, frp + i)
+                                        SWTHawkAutoencoder.store(vt + hFus + qVec * crossFT, trp + i)
+                                        SWTHawkAutoencoder.store(vf + vt + hFus, rsp + i)
+                                        i += 8
+                                    }
+                                    while i < total {
+                                        let g = gp[i]
+                                        let sigG = 1.0 / (1.0 + expf(-g))
+                                        let hFus = (g * sigG) * upPtr[i]
+                                        let crossFT = sigG * tp[i] + (1.0 - sigG) * fp[i]
+                                        frp[i] = fp[i] + hFus + 0.25 * crossFT
+                                        trp[i] = tp[i] + hFus + 0.25 * crossFT
+                                        rsp[i] = fp[i] + tp[i] + hFus
+                                        i += 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let uF = SWTHawkAutoencoder.layerNorm(
@@ -119,7 +157,7 @@ public enum GatedTimeFrequencyFusion {
         return (uF, uT, uFused)
     }
 
-    /// Forward pass returning `uFused: [B, T, D]`.
+    /// Forward pass returning `uFused: [B, T, D]` directly (avoids computing unused `uF` / `uT` LayerNorms).
     public static func forward(
         fSWT: [Float],
         tFeat: [Float],
@@ -127,7 +165,70 @@ public enum GatedTimeFrequencyFusion {
         batch: Int,
         time: Int
     ) -> [Float] {
-        return forwardDual(fSWT: fSWT, tFeat: tFeat, weights: weights, batch: batch, time: time).uFused
+        let dim = weights.dim
+        let rows = batch * time
+        let total = rows * dim
+        precondition(fSWT.count == total && tFeat.count == total)
+        guard total > 0 else { return [] }
+
+        let concatFT = [Float](unsafeUninitializedCapacity: rows * 2 * dim) { catBuf, initCount in
+            let cp = catBuf.baseAddress!
+            fSWT.withUnsafeBufferPointer { fBuf in
+                tFeat.withUnsafeBufferPointer { tBuf in
+                    let fp = fBuf.baseAddress!
+                    let tp = tBuf.baseAddress!
+                    for r in 0..<rows {
+                        let dst = cp + r * 2 * dim
+                        dst.initialize(from: fp + r * dim, count: dim)
+                        (dst + dim).initialize(from: tp + r * dim, count: dim)
+                    }
+                }
+            }
+            initCount = rows * 2 * dim
+        }
+
+        let gatePre = SWTHawkAutoencoder.linear(
+            x: concatFT, w: weights.wSwiGLUGate, b: weights.bSwiGLUGate,
+            rows: rows, inDim: 2 * dim, outDim: dim
+        )
+        let up = SWTHawkAutoencoder.linear(
+            x: concatFT, w: weights.wSwiGLUUp, b: weights.bSwiGLUUp,
+            rows: rows, inDim: 2 * dim, outDim: dim
+        )
+
+        let residualSum = [Float](unsafeUninitializedCapacity: total) { rsBuf, initCount in
+            let rsp = rsBuf.baseAddress!
+            gatePre.withUnsafeBufferPointer { gBuf in
+                up.withUnsafeBufferPointer { uBuf in
+                    fSWT.withUnsafeBufferPointer { fBuf in
+                        tFeat.withUnsafeBufferPointer { tBuf in
+                            let gp = gBuf.baseAddress!, upPtr = uBuf.baseAddress!
+                            let fp = fBuf.baseAddress!, tp = tBuf.baseAddress!
+                            var i = 0
+                            while i + 8 <= total {
+                                let g = SWTHawkAutoencoder.load(gp + i)
+                                let hFus = (g * SIMDMath.sigmoid(g)) * SWTHawkAutoencoder.load(upPtr + i)
+                                let vf = SWTHawkAutoencoder.load(fp + i)
+                                let vt = SWTHawkAutoencoder.load(tp + i)
+                                SWTHawkAutoencoder.store(vf + vt + hFus, rsp + i)
+                                i += 8
+                            }
+                            while i < total {
+                                let g = gp[i]
+                                let hFus = (g / (1.0 + expf(-g))) * upPtr[i]
+                                rsp[i] = fp[i] + tp[i] + hFus
+                                i += 1
+                            }
+                        }
+                    }
+                }
+            }
+            initCount = total
+        }
+
+        return SWTHawkAutoencoder.layerNorm(
+            x: residualSum, gamma: weights.normGamma, beta: weights.normBeta, rows: rows, dim: dim
+        )
     }
 }
 
@@ -734,41 +835,83 @@ public enum MultiScaleAttentionPooling {
         let invK = 1.0 / Float(max(1, numQueries))
 
         var meanOverQueries = [Float](repeating: 0.0, count: batch * dim)
-        for b in 0..<batch {
-            let bTimeOff = b * time * dim
-            for h in 0..<numHeads {
-                let hOff = h * headDim
-                for k in 0..<numQueries {
-                    let qOff = k * dim + hOff
-                    var maxScore: Float = -.greatestFiniteMagnitude
-                    var scores = [Float](repeating: 0.0, count: time)
-                    for t in 0..<time {
-                        let kOff = bTimeOff + t * dim + hOff
-                        var dot: Float = 0.0
-                        for d in 0..<headDim {
-                            dot += weights.qPool[qOff + d] * keys[kOff + d]
-                        }
-                        let s = dot * scale
-                        scores[t] = s
-                        if s > maxScore {
-                            maxScore = s
-                        }
-                    }
-
-                    var sumExp: Float = 0.0
-                    for t in 0..<time {
-                        let e = expf(scores[t] - maxScore)
-                        scores[t] = e
-                        sumExp += e
-                    }
-                    let invSum = 1.0 / max(sumExp, 1e-12)
-
-                    let mOff = b * dim + hOff
-                    for t in 0..<time {
-                        let p = scores[t] * invSum * invK
-                        let vOff = bTimeOff + t * dim + hOff
-                        for d in 0..<headDim {
-                            meanOverQueries[mOff + d] += p * values[vOff + d]
+        var scores = [Float](repeating: 0.0, count: max(1, time))
+        weights.qPool.withUnsafeBufferPointer { qBuf in
+            keys.withUnsafeBufferPointer { kBuf in
+                values.withUnsafeBufferPointer { vBuf in
+                    meanOverQueries.withUnsafeMutableBufferPointer { mBuf in
+                        scores.withUnsafeMutableBufferPointer { scBuf in
+                            let qp = qBuf.baseAddress!, kp = kBuf.baseAddress!, vp = vBuf.baseAddress!
+                            let mp = mBuf.baseAddress!, sp = scBuf.baseAddress!
+                            for b in 0..<batch {
+                                let bTimeOff = b * time * dim
+                                for h in 0..<numHeads {
+                                    let hOff = h * headDim
+                                    let mPtr = mp + b * dim + hOff
+                                    for k in 0..<numQueries {
+                                        let qPtr = qp + k * dim + hOff
+                                        var maxScore: Float = -.greatestFiniteMagnitude
+                                        if headDim == 32 {
+                                            let q0 = SWTHawkAutoencoder.load(qPtr)
+                                            let q1 = SWTHawkAutoencoder.load(qPtr + 8)
+                                            let q2 = SWTHawkAutoencoder.load(qPtr + 16)
+                                            let q3 = SWTHawkAutoencoder.load(qPtr + 24)
+                                            for t in 0..<time {
+                                                let kPtr = kp + bTimeOff + t * dim + hOff
+                                                var acc = q0 * SWTHawkAutoencoder.load(kPtr)
+                                                acc.addProduct(q1, SWTHawkAutoencoder.load(kPtr + 8))
+                                                acc.addProduct(q2, SWTHawkAutoencoder.load(kPtr + 16))
+                                                acc.addProduct(q3, SWTHawkAutoencoder.load(kPtr + 24))
+                                                let s = acc.sum() * scale
+                                                sp[t] = s
+                                                if s > maxScore { maxScore = s }
+                                            }
+                                            var sumExp: Float = 0.0
+                                            for t in 0..<time {
+                                                let e = expf(sp[t] - maxScore)
+                                                sp[t] = e
+                                                sumExp += e
+                                            }
+                                            let factor = invK / max(sumExp, 1e-12)
+                                            var o0 = SWTHawkAutoencoder.load(mPtr)
+                                            var o1 = SWTHawkAutoencoder.load(mPtr + 8)
+                                            var o2 = SWTHawkAutoencoder.load(mPtr + 16)
+                                            var o3 = SWTHawkAutoencoder.load(mPtr + 24)
+                                            for t in 0..<time {
+                                                let pVec = SIMD8<Float>(repeating: sp[t] * factor)
+                                                let vPtr = vp + bTimeOff + t * dim + hOff
+                                                o0.addProduct(pVec, SWTHawkAutoencoder.load(vPtr))
+                                                o1.addProduct(pVec, SWTHawkAutoencoder.load(vPtr + 8))
+                                                o2.addProduct(pVec, SWTHawkAutoencoder.load(vPtr + 16))
+                                                o3.addProduct(pVec, SWTHawkAutoencoder.load(vPtr + 24))
+                                            }
+                                            SWTHawkAutoencoder.store(o0, mPtr)
+                                            SWTHawkAutoencoder.store(o1, mPtr + 8)
+                                            SWTHawkAutoencoder.store(o2, mPtr + 16)
+                                            SWTHawkAutoencoder.store(o3, mPtr + 24)
+                                        } else {
+                                            for t in 0..<time {
+                                                let kPtr = kp + bTimeOff + t * dim + hOff
+                                                let s = VectorOperations.dotProduct(a: qPtr, b: kPtr, count: headDim) * scale
+                                                sp[t] = s
+                                                if s > maxScore { maxScore = s }
+                                            }
+                                            var sumExp: Float = 0.0
+                                            for t in 0..<time {
+                                                let e = expf(sp[t] - maxScore)
+                                                sp[t] = e
+                                                sumExp += e
+                                            }
+                                            let factor = invK / max(sumExp, 1e-12)
+                                            for t in 0..<time {
+                                                let p = sp[t] * factor
+                                                let vPtr = vp + bTimeOff + t * dim + hOff
+                                                for d in 0..<headDim { mPtr[d] += p * vPtr[d] }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -796,26 +939,62 @@ public enum MultiScaleAttentionPooling {
             rows: batch, inDim: 3 * dim, outDim: latentDim
         )
 
-        // Multi-scale Nyquist harmonic projection into 1024-D principal component space
-        let wHarmonic = Array(weights.wProj[0..<(dim * latentDim)])
-        let uProj = SWTHawkAutoencoder.linear(
-            x: uFused, w: wHarmonic, b: nil, rows: rows, inDim: dim, outDim: latentDim
-        )
+        // Multi-scale Nyquist harmonic projection via associativity:
+        // sum_t (uFused[b, t] · W_harm) ⊙ phi[t] == sum_d (sum_t uFused[b, t, d] * phi[t]) * W_harm[d]
+        // Compute H_b[d, c] or project directly with SIMD8 over uProj without wHarmonic slice copy:
         let phi = HawkConditionalDecoder.latentBasis(time: time, latentDim: latentDim)
         let harmScale = 2.0 / sqrtf(Float(max(1, time)))
-        for b in 0..<batch {
-            let dstOff = b * latentDim
-            let bTimeOff = b * time * latentDim
-            var zHarm = [Float](repeating: 0.0, count: latentDim)
-            for t in 0..<time {
-                let uOff = bTimeOff + t * latentDim
-                let pOff = t * latentDim
-                for c in 0..<latentDim {
-                    zHarm[c] += uProj[uOff + c] * phi[pOff + c]
+        var uProj = [Float](repeating: 0.0, count: rows * latentDim)
+        uFused.withUnsafeBufferPointer { uBuf in
+            weights.wProj.withUnsafeBufferPointer { wBuf in
+                uProj.withUnsafeMutableBufferPointer { upBuf in
+                    SWTHawkAutoencoder.gemmRaw(
+                        uBuf.baseAddress!, dim,
+                        wBuf.baseAddress!, latentDim,
+                        upBuf.baseAddress!, latentDim,
+                        m: rows, n: latentDim, k: dim, beta: 0.0
+                    )
                 }
             }
-            for c in 0..<latentDim {
-                zRaw[dstOff + c] += zHarm[c] * harmScale
+        }
+        uProj.withUnsafeBufferPointer { upBuf in
+            phi.withUnsafeBufferPointer { phBuf in
+                zRaw.withUnsafeMutableBufferPointer { zrBuf in
+                    let upp = upBuf.baseAddress!, php = phBuf.baseAddress!, zrp = zrBuf.baseAddress!
+                    let hsVec = SIMD8<Float>(repeating: harmScale)
+                    var zHarm = [Float](repeating: 0.0, count: latentDim)
+                    zHarm.withUnsafeMutableBufferPointer { zhBuf in
+                        let zhp = zhBuf.baseAddress!
+                        for b in 0..<batch {
+                            zhp.update(repeating: 0.0, count: latentDim)
+                            let bTimeOff = b * time * latentDim
+                            for t in 0..<time {
+                                let uOff = bTimeOff + t * latentDim
+                                let pOff = t * latentDim
+                                var c = 0
+                                while c + 8 <= latentDim {
+                                    let acc = SWTHawkAutoencoder.load(zhp + c) + SWTHawkAutoencoder.load(upp + uOff + c) * SWTHawkAutoencoder.load(php + pOff + c)
+                                    SWTHawkAutoencoder.store(acc, zhp + c)
+                                    c += 8
+                                }
+                                while c < latentDim {
+                                    zhp[c] += upp[uOff + c] * php[pOff + c]
+                                    c += 1
+                                }
+                            }
+                            let dstOff = b * latentDim
+                            var c = 0
+                            while c + 8 <= latentDim {
+                                SWTHawkAutoencoder.store(SWTHawkAutoencoder.load(zrp + dstOff + c) + SWTHawkAutoencoder.load(zhp + c) * hsVec, zrp + dstOff + c)
+                                c += 8
+                            }
+                            while c < latentDim {
+                                zrp[dstOff + c] += zhp[c] * harmScale
+                                c += 1
+                            }
+                        }
+                    }
+                }
             }
         }
 

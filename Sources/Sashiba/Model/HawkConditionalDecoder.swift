@@ -171,27 +171,58 @@ public struct HawkDecoderWeights: Sendable, Equatable {
 
 /// Griffin Conditional Text Decoder (`Section 2.2`).
 public enum HawkConditionalDecoder {
-    /// Sinusoidal positional encoding `[T, D]` scaled to `[-0.5, 0.5]`.
+    private static let tableCacheLock = NSLock()
+    nonisolated(unsafe) private static var peCache: [Int: [Float]] = [:]
+    nonisolated(unsafe) private static var phiCache: [Int: [Float]] = [:]
+
+    /// Sinusoidal positional encoding `[T, D]` scaled to `[-0.5, 0.5]` (cached by `(time, dim)`).
     public static func positionalEncoding(time: Int, dim: Int) -> [Float] {
+        let key = (time << 20) ^ dim
+        tableCacheLock.lock()
+        if let hit = peCache[key], hit.count == time * dim {
+            tableCacheLock.unlock()
+            return hit
+        }
+        tableCacheLock.unlock()
+
         var pe = [Float](repeating: 0.0, count: time * dim)
         let half = max(1, dim / 2)
+        var freqs = [Float](repeating: 0.0, count: half)
+        let denom = Float(max(1, half - 1))
+        let log1000 = logf(1000.0)
+        for i in 0..<half {
+            freqs[i] = expf(-Float(i) * log1000 / denom)
+        }
         for t in 0..<time {
             let pos = Float(t)
             let base = t * dim
             for i in 0..<half {
-                let freq = expf(-Float(i) * logf(1000.0) / Float(max(1, half - 1)))
-                let angle = pos * freq
+                let angle = pos * freqs[i]
                 pe[base + 2 * i] = 0.5 * sinf(angle)
                 if 2 * i + 1 < dim {
                     pe[base + 2 * i + 1] = 0.5 * cosf(angle)
                 }
             }
         }
+        if time * dim <= 1_048_576 {
+            tableCacheLock.lock()
+            if peCache.count >= 32 { peCache.removeAll(keepingCapacity: true) }
+            peCache[key] = pe
+            tableCacheLock.unlock()
+        }
         return pe
     }
 
-    /// Orthogonal Nyquist sinusoidal basis `Φ ∈ R^(T × latentDim)` spanning wavelengths from `2` to `latentDim` tokens.
+    /// Orthogonal Nyquist sinusoidal basis `Φ ∈ R^(T × latentDim)` spanning wavelengths from `2` to `latentDim` tokens (cached by `(time, latentDim)`).
     public static func latentBasis(time: Int, latentDim: Int) -> [Float] {
+        let key = (time << 20) ^ latentDim
+        tableCacheLock.lock()
+        if let hit = phiCache[key], hit.count == time * latentDim {
+            tableCacheLock.unlock()
+            return hit
+        }
+        tableCacheLock.unlock()
+
         var phi = [Float](repeating: 0.0, count: time * latentDim)
         let half = max(1, latentDim / 2)
         let fund = 2.0 * Float.pi / Float(max(2, latentDim))
@@ -205,6 +236,12 @@ public enum HawkConditionalDecoder {
                     phi[base + 2 * k + 1] = cosf(angle)
                 }
             }
+        }
+        if time * latentDim <= 1_048_576 {
+            tableCacheLock.lock()
+            if phiCache.count >= 16 { phiCache.removeAll(keepingCapacity: true) }
+            phiCache[key] = phi
+            tableCacheLock.unlock()
         }
         return phi
     }
@@ -778,27 +815,80 @@ public enum HawkConditionalDecoder {
                     xMid1[i] = xStep[i] + recOut[i]
                 }
 
-                // Causal Local Sliding-Window Attention step over window W = 32
-                let winSize = lw.block.localAttn.windowSize
-                var xMid2 = [Float](repeating: 0.0, count: batch * dim)
+                // Causal Local Sliding-Window Attention step over window W = 32 (cached K/V per step)
+                let la = lw.block.localAttn
+                let winSize = la.windowSize
+                let numHeads = la.numHeads
+                let headDim = dim / numHeads
+                let halfHead = headDim / 2
+                let scale = 1.0 / sqrtf(Float(max(1, headDim)))
+                let (cosWin, sinWin) = LocalSlidingWindowAttention.ropeTables(time: max(1, winSize), headDim: headDim)
+
+                let normedLA = SWTHawkAutoencoder.layerNorm(
+                    x: xMid1, gamma: la.normGamma, beta: la.normBeta, rows: batch, dim: dim
+                )
+                let qStep = SWTHawkAutoencoder.linear(x: normedLA, w: la.wQ, b: la.bQ, rows: batch, inDim: dim, outDim: dim)
+                let kStep = SWTHawkAutoencoder.linear(x: normedLA, w: la.wK, b: la.bK, rows: batch, inDim: dim, outDim: dim)
+                let vStep = SWTHawkAutoencoder.linear(x: normedLA, w: la.wV, b: la.bV, rows: batch, inDim: dim, outDim: dim)
+
+                var contextStep = [Float](repeating: 0.0, count: batch * dim)
                 for b in 0..<batch {
-                    let bSlice = Array(xMid1[(b * dim)..<((b + 1) * dim)])
-                    layerHistories[l][b].append(contentsOf: bSlice)
-                    let curSteps = layerHistories[l][b].count / dim
+                    let kvPair = Array(kStep[(b * dim)..<((b + 1) * dim)]) + Array(vStep[(b * dim)..<((b + 1) * dim)])
+                    layerHistories[l][b].append(contentsOf: kvPair)
+                    let curSteps = layerHistories[l][b].count / (2 * dim)
                     if curSteps > winSize {
-                        layerHistories[l][b].removeFirst((curSteps - winSize) * dim)
+                        layerHistories[l][b].removeFirst((curSteps - winSize) * 2 * dim)
                     }
-                    let wSteps = layerHistories[l][b].count / dim
-                    let attnSeq = LocalSlidingWindowAttention.forward(
-                        x: layerHistories[l][b],
-                        weights: lw.block.localAttn,
-                        batch: 1,
-                        time: wSteps
-                    )
-                    let lastOff = (wSteps - 1) * dim
-                    for c in 0..<dim {
-                        xMid2[b * dim + c] = attnSeq[lastOff + c]
+                    let wSteps = layerHistories[l][b].count / (2 * dim)
+                    let qPosOff = (wSteps - 1) * halfHead
+
+                    for h in 0..<numHeads {
+                        let hOff = h * headDim
+                        var qRot = [Float](repeating: 0.0, count: headDim)
+                        let qSrcOff = b * dim + hOff
+                        for i in 0..<halfHead {
+                            let c = cosWin[qPosOff + i], s = sinWin[qPosOff + i]
+                            let x1 = qStep[qSrcOff + i], x2 = qStep[qSrcOff + halfHead + i]
+                            qRot[i] = x1 * c - x2 * s
+                            qRot[halfHead + i] = x1 * s + x2 * c
+                        }
+                        var scores = [Float](repeating: 0.0, count: wSteps)
+                        var maxScore: Float = -.greatestFiniteMagnitude
+                        for idx in 0..<wSteps {
+                            let kSrcOff = idx * 2 * dim + hOff
+                            let kPosOff = idx * halfHead
+                            var dot: Float = 0.0
+                            for i in 0..<halfHead {
+                                let c = cosWin[kPosOff + i], s = sinWin[kPosOff + i]
+                                let k1 = layerHistories[l][b][kSrcOff + i]
+                                let k2 = layerHistories[l][b][kSrcOff + halfHead + i]
+                                dot += qRot[i] * (k1 * c - k2 * s) + qRot[halfHead + i] * (k1 * s + k2 * c)
+                            }
+                            let sc = dot * scale
+                            scores[idx] = sc
+                            if sc > maxScore { maxScore = sc }
+                        }
+                        var sumExp: Float = 0.0
+                        for idx in 0..<wSteps {
+                            let e = expf(scores[idx] - maxScore)
+                            scores[idx] = e
+                            sumExp += e
+                        }
+                        let invSum = 1.0 / max(sumExp, 1e-12)
+                        let outOff = b * dim + hOff
+                        for idx in 0..<wSteps {
+                            let p = scores[idx] * invSum
+                            let vSrcOff = idx * 2 * dim + dim + hOff
+                            for d in 0..<headDim {
+                                contextStep[outOff + d] += p * layerHistories[l][b][vSrcOff + d]
+                            }
+                        }
                     }
+                }
+                let attnOutStep = SWTHawkAutoencoder.linear(x: contextStep, w: la.wOut, b: la.bOut, rows: batch, inDim: dim, outDim: dim)
+                var xMid2 = [Float](repeating: 0.0, count: batch * dim)
+                for i in 0..<(batch * dim) {
+                    xMid2[i] = xMid1[i] + attnOutStep[i]
                 }
 
                 let normed2 = SWTHawkAutoencoder.layerNorm(
