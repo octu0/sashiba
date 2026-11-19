@@ -109,7 +109,7 @@ let seqLen = allCases
     .reduce(4, max)
 
 print("==================================================================")
-print("Relational Head Evaluation [v5 & v5_hybrid] (Mode: \(cli.useGPU ? "GPU" : "Pure Multi-Core CPU (0 GPU VRAM)"))")
+print("Relational Head Evaluation [v6 & v6_hybrid] (Mode: \(cli.useGPU ? "GPU" : "Pure Multi-Core CPU (0 GPU VRAM)"))")
 print("==================================================================")
 print("Train cases: \(trainCasesAll.count) | Unseen cases: \(unseenCasesAll.count) | seqLen: \(seqLen)")
 
@@ -265,11 +265,11 @@ for task in tasks {
     predictionsA[task.name] = perCase
     let maj = majorityClass(trainIndices.map { task.label(allCases[$0]) }, classCount: task.classNames.count)
     let r = summarize(
-        task: task, featurizer: "v5", testIdx: unseenIndices, preds: preds,
+        task: task, featurizer: "v6", testIdx: unseenIndices, preds: preds,
         majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
     )
     splitResults.append(r)
-    print("[split   ][v5       ] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+    print("[split   ][v6       ] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
 }
 
 for task in tasks {
@@ -293,11 +293,11 @@ for task in tasks {
     let preds = unseenIndices.map { h.predict(hyb[$0]) }
     let maj = majorityClass(trainY, classCount: task.classNames.count)
     let r = summarize(
-        task: task, featurizer: "v5_hybrid", testIdx: unseenIndices, preds: preds,
+        task: task, featurizer: "v6_hybrid", testIdx: unseenIndices, preds: preds,
         majorityPreds: unseenIndices.map { _ in maj }, trainCorrect: trainCorrect, trainTotal: trainIndices.count
     )
     splitResults.append(r)
-    print("[split   ][v5_hybrid] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
+    print("[split   ][v6_hybrid] \(task.name): train \(pct(r.trainAcc)) | unseen \(pct(r.testAcc)) | majority \(pct(r.majorityAcc))")
 }
 
 // ------------------------------------------------------------------
@@ -549,7 +549,7 @@ if !cli.skipFolds {
         }
     }
     let unseenHoldoutIdx = unseenIndices.filter { foldOfCategory[allCases[$0].group] != nil }
-    for (featName, pMap, tcMap) in [("v5_frozen", zPreds, zTrC), ("v5_hybrid_frozen", hPreds, hTrC)] {
+    for (featName, pMap, tcMap) in [("v6_frozen", zPreds, zTrC), ("v6_hybrid_frozen", hPreds, hTrC)] {
         for task in tasks {
             let r = summarize(
                 task: task, featurizer: featName, testIdx: unseenHoldoutIdx,
@@ -582,10 +582,10 @@ func perClassList(_ rs: [EvalResult]) -> String {
     return s
 }
 
-var report = "# 関係性分類・感情グラデーション・離脱軌跡の汎化評価（`v5` & `v5_hybrid` 標準構成）\n\n"
+var report = "# 関係性分類・感情グラデーション・離脱軌跡の汎化評価（`v6` & `v6_hybrid` 標準構成）\n\n"
 report += "- 入力: `(senderTokenIDs, receiverTokenIDs)` の2配列のみ（連結しない Dual-Stream。$T_4$ は受信側全文、$T_2$ は受信側前半）\n"
-report += "- `v5`: `z_rel = [z_LL^rel(\(weights.relational.latentDim / 2)); z_HH^rel(\(weights.relational.latentDim / 2))] ∈ R^\(weights.relational.latentDim)`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
-report += "- `v5_hybrid`: `z_rel` + 非線形サブバンド幾何(8) + トピック置換不変エコー・Pentagon(8) + 非語彙対話リズム(16) = `\(weights.relational.latentDim + 32)` 次元、および軌跡用 `336D / 350D` 特徴\n\n"
+report += "- `v6`: `z_rel = [z_LL^rel(\(weights.relational.latentDim / 2)); z_HH^rel(\(weights.relational.latentDim / 2))] ∈ R^\(weights.relational.latentDim)`（`verify_latent_space` と同一テンソル・同一校正ヘッド）\n"
+report += "- `v6_hybrid`: `z_rel` + 非線形サブバンド幾何(8) + トピック置換不変エコー・Pentagon(8) + 非語彙対話リズム(16) + 絵文字・口語表記プロソディ(8) = `\(weights.relational.latentDim + 40)` 次元、および軌跡用 `352D / 366D` 特徴\n\n"
 report += "## (A) シナリオ分割: train → unseen_test\n\n"
 report += "学習 `\(trainIndices.count)` 件、評価 `\(unseenIndices.count)` 件。\n\n"
 report += resultTable(splitResults, testLabel: "未学習精度")

@@ -11,6 +11,7 @@ struct ValidateBenchmarksCLI: Sendable {
     var layer3aDir: String = ".tmp/validation/benchmarks/layer3a_style_domain_holdout"
     var layer3bDir: String = ".tmp/validation/benchmarks/layer3b_independent_paraphrases"
     var layer3cDir: String = ".tmp/validation/benchmarks/layer3c_independent_inversions"
+    var layer3dDir: String = ".tmp/validation/benchmarks/layer3d_generational_slang_emoji"
     var layer4Dir: String = ".tmp/validation/benchmarks/layer4_gold_outcome_benchmark"
     var cacheDir: String = ".tmp/validation/zrel_cache"
     var outputPath: String = ".tmp/validation/benchmark_metrics.json"
@@ -203,16 +204,16 @@ struct OrdinalGradationAxisMetrics: Codable {
     let expected_value_mae: Float
 }
 
-struct V5GradationAndTrajectoryOutput: Codable {
-    let n_unseen_cases: Int
-    let emotion_gradation_unseen: [String: OrdinalGradationAxisMetrics]
+struct GradationAndTrajectoryEval: Codable {
+    let n_cases: Int
+    let emotion_gradation: [String: OrdinalGradationAxisMetrics]
     let arousal_t2_mae: Float
     let arousal_t4_mae: Float
     let trajectory_10way_text_only_accuracy: Float
     let trajectory_10way_full_temporal_accuracy: Float
     let trajectory_per_class_full_accuracy: [String: Float]
-    let unseen_retained_30d_accuracy: Float
-    let unseen_retained_90d_accuracy: Float
+    let retained_30d_accuracy: Float
+    let retained_90d_accuracy: Float
 }
 
 struct BenchmarkMetricsReport: Codable {
@@ -224,7 +225,8 @@ struct BenchmarkMetricsReport: Codable {
     let layer2_validation: Layer2ValidationOutput
     let layer3_ood_benchmarks: [String: Layer3SuiteOutput]
     let layer4_gold_outcome_benchmark: Layer4Output
-    let v5_gradation_and_trajectory: V5GradationAndTrajectoryOutput
+    let unseen_gradation_and_trajectory: GradationAndTrajectoryEval
+    let layer3d_gradation_and_trajectory: GradationAndTrajectoryEval?
 }
 
 // MARK: - Encoding & Evaluation Helpers
@@ -573,7 +575,7 @@ if cli.useGPU {
 let pct = { (v: Float) in String(format: "%6.2f%%", v * 100.0) }
 
 print("==================================================================")
-print("Sashiba External Benchmark Validation [v5 & v5_hybrid]")
+print("Sashiba External Benchmark Validation [v6 & v6_hybrid]")
 print("Execution mode: \(cli.useGPU ? "GPU (MLX)" : "Pure Multi-Core CPU (0 GPU VRAM)") | Cache: \(cli.disableCache ? "OFF" : cli.cacheDir)")
 print("==================================================================")
 
@@ -585,6 +587,7 @@ let caseByID = Dictionary(uniqueKeysWithValues: mainConfig.relationalDialogueCas
 let l3aCases = DatasetConfiguration.load(from: cli.layer3aDir).relationalDialogueCases
 let l3bCases = DatasetConfiguration.load(from: cli.layer3bDir).relationalDialogueCases
 let l3cCases = DatasetConfiguration.load(from: cli.layer3cDir).relationalDialogueCases
+let l3dCases = FileManager.default.fileExists(atPath: cli.layer3dDir) ? DatasetConfiguration.load(from: cli.layer3dDir).relationalDialogueCases : []
 let l4CasesRaw = DatasetConfiguration.load(from: cli.layer4Dir).relationalDialogueCases
 
 let l1Items = try JSONDecoder().decode(
@@ -625,7 +628,7 @@ let l4Aligned: [(rc: RelationalDialogueCase, meta: Layer4MetadataItem)] = l4Meta
 let l4Cases = l4Aligned.map(\.rc)
 let l4MetaOrdered = l4Aligned.map(\.meta)
 
-print("Loaded splits: train=\(trainCases.count), unseen=\(unseenCases.count), L1_T2=\(l1T2MatchedCases.count), L1_T4=\(l1T4MatchedCases.count), L3a=\(l3aCases.count), L3b=\(l3bCases.count), L3c=\(l3cCases.count), L4=\(l4Cases.count)")
+print("Loaded splits: train=\(trainCases.count), unseen=\(unseenCases.count), L1_T2=\(l1T2MatchedCases.count), L1_T4=\(l1T4MatchedCases.count), L3a=\(l3aCases.count), L3b=\(l3bCases.count), L3c=\(l3cCases.count), L3d=\(l3dCases.count), L4=\(l4Cases.count)")
 
 let w = try SWTHawkWeights.load(from: URL(fileURLWithPath: cli.weightsPath))
 let vocab = TextVocabulary.deserialize(w.serializedVocabulary)
@@ -653,11 +656,12 @@ let l1T4Suite = enc("l1_t4", l1T4MatchedCases.map(\.rc))
 let l3aSuite = enc("l3a", l3aCases)
 let l3bSuite = enc("l3b", l3bCases)
 let l3cSuite = enc("l3c", l3cCases)
+let l3dSuite: EncodedSuite? = l3dCases.isEmpty ? nil : enc("l3d", l3dCases)
 let l4Suite = enc("l4", l4Cases)
 if cli.useGPU { MLX.Memory.clearCache() }
-print(String(format: "[v5] Encoded all suites in %.2fs", Date().timeIntervalSince(tEncode)))
+print(String(format: "[v6] Encoded all suites in %.2fs", Date().timeIntervalSince(tEncode)))
 
-// Resolve v5_hybrid heads (prefer serialized heads inside weights.safetensors; otherwise calibrate on trainCases)
+// Resolve v6_hybrid heads (prefer serialized heads inside weights.safetensors; otherwise calibrate on trainCases)
 let hybridArchT4: SoftmaxClassifierHead
 let hybridTopoT4: SoftmaxClassifierHead
 let hybridArchT2: SoftmaxClassifierHead
@@ -671,7 +675,7 @@ if let ha4 = cal.hybridArchetypeT4, let ht4 = cal.hybridTopologyT4,
     hybridTopoT4 = ht4
     hybridArchT2 = ha2
     hybridTopoT2 = ht2
-    print("[v5_hybrid] Loaded serialized 160D hybrid heads directly from \(cli.weightsPath)")
+    print("[v6_hybrid] Loaded serialized \(ha4.featureDim)D hybrid heads directly from \(cli.weightsPath)")
 } else {
     let groups = trainCases.map(\.group)
     let yA4 = trainCases.map { RelationalPipeline.archetypeIndex($0.expectedArchetype) }
@@ -682,7 +686,7 @@ if let ha4 = cal.hybridArchetypeT4, let ht4 = cal.hybridTopologyT4,
     hybridTopoT4 = SoftmaxClassifierHead.trainGroupCV(features: trSuite.hybridT4, labels: yT4, groups: groups, classCount: 5, steps: 350)
     hybridArchT2 = SoftmaxClassifierHead.trainGroupCV(features: trSuite.hybridT2, labels: yA2, groups: groups, classCount: 6, steps: 350)
     hybridTopoT2 = SoftmaxClassifierHead.trainGroupCV(features: trSuite.hybridT2, labels: yT2, groups: groups, classCount: 5, steps: 350)
-    print("[v5_hybrid] Calibrated 160D hybrid heads on CPU Group-CV")
+    print("[v6_hybrid] Calibrated \(hybridArchT4.featureDim)D hybrid heads on CPU Group-CV")
 }
 
 func projectHybrid(_ base: EncodedSuite) -> EncodedSuite {
@@ -704,17 +708,18 @@ let unHybrid = projectHybrid(unSuite)
 let l3aHybrid = projectHybrid(l3aSuite)
 let l3bHybrid = projectHybrid(l3bSuite)
 let l3cHybrid = projectHybrid(l3cSuite)
+let l3dHybrid: EncodedSuite? = l3dSuite.map { projectHybrid($0) }
 let l4Hybrid = projectHybrid(l4Suite)
 
 func evalPair(
     cases: [RelationalDialogueCase],
-    v5Suite: EncodedSuite,
+    v6Suite: EncodedSuite,
     hybSuite: EncodedSuite,
     unseenRef: [String: FourTaskMetrics]?,
     isInversionSuite: Bool
 ) -> [String: SuiteModelEval] {
     var out: [String: SuiteModelEval] = [:]
-    for (mName, enc) in [("v5", v5Suite), ("v5_hybrid", hybSuite)] {
+    for (mName, enc) in [("v6", v6Suite), ("v6_hybrid", hybSuite)] {
         let acc = computeFourTaskAccuracy(
             cases: cases, predArchT4: enc.predArchT4, predTopoT4: enc.predTopoT4,
             predArchT2: enc.predArchT2, predTopoT2: enc.predTopoT2
@@ -730,9 +735,9 @@ func evalPair(
 }
 
 // 1. In-Distribution unseen_test
-let unseenEval = evalPair(cases: unseenCases, v5Suite: unSuite, hybSuite: unHybrid, unseenRef: nil, isInversionSuite: false)
+let unseenEval = evalPair(cases: unseenCases, v6Suite: unSuite, hybSuite: unHybrid, unseenRef: nil, isInversionSuite: false)
 let unseenAccRef = unseenEval.mapValues(\.accuracy)
-for k in ["v5", "v5_hybrid"] {
+for k in ["v6", "v6_hybrid"] {
     if let r = unseenEval[k]?.accuracy {
         print("[Unseen Test] \(k.padding(toLength: 10, withPad: " ", startingAt: 0)): archT4 \(pct(r.archetype_t4)) | topoT4 \(pct(r.topology_t4)) | archT2 \(pct(r.archetype_t2)) | topoT2 \(pct(r.topology_t2)) | mean \(pct(r.mean))")
     }
@@ -795,20 +800,25 @@ let pentEval = PentagonModelValidity(
     combined_t4: correlatePentagon(modelPreds: l1T4Suite.pentagonT4 + l4Suite.pentagonT4, humanMeans: l1HumT4 + l4HumT4)
 )
 print(String(
-    format: "[Layer 2] v5 | 3D Probe mean: %.2f%% | MI mean: %.3f bits | Pentagon Pearson r (comb T2/T4): %.3f / %.3f",
+    format: "[Layer 2] v6 | 3D Probe mean: %.2f%% | MI mean: %.3f bits | Pentagon Pearson r (comb T2/T4): %.3f / %.3f",
     geomEval.linear_probe_3d_unseen_accuracy.mean * 100.0,
     geomEval.mutual_information_bits.mean,
     pentEval.combined_t2.mean_pearson_r,
     pentEval.combined_t4.mean_pearson_r
 ))
 
-// 3. Layer 3 OOD Benchmarks (3a, 3b, 3c)
-let l3aEval = evalPair(cases: l3aCases, v5Suite: l3aSuite, hybSuite: l3aHybrid, unseenRef: nil, isInversionSuite: false)
-let l3bEval = evalPair(cases: l3bCases, v5Suite: l3bSuite, hybSuite: l3bHybrid, unseenRef: unseenAccRef, isInversionSuite: false)
-let l3cEval = evalPair(cases: l3cCases, v5Suite: l3cSuite, hybSuite: l3cHybrid, unseenRef: nil, isInversionSuite: true)
+// 3. Layer 3 OOD Benchmarks (3a, 3b, 3c, 3d)
+let l3aEval = evalPair(cases: l3aCases, v6Suite: l3aSuite, hybSuite: l3aHybrid, unseenRef: nil, isInversionSuite: false)
+let l3bEval = evalPair(cases: l3bCases, v6Suite: l3bSuite, hybSuite: l3bHybrid, unseenRef: unseenAccRef, isInversionSuite: false)
+let l3cEval = evalPair(cases: l3cCases, v6Suite: l3cSuite, hybSuite: l3cHybrid, unseenRef: nil, isInversionSuite: true)
+let l3dEval: [String: SuiteModelEval]? = if let s3d = l3dSuite, let h3d = l3dHybrid, !l3dCases.isEmpty {
+    evalPair(cases: l3dCases, v6Suite: s3d, hybSuite: h3d, unseenRef: unseenAccRef, isInversionSuite: false)
+} else { nil }
 
-for (suiteName, evalMap) in [("layer3a", l3aEval), ("layer3b", l3bEval), ("layer3c", l3cEval)] {
-    for k in ["v5", "v5_hybrid"] {
+var oodList: [(String, [String: SuiteModelEval])] = [("layer3a", l3aEval), ("layer3b", l3bEval), ("layer3c", l3cEval)]
+if let e3d = l3dEval { oodList.append(("layer3d", e3d)) }
+for (suiteName, evalMap) in oodList {
+    for k in ["v6", "v6_hybrid"] {
         if let e = evalMap[k] {
             let extra = if let p = e.paired_inversion_accuracy {
                 String(format: " | paired_mean %.2f%%", p.mean_paired_accuracy * 100.0)
@@ -821,29 +831,32 @@ for (suiteName, evalMap) in [("layer3a", l3aEval), ("layer3b", l3bEval), ("layer
 }
 
 // 4. Layer 4 External Gold Benchmark & Coarse T2
-let l4ZeroShot = evalPair(cases: l4Cases, v5Suite: l4Suite, hybSuite: l4Hybrid, unseenRef: nil, isInversionSuite: false)
-for k in ["v5", "v5_hybrid"] {
+let l4ZeroShot = evalPair(cases: l4Cases, v6Suite: l4Suite, hybSuite: l4Hybrid, unseenRef: nil, isInversionSuite: false)
+for k in ["v6", "v6_hybrid"] {
     if let e = l4ZeroShot[k] {
         print("[layer4 ] \(k.padding(toLength: 10, withPad: " ", startingAt: 0)): mean \(pct(e.accuracy.mean)) (archT4 \(pct(e.accuracy.archetype_t4)), topoT4 \(pct(e.accuracy.topology_t4)), archT2 \(pct(e.accuracy.archetype_t2)), topoT2 \(pct(e.accuracy.topology_t2)))")
     }
 }
 
-func coarsePair(_ cs: [RelationalDialogueCase], _ s5: EncodedSuite, _ sh: EncodedSuite) -> [String: CoarseEarlyT2Metrics] {
+func coarsePair(_ cs: [RelationalDialogueCase], _ s6: EncodedSuite, _ sh: EncodedSuite) -> [String: CoarseEarlyT2Metrics] {
     return [
-        "v5": computeCoarseEarlyT2(cases: cs, predStance: s5.predStanceT2, predDist: s5.predDistT2),
-        "v5_hybrid": computeCoarseEarlyT2(cases: cs, predStance: sh.predStanceT2, predDist: sh.predDistT2)
+        "v6": computeCoarseEarlyT2(cases: cs, predStance: s6.predStanceT2, predDist: s6.predDistT2),
+        "v6_hybrid": computeCoarseEarlyT2(cases: cs, predStance: sh.predStanceT2, predDist: sh.predDistT2)
     ]
 }
-let p0CoarseBenchmarks: [String: [String: CoarseEarlyT2Metrics]] = [
+var p0CoarseBenchmarks: [String: [String: CoarseEarlyT2Metrics]] = [
     "unseen_test": coarsePair(unseenCases, unSuite, unHybrid),
     "layer3a": coarsePair(l3aCases, l3aSuite, l3aHybrid),
     "layer3b": coarsePair(l3bCases, l3bSuite, l3bHybrid),
     "layer3c": coarsePair(l3cCases, l3cSuite, l3cHybrid),
     "layer4_gold": coarsePair(l4Cases, l4Suite, l4Hybrid)
 ]
-for sKey in ["unseen_test", "layer3a", "layer3b", "layer3c", "layer4_gold"] {
-    if let m = p0CoarseBenchmarks[sKey]?["v5"], let mh = p0CoarseBenchmarks[sKey]?["v5_hybrid"] {
-        print("[P0 Coarse T2 | \(sKey.padding(toLength: 11, withPad: " ", startingAt: 0))] v5 mean \(pct(m.mean)) (stance \(pct(m.early_stance_4way)), dist \(pct(m.early_distance_3way))) | v5_hybrid mean \(pct(mh.mean)) (stance \(pct(mh.early_stance_4way)), dist \(pct(mh.early_distance_3way)))")
+if let s3d = l3dSuite, let h3d = l3dHybrid, !l3dCases.isEmpty {
+    p0CoarseBenchmarks["layer3d"] = coarsePair(l3dCases, s3d, h3d)
+}
+for sKey in ["unseen_test", "layer3a", "layer3b", "layer3c", "layer3d", "layer4_gold"] {
+    if let m = p0CoarseBenchmarks[sKey]?["v6"], let mh = p0CoarseBenchmarks[sKey]?["v6_hybrid"] {
+        print("[P0 Coarse T2 | \(sKey.padding(toLength: 11, withPad: " ", startingAt: 0))] v6 mean \(pct(m.mean)) (stance \(pct(m.early_stance_4way)), dist \(pct(m.early_distance_3way))) | v6_hybrid mean \(pct(mh.mean)) (stance \(pct(mh.early_stance_4way)), dist \(pct(mh.early_distance_3way)))")
     }
 }
 
@@ -858,10 +871,10 @@ let foldsBlock = BenchmarkMath.stratifiedBinaryFolds(labels: yBlock, k: 5, seed:
 let foldsDrift = BenchmarkMath.stratifiedContinuousFolds(targets: yDrift, k: 5, seed: 2029)
 
 let featureBanks: [(String, [[Float]])] = [
-    ("v5_z_rel_t2", l4Suite.zT2),
-    ("v5_hybrid_t2", l4Suite.hybridT2),
-    ("v5_z_rel_t4", l4Suite.zT4),
-    ("v5_hybrid_t4", l4Suite.hybridT4)
+    ("v6_z_rel_t2", l4Suite.zT2),
+    ("v6_hybrid_t2", l4Suite.hybridT2),
+    ("v6_z_rel_t4", l4Suite.zT4),
+    ("v6_hybrid_t4", l4Suite.hybridT4)
 ]
 
 var outRet30: [String: BinaryOutcomeMetrics] = [:]
@@ -884,7 +897,7 @@ for (fName, feats) in featureBanks {
     ))
 }
 
-// 5. v5 Emotional Gradation, 10-way Trajectory & Retention on Unseen Split
+// 5. v6 Emotional Gradation, 10-way Trajectory & Retention on Unseen Split and Layer 3d OOD
 let trGroups = trainCases.map(\.group)
 @MainActor
 func resolveOrFit(_ ex: SoftmaxClassifierHead?, _ trX: [[Float]], _ trY: [Int], _ k: Int) -> SoftmaxClassifierHead {
@@ -905,12 +918,6 @@ let trTrajText = trainCases.indices.map { i in
 let trTrajFull = trainCases.indices.map { i in
     RelationalHybridFeatureExtractor.extractTrajectoryFullFeatures(hybridT2: trSuite.hybridT2[i], hybridT4: trSuite.hybridT4[i], zT2: trSuite.zT2[i], zT4: trSuite.zT4[i], temporal: trainCases[i].temporalContext)
 }
-let unTrajText = unseenCases.indices.map { i in
-    RelationalHybridFeatureExtractor.extractTrajectoryTextFeatures(hybridT2: unSuite.hybridT2[i], hybridT4: unSuite.hybridT4[i], zT2: unSuite.zT2[i], zT4: unSuite.zT4[i])
-}
-let unTrajFull = unseenCases.indices.map { i in
-    RelationalHybridFeatureExtractor.extractTrajectoryFullFeatures(hybridT2: unSuite.hybridT2[i], hybridT4: unSuite.hybridT4[i], zT2: unSuite.zT2[i], zT4: unSuite.zT4[i], temporal: unseenCases[i].temporalContext)
-}
 let hTrajText = resolveOrFit(cal.trajectoryTextHead, trTrajText, trainCases.map { trajCases.firstIndex(of: $0.trajectory.type) ?? 0 }, trajCases.count)
 let hTrajFull = resolveOrFit(cal.trajectoryFullHead, trTrajFull, trainCases.map { trajCases.firstIndex(of: $0.trajectory.type) ?? 0 }, trajCases.count)
 let hRet30 = resolveOrFit(cal.retained30dHead, trTrajFull, trainCases.map { $0.trajectory.retained30d ? 1 : 0 }, 2)
@@ -926,44 +933,69 @@ func ordMetrics(_ h: SoftmaxClassifierHead, _ xs: [[Float]], _ ys: [Int]) -> Ord
     return OrdinalGradationAxisMetrics(exact_accuracy: ex, within_one_accuracy: w1, expected_value_mae: mae)
 }
 
-let unN = Float(max(1, unseenCases.count))
-let ar2MAE = zip(unSuite.hybridT2, unseenCases).reduce(Float(0.0)) { $0 + abs(hAr2.expectedValue($1.0, binValues: SoftmaxClassifierHead.arousalBinCenters) - $1.1.emotionT2.arousal) } / unN
-let ar4MAE = zip(unSuite.hybridT4, unseenCases).reduce(Float(0.0)) { $0 + abs(hAr4.expectedValue($1.0, binValues: SoftmaxClassifierHead.arousalBinCenters) - $1.1.emotionT4.arousal) } / unN
-let unYTraj = unseenCases.map { trajCases.firstIndex(of: $0.trajectory.type) ?? 0 }
-let pTrajText = unTrajText.map { hTrajText.predict($0) }
-let pTrajFull = unTrajFull.map { hTrajFull.predict($0) }
-let trajTextAcc = Float(zip(pTrajText, unYTraj).filter { $0 == $1 }.count) / unN
-let trajFullAcc = Float(zip(pTrajFull, unYTraj).filter { $0 == $1 }.count) / unN
-var trajPerClass: [String: Float] = [:]
-for (cIdx, tc) in trajCases.enumerated() {
-    let idxs = unYTraj.indices.filter { unYTraj[$0] == cIdx }
-    if !idxs.isEmpty {
-        trajPerClass[tc.rawValue] = Float(idxs.filter { pTrajFull[$0] == cIdx }.count) / Float(idxs.count)
+@MainActor
+func evalGradationAndTrajectory(label: String, cases cs: [RelationalDialogueCase], suite s: EncodedSuite) -> GradationAndTrajectoryEval {
+    let n = Float(max(1, cs.count))
+    let tText = cs.indices.map { i in
+        RelationalHybridFeatureExtractor.extractTrajectoryTextFeatures(hybridT2: s.hybridT2[i], hybridT4: s.hybridT4[i], zT2: s.zT2[i], zT4: s.zT4[i])
     }
+    let tFull = cs.indices.map { i in
+        RelationalHybridFeatureExtractor.extractTrajectoryFullFeatures(hybridT2: s.hybridT2[i], hybridT4: s.hybridT4[i], zT2: s.zT2[i], zT4: s.zT4[i], temporal: cs[i].temporalContext)
+    }
+    let ar2MAE = zip(s.hybridT2, cs).reduce(Float(0.0)) { $0 + abs(hAr2.expectedValue($1.0, binValues: SoftmaxClassifierHead.arousalBinCenters) - $1.1.emotionT2.arousal) } / n
+    let ar4MAE = zip(s.hybridT4, cs).reduce(Float(0.0)) { $0 + abs(hAr4.expectedValue($1.0, binValues: SoftmaxClassifierHead.arousalBinCenters) - $1.1.emotionT4.arousal) } / n
+    let yTraj = cs.map { trajCases.firstIndex(of: $0.trajectory.type) ?? 0 }
+    let pText = tText.map { hTrajText.predict($0) }
+    let pFull = tFull.map { hTrajFull.predict($0) }
+    let trajTextAcc = Float(zip(pText, yTraj).filter { $0 == $1 }.count) / n
+    let trajFullAcc = Float(zip(pFull, yTraj).filter { $0 == $1 }.count) / n
+    var perClass: [String: Float] = [:]
+    for (cIdx, tc) in trajCases.enumerated() {
+        let idxs = yTraj.indices.filter { yTraj[$0] == cIdx }
+        if !idxs.isEmpty {
+            perClass[tc.rawValue] = Float(idxs.filter { pFull[$0] == cIdx }.count) / Float(idxs.count)
+        }
+    }
+    let r30Acc = Float(cs.indices.filter { (hRet30.predict(tFull[$0]) == 1) == cs[$0].trajectory.retained30d }.count) / n
+    let r90Acc = Float(cs.indices.filter { (hRet90.predict(tFull[$0]) == 1) == cs[$0].trajectory.retained90d }.count) / n
+    let aff4 = ordMetrics(hAff4, s.hybridT4, cs.map { $0.emotionT4.affection })
+    let fric4 = ordMetrics(hFric4, s.hybridT4, cs.map { $0.emotionT4.friction })
+    print(String(
+        format: "[v6 Grad & Traj | %-8@] aff4 ±1 %.2f%% | fric4 ±1 %.2f%% | traj text %.2f%% -> full %.2f%% | ret90 %.2f%%",
+        label as NSString, aff4.within_one_accuracy * 100.0, fric4.within_one_accuracy * 100.0,
+        trajTextAcc * 100.0, trajFullAcc * 100.0, r90Acc * 100.0
+    ))
+    return GradationAndTrajectoryEval(
+        n_cases: cs.count,
+        emotion_gradation: [
+            "affection_t2": ordMetrics(hAff2, s.hybridT2, cs.map { $0.emotionT2.affection }),
+            "friction_t2": ordMetrics(hFric2, s.hybridT2, cs.map { $0.emotionT2.friction }),
+            "affection_t4": aff4,
+            "friction_t4": fric4
+        ],
+        arousal_t2_mae: ar2MAE,
+        arousal_t4_mae: ar4MAE,
+        trajectory_10way_text_only_accuracy: trajTextAcc,
+        trajectory_10way_full_temporal_accuracy: trajFullAcc,
+        trajectory_per_class_full_accuracy: perClass,
+        retained_30d_accuracy: r30Acc,
+        retained_90d_accuracy: r90Acc
+    )
 }
-let unRet30Acc = Float(unseenCases.indices.filter { (hRet30.predict(unTrajFull[$0]) == 1) == unseenCases[$0].trajectory.retained30d }.count) / unN
-let unRet90Acc = Float(unseenCases.indices.filter { (hRet90.predict(unTrajFull[$0]) == 1) == unseenCases[$0].trajectory.retained90d }.count) / unN
 
-let v5GradEval = V5GradationAndTrajectoryOutput(
-    n_unseen_cases: unseenCases.count,
-    emotion_gradation_unseen: [
-        "affection_t2": ordMetrics(hAff2, unSuite.hybridT2, unseenCases.map { $0.emotionT2.affection }),
-        "friction_t2": ordMetrics(hFric2, unSuite.hybridT2, unseenCases.map { $0.emotionT2.friction }),
-        "affection_t4": ordMetrics(hAff4, unSuite.hybridT4, unseenCases.map { $0.emotionT4.affection }),
-        "friction_t4": ordMetrics(hFric4, unSuite.hybridT4, unseenCases.map { $0.emotionT4.friction })
-    ],
-    arousal_t2_mae: ar2MAE,
-    arousal_t4_mae: ar4MAE,
-    trajectory_10way_text_only_accuracy: trajTextAcc,
-    trajectory_10way_full_temporal_accuracy: trajFullAcc,
-    trajectory_per_class_full_accuracy: trajPerClass,
-    unseen_retained_30d_accuracy: unRet30Acc,
-    unseen_retained_90d_accuracy: unRet90Acc
-)
-print(String(
-    format: "[v5 Trajectory 10-way] text_only %.2f%% -> full(text+temporal) %.2f%% | ret30 %.2f%% | ret90 %.2f%%",
-    trajTextAcc * 100.0, trajFullAcc * 100.0, unRet30Acc * 100.0, unRet90Acc * 100.0
-))
+let unseenGradEval = evalGradationAndTrajectory(label: "unseen", cases: unseenCases, suite: unSuite)
+let l3dGradEval: GradationAndTrajectoryEval? = if let s3d = l3dSuite, !l3dCases.isEmpty {
+    evalGradationAndTrajectory(label: "layer3d", cases: l3dCases, suite: s3d)
+} else { nil }
+
+var layer3OODMap: [String: Layer3SuiteOutput] = [
+    "layer3a_style_domain_holdout": Layer3SuiteOutput(n_cases: l3aCases.count, models: l3aEval),
+    "layer3b_independent_paraphrases": Layer3SuiteOutput(n_cases: l3bCases.count, models: l3bEval),
+    "layer3c_independent_inversions": Layer3SuiteOutput(n_cases: l3cCases.count, models: l3cEval)
+]
+if let e3d = l3dEval {
+    layer3OODMap["layer3d_generational_slang_emoji"] = Layer3SuiteOutput(n_cases: l3dCases.count, models: e3d)
+}
 
 let elapsedWallSec = Date().timeIntervalSince(startWallTime)
 let execModeLabel = cli.useGPU ? "gpu_mlx" : (didMissAnyCache ? "cpu_multicore_cold" : "cpu_multicore_cached")
@@ -978,11 +1010,7 @@ let report = BenchmarkMetricsReport(
         subband_geometry: geomEval,
         pentagon_external_validity: pentEval
     ),
-    layer3_ood_benchmarks: [
-        "layer3a_style_domain_holdout": Layer3SuiteOutput(n_cases: l3aCases.count, models: l3aEval),
-        "layer3b_independent_paraphrases": Layer3SuiteOutput(n_cases: l3bCases.count, models: l3bEval),
-        "layer3c_independent_inversions": Layer3SuiteOutput(n_cases: l3cCases.count, models: l3cEval)
-    ],
+    layer3_ood_benchmarks: layer3OODMap,
     layer4_gold_outcome_benchmark: Layer4Output(
         n_cases: l4Cases.count,
         zero_shot_consensus_classification: l4ZeroShot,
@@ -991,7 +1019,8 @@ let report = BenchmarkMetricsReport(
         moderation_or_block_5fold: outBlock,
         response_interval_drift_5fold: outDrift
     ),
-    v5_gradation_and_trajectory: v5GradEval
+    unseen_gradation_and_trajectory: unseenGradEval,
+    layer3d_gradation_and_trajectory: l3dGradEval
 )
 
 let outURL = URL(fileURLWithPath: cli.outputPath)

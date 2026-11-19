@@ -79,5 +79,36 @@ struct Step7EmotionDistanceDisengageTests {
         #expect(moved.sorted() == log.sorted())
         #expect(moved.hasPrefix("先日の展示会とても素敵でした。ただ、価値観が違いすぎるので連絡はこれで最後にします。"))
         #expect(moved.hasSuffix("今回の新作も色使いが綺麗ですね。"))
+
+        let emojiLog = "昨日のソワレ最高だった😭✨ 差し入れも喜んでくれて嬉しかったよ🫶 新曲も楽しみにしてるね🎶 でも価値観が合わないから連絡はこれで最後にするね🙇"
+        let emojiMoved = DualStreamRelationalEngine.counterfactualMoveLastSentenceToMiddle(emojiLog)
+        #expect(emojiMoved.sorted() == emojiLog.sorted())
+        #expect(emojiMoved.hasPrefix("昨日のソワレ最高だった😭✨ でも価値観が合わないから連絡はこれで最後にするね🙇"))
+    }
+
+    @Test("7.5: Emoji base-scalar fallback, expressive alphaRel=1.0 gate, and period-less chat preservation")
+    func emojiEncodingGateAndPeriodlessChat() throws {
+        let baseVocab = TextVocabulary(serializedCharacters: "あいうえお配信おつ歌枠たすかる❤❗🙇😭✨😆💦！？ ")
+        // Variation-selector & ZWJ emojis ("❤️", "❗️", "🙇‍♂️") resolve to base scalar without <unk>
+        let encoded = baseVocab.encode("配信おつ❤️❗️🙇‍♂️😭✨")
+        #expect(!encoded.contains(TextVocabulary.unkId))
+
+        let gate = baseVocab.computeRelationalTokenGate(trainTexts: ["あいうえお"])
+        let cryID = baseVocab.encode("😭")[0]
+        #expect(gate[cryID] == 1.0)
+
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("sashiba_emoji_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let cfgJSON = #"{"classifierRules":{"sentenceDelimiters":["。"],"clauseDelimiters":["、"]}}"#
+        try cfgJSON.write(to: tmpDir.appendingPathComponent("dataset_config.json"), atomically: true, encoding: .utf8)
+        let rowJSON = """
+        {"scenario_id":"v6_chat_01","split":"unseen_test","category_12":"VTUBER_GENZ","archetype_6":"TRUE_SUPPORTER","topology_5":"CLOSE_CONFIDANT","expected_archetype_t2":"TRUE_SUPPORTER","expected_topology_t2":"CLOSE_CONFIDANT","modulation":{"ll_t2":0.8,"pol_t2":0.8,"gain_t2":1.0,"ll_t4":0.85,"pol_t4":0.85,"gain_t4":1.0},"persona_profile":{"age_group":"10代後半","tone":"Z世代スラング・絵文字","relationship_duration":"1年","context_domain":"VTuber歌枠"},"sender_log_t1_t2":"深夜のゲリラ歌枠来てくれてありがと〜🎤✨","sender_log_t3_t4":"来週の新衣装お披露目も楽しみにしててね🫶","receiver_log_t1_t2":"ゲリラ歌枠ガチたすかる😭✨ 高音メロすぎて鳥肌立ったよ🔥","receiver_log_t3_t4":"新衣装ビジュ絶対えぐいじゃん🥺 喉ケアしてゆっくり寝てね🫶🤍","receiver_log_harmonized":"新衣装ビジュ絶対えぐいじゃん🥺 喉ケアしてゆっくり寝てね🫶🤍","insights":{"level_0_core":"スラングと絵文字を使いつつ体調を気遣う10代ファン","level_1_mid":"Z世代特有の表現と絵文字で熱量高く応援しつつ睡眠を促す健全な支援者","level_2_deep":"句点を使わない現代チャット文体ながら配信内容を具体的に受け止め境界を尊重している"}}
+        """
+        try rowJSON.write(to: tmpDir.appendingPathComponent("scenarios.jsonl"), atomically: true, encoding: .utf8)
+        let loaded = DatasetConfiguration.load(from: tmpDir.path).relationalDialogueCases
+        #expect(loaded.count == 1)
+        // Must NOT inject fake "。" in the middle of period-less emoji chat!
+        #expect(!loaded[0].partnerCurrentText.contains("。"))
     }
 }

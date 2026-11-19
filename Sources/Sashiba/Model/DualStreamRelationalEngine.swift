@@ -1947,26 +1947,52 @@ public enum DualStreamRelationalEngine {
         )
     }
 
-    /// §3.1 Counterfactual terminal-utterance operator (`最後の一言の終端効果テスト`):
-    /// moves the final sentence of a multi-sentence dialogue log (`[s1, s2, ..., s_n]`, `n >= 3`) to the middle
-    /// (`[s1, s_n, s2, ..., s_{n-1}]`) while preserving exact character multiset and opening sentence `s1`.
-    public static func counterfactualMoveLastSentenceToMiddle(_ text: String) -> String {
-        let terminators: Set<Character> = ["。", "！", "？", "!", "?"]
+    public static func isChatTerminator(_ ch: Character) -> Bool {
+        let punct: Set<Character> = ["。", "！", "？", "!", "?", "♪", "❗", "❓", "‼", "⁉"]
+        if punct.contains(ch) { return true }
+        if let sc = ch.unicodeScalars.first?.value {
+            return (sc >= 0x1F300 && sc <= 0x1FAFF) || (sc >= 0x2600 && sc <= 0x27BF) || sc == 0x203C || sc == 0x2049
+        }
+        return false
+    }
+
+    /// Splits formal or emoji/slang chat text into clauses/sentences while keeping consecutive terminators (`😭✨`, `⁉️💦`, `！！`) grouped together.
+    public static func splitChatSentences(_ text: String) -> [String] {
+        let chars = Array(text)
+        guard !chars.isEmpty else { return [] }
         var sentences: [String] = []
         var buf = ""
-        for ch in text {
+        var i = 0
+        while i < chars.count {
+            let ch = chars[i]
             buf.append(ch)
-            if terminators.contains(ch) {
+            if isChatTerminator(ch) {
+                while (i + 1) < chars.count && (isChatTerminator(chars[i + 1]) || chars[i + 1].isWhitespace) {
+                    i += 1
+                    buf.append(chars[i])
+                }
                 if !buf.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     sentences.append(buf)
                 }
                 buf = ""
             }
+            i += 1
         }
-        let tail = buf.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty {
-            sentences.append(buf)
+        if !buf.isEmpty {
+            if !buf.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sentences.append(buf)
+            } else if !sentences.isEmpty {
+                sentences[sentences.count - 1] += buf
+            }
         }
+        return sentences
+    }
+
+    /// §3.1 Counterfactual terminal-utterance operator (`最後の一言の終端効果テスト`):
+    /// moves the final sentence of a multi-sentence dialogue log (`[s1, s2, ..., s_n]`, `n >= 3`) to the middle
+    /// (`[s1, s_n, s2, ..., s_{n-1}]`) while preserving exact character multiset and opening sentence `s1`.
+    public static func counterfactualMoveLastSentenceToMiddle(_ text: String) -> String {
+        let sentences = splitChatSentences(text)
         guard sentences.count >= 3 else {
             if sentences.count == 2 {
                 return sentences[1] + sentences[0]

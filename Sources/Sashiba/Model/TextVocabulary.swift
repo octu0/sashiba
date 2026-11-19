@@ -189,13 +189,33 @@ public struct TextVocabulary: Sendable, Equatable {
         return TextDocument.loadDocuments(from: [url.path]).flatMap(\.documents)
     }
 
+    public func tokenCharacter(at id: Int) -> Character? {
+        guard id >= Self.specialCount && id < tokenList.count else { return nil }
+        return tokenList[id]
+    }
+
+    public static func isEmojiOrExpressiveScalar(_ scalar: UInt32) -> Bool {
+        return (scalar >= 0x1F1E6 && scalar <= 0x1FAFF)
+            || (scalar >= 0x2600 && scalar <= 0x27BF)
+            || scalar == 0x203C || scalar == 0x2049
+            || scalar == 0x03C9 || scalar == 0x0414 || scalar == 0x2200
+            || scalar == 0xFF57 // fullwidth 'ｗ'
+    }
+
     public func encode(
         _ text: String,
         maxLength: Int? = nil,
         addEOS: Bool = false,
         padToLength: Int? = nil
     ) -> [Int] {
-        var ids = text.map { charToIdTable[$0] ?? Self.unkId }
+        var ids = text.map { ch -> Int in
+            if let id = charToIdTable[ch] { return id }
+            if let firstScalar = ch.unicodeScalars.first,
+               let id = charToIdTable[Character(firstScalar)] {
+                return id
+            }
+            return Self.unkId
+        }
         if addEOS {
             ids.append(Self.eosId)
         }
@@ -250,9 +270,10 @@ public struct TextVocabulary: Sendable, Equatable {
             let scalar = ch.unicodeScalars.first?.value ?? 0
             let isHiragana = (scalar >= 0x3040 && scalar <= 0x309F)
             let isPunctOrSym = (scalar >= 0x3000 && scalar <= 0x303F) || (scalar >= 0xFF01 && scalar <= 0xFF60) || (scalar >= 0x2000 && scalar <= 0x206F) || (scalar == 0x30FC)
+            let isExpressive = Self.isEmojiOrExpressiveScalar(scalar)
             let isKatakana = (scalar >= 0x30A1 && scalar <= 0x30FA)
             let dfRatio = Float(docFreq[idx]) / totalDocs
-            if isHiragana || isPunctOrSym {
+            if isHiragana || isPunctOrSym || isExpressive {
                 gate[idx] = 1.0
             } else if isKatakana {
                 gate[idx] = (dfRatio >= 0.015 && docFreq[idx] >= 3) ? 0.35 : 0.08
@@ -548,8 +569,14 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
     }
 
     private static func normalizeTwoSentences(_ text: String, sentenceDelim: String, clauseDelim: String) -> String {
-        guard !sentenceDelim.isEmpty else { return text }
-        let parts = text
+        let collapsed = text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sentenceDelim.isEmpty, collapsed.contains(sentenceDelim) else {
+            return collapsed
+        }
+        let parts = collapsed
             .components(separatedBy: sentenceDelim)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -560,17 +587,9 @@ public struct DatasetConfiguration: Codable, Sendable, Equatable {
             let rest = parts[1..<parts.count].joined(separator: clauseDelim)
             return first + sentenceDelim + rest + sentenceDelim
         } else if let single = parts.first {
-            let clauses = single.components(separatedBy: clauseDelim).filter { !$0.isEmpty }
-            if clauses.count >= 2 {
-                let mid = clauses.count / 2
-                let s1 = clauses[0..<mid].joined(separator: clauseDelim)
-                let s2 = clauses[mid..<clauses.count].joined(separator: clauseDelim)
-                return s1 + sentenceDelim + s2 + sentenceDelim
-            }
-            let midIdx = single.index(single.startIndex, offsetBy: max(1, single.count / 2))
-            return String(single[..<midIdx]) + sentenceDelim + String(single[midIdx...]) + sentenceDelim
+            return single + sentenceDelim
         }
-        return text
+        return collapsed
     }
 
     private static func readJSONLRecords(inDirectory dirPath: String) -> [ScenarioJSONLRecord] {

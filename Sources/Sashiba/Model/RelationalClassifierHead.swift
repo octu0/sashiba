@@ -344,15 +344,19 @@ public struct SoftmaxClassifierHead: Codable, Sendable, Equatable {
     }
 }
 
-/// Pure token-ID, topic-noun-swap-invariant hybrid relational descriptor (`160` dims for `z_rel ∈ R^128`):
+/// Pure token-ID, topic-noun-swap-invariant hybrid relational descriptor (`168` dims for `z_rel ∈ R^128`):
 /// combines `z_rel` (`128`), nonlinear subband geometry (`8`), cross-stream content-echo & subband rule modulation (`8`),
-/// and non-lexical dialogue turn-taking / punctuation / sentence-trajectory cadence (`16`).
+/// non-lexical dialogue turn-taking / punctuation rhythm (`16`), and emoji / chat-orthography / register prosody (`8`).
 /// Requires ZERO GPU retraining and preserves Audit 1 (token-ID-only signature) & Audit 4 (topic-swap invariance).
 public struct RelationalHybridFeatureExtractor: Sendable {
     public let questionIDs: Set<Int>
     public let exclamIDs: Set<Int>
     public let commaIDs: Set<Int>
     public let periodIDs: Set<Int>
+    public let emojiIDs: Set<Int>
+    public let laughKaomojiIDs: Set<Int>
+    public let elongationIDs: Set<Int>
+    public let chatTerminatorIDs: Set<Int>
 
     public init(vocabulary: TextVocabulary) {
         func ids(for chars: [String]) -> Set<Int> {
@@ -365,10 +369,27 @@ public struct RelationalHybridFeatureExtractor: Sendable {
             }
             return out
         }
-        self.questionIDs = ids(for: ["？", "?"])
-        self.exclamIDs = ids(for: ["！", "!", "♪"])
+        let qSet = ids(for: ["？", "?", "❓", "⁉"])
+        let exSet = ids(for: ["！", "!", "♪", "❗", "‼"])
+        let pSet = ids(for: ["。", "."])
+        self.questionIDs = qSet
+        self.exclamIDs = exSet
         self.commaIDs = ids(for: ["、", ","])
-        self.periodIDs = ids(for: ["。", "."])
+        self.periodIDs = pSet
+        self.laughKaomojiIDs = ids(for: ["ｗ", "w", "ω", "Д", "∀", "≧", "≦", "´", "｀", "^", "＾"])
+        self.elongationIDs = ids(for: ["〜", "～", "…", "‥"])
+
+        var emSet: Set<Int> = []
+        for id in TextVocabulary.specialCount..<vocabulary.size {
+            if let ch = vocabulary.tokenCharacter(at: id),
+               let sc = ch.unicodeScalars.first?.value {
+                if (sc >= 0x1F1E6 && sc <= 0x1FAFF) || (sc >= 0x2600 && sc <= 0x27BF) || sc == 0x203C || sc == 0x2049 {
+                    emSet.insert(id)
+                }
+            }
+        }
+        self.emojiIDs = emSet
+        self.chatTerminatorIDs = pSet.union(qSet).union(exSet).union(emSet)
     }
 
     public func extract(
@@ -486,12 +507,56 @@ public struct RelationalHybridFeatureExtractor: Sendable {
             qIgnored
         ]
 
+        func countChatClauses(_ toks: [Int]) -> Int {
+            guard !toks.isEmpty else { return 1 }
+            var clauses = 0
+            var i = 0
+            var hasBody = false
+            while i < toks.count {
+                if chatTerminatorIDs.contains(toks[i]) {
+                    while (i + 1) < toks.count && chatTerminatorIDs.contains(toks[i + 1]) {
+                        i += 1
+                    }
+                    if hasBody {
+                        clauses += 1
+                        hasBody = false
+                    }
+                } else {
+                    hasBody = true
+                }
+                i += 1
+            }
+            if hasBody { clauses += 1 }
+            return max(1, clauses)
+        }
+
+        let emS = Float(cleanS.filter { emojiIDs.contains($0) }.count) * invS
+        let emR = Float(cleanR.filter { emojiIDs.contains($0) }.count) * invR
+        let lkS = Float(cleanS.filter { laughKaomojiIDs.contains($0) }.count) * invS
+        let lkR = Float(cleanR.filter { laughKaomojiIDs.contains($0) }.count) * invR
+        let elongR = Float(cleanR.filter { elongationIDs.contains($0) }.count) * invR
+        let periodR = Float(cleanR.filter { periodIDs.contains($0) }.count) * invR
+        let chatClauseRatio = Float(countChatClauses(cleanR)) / Float(countChatClauses(cleanS))
+        let hasTerminalEmojiR: Float = if let lastTok = cleanR.last, emojiIDs.contains(lastTok) { 1.0 } else { 0.0 }
+
+        let orthographyFeats: [Float] = [
+            emS,
+            emR,
+            emR - emS,
+            lkS,
+            lkR,
+            elongR,
+            periodR,
+            chatClauseRatio + 0.25 * hasTerminalEmojiR
+        ]
+
         var out: [Float] = []
-        out.reserveCapacity(zRel.count + 32)
+        out.reserveCapacity(zRel.count + 40)
         out.append(contentsOf: zRel)
         out.append(contentsOf: geomFeats)
         out.append(contentsOf: echoFeats)
         out.append(contentsOf: rhythmFeats)
+        out.append(contentsOf: orthographyFeats)
         return out
     }
 

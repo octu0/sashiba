@@ -111,13 +111,13 @@ struct Step6NextPhaseZeroGPUTests {
             zRel: zDummy, weights: w
         )
 
-        #expect(fEchoA.count == 160)
+        #expect(fEchoA.count == 168)
         // Index 128 + 8 = 136 is rareEchoRecall
         #expect(fEchoA[136] > fTemplate[136] + 0.3, "Topic echo recall must separate genuine memory from generic flattery")
 
         // Simultaneous topic-noun swap ("陶芸/釉薬" -> "園芸/肥料") preserves hybrid echo & rhythm features identically!
         var maxSwapDiff: Float = 0.0
-        for j in 128..<160 {
+        for j in 128..<168 {
             maxSwapDiff = max(maxSwapDiff, abs(fEchoA[j] - fEchoB[j]))
         }
         #expect(maxSwapDiff < 1e-5, "Hybrid features must be invariant under simultaneous rare-noun swaps: maxDiff=\(maxSwapDiff)")
@@ -154,7 +154,7 @@ struct Step6NextPhaseZeroGPUTests {
 
         let inf = SWTHawkAutoencoder(weights: w).inferRelational(senderTokenIDs: sToks[0], receiverTokenIDs: rToks[0])
         #expect(inf.zRel.count == 128)
-        #expect(inf.hybridFeatures.count == 160)
+        #expect(inf.hybridFeatures.count == 168)
         #expect(inf.hybridArchetypeProbsT4.count == 6)
         #expect(inf.hybridTopologyProbsT4.count == 5)
     }

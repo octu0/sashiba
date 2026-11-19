@@ -474,22 +474,7 @@ public struct RelationalDialogueCase: Codable, Sendable, Equatable {
     }
 
     public static func fallbackEarlyText(from hostText: String) -> String {
-        let terminators: Set<Character> = ["。", "！", "？", "!", "?"]
-        var sentences: [String] = []
-        var buf = ""
-        for ch in hostText {
-            buf.append(ch)
-            if terminators.contains(ch) {
-                if !buf.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    sentences.append(buf)
-                }
-                buf = ""
-            }
-        }
-        let tail = buf.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty {
-            sentences.append(buf)
-        }
+        let sentences = DualStreamRelationalEngine.splitChatSentences(hostText)
         if sentences.count >= 3 {
             return sentences[0] + sentences[1]
         }
