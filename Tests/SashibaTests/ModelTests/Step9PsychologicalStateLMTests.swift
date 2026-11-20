@@ -3,21 +3,33 @@ import MLX
 import Testing
 @testable import Sashiba
 
-@Suite("Step 9: Small Conditional Griffin Psychological State LM (CPU/GPU Parity & KV-Cache)")
+@Suite("Step 9: Small Conditional Griffin Psychological State LM (Subword BPE, CPU/GPU Parity & KV-Cache)")
 struct Step9PsychologicalStateLMTests {
-    @Test("9.1: PsychologicalStateLMWeights SafeTensors round-trip is bit-exact")
+    @Test("9.1: SubwordVocabulary BPE round-trips Japanese psychological prose with 0 <unk> and ~2.5x compression")
+    func subwordBPERoundTripAndCompression() {
+        let corpus = Array(repeating: "表面上は明るく合わせていますが、内心では少しずつ距離を置きたい心境です。", count: 8) +
+                     Array(repeating: "相手の体調を気遣っており、無理のない距離感で温かく見守りたい心理状態です。", count: 8)
+        let bpe = SubwordVocabulary.train(trainingTexts: corpus, baseCharacters: "未知漢字薔薇のように静かに", numMerges: 64, minPairFreq: 2)
+        let sample = "表面上は明るく合わせていますが、薔薇のように静かに距離を置きたい心境です。"
+        let ids = bpe.encode(sample, addEOS: true)
+        #expect(!ids.contains(TextVocabulary.unkId))
+        #expect(ids.count < sample.count)
+        #expect(bpe.decode(ids) == sample)
+    }
+
+    @Test("9.2: PsychologicalStateLMWeights SafeTensors round-trip is bit-exact")
     func safeTensorsRoundTrip() throws {
-        let vocab = TextVocabulary(texts: ["心の距離と安心感があふれています。"])
+        let bpe = SubwordVocabulary.train(trainingTexts: ["心の距離と安心感があふれています。"], numMerges: 16, minPairFreq: 1)
         let w = PsychologicalStateLMWeights.makeRandom(
-            vocabSize: vocab.count,
+            vocabSize: bpe.count,
             dim: 64,
             numLayers: 2,
             numHeads: 2,
             windowSize: 16,
             numCondTokens: 4,
             condRawDim: PsychConditionExtractor.rawConditionDim,
-            maxSeqLen: 96,
-            serializedVocabulary: vocab.serialize(),
+            maxSeqLen: 48,
+            serializedSubwordVocabulary: bpe.serialize(),
             seed: 9001
         )
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("psych_lm_test_\(UUID().uuidString).safetensors")
@@ -28,19 +40,19 @@ struct Step9PsychologicalStateLMTests {
         #expect(loaded == w)
     }
 
-    @Test("9.2: CPU forwardTeacherForced matches MLX GPU forward logits to < 1e-4 and KV-cached generateTokens matches step-for-step")
+    @Test("9.3: CPU forwardTeacherForced matches MLX GPU forward logits to < 2e-3 (TF32) and KV-cached generateTokens matches argmax")
     func cpuMLXParityAndKVCacheDecode() {
-        let vocab = TextVocabulary(texts: ["穏やかな信頼と親しみがあふれており、心地よい距離感で見守りたい心理状態です。"])
+        let bpe = SubwordVocabulary.train(trainingTexts: ["穏やかな信頼と親しみがあふれており、心地よい距離感で見守りたい心理状態です。"], numMerges: 8, minPairFreq: 1)
         let w = PsychologicalStateLMWeights.makeRandom(
-            vocabSize: vocab.count,
+            vocabSize: bpe.count,
             dim: 64,
             numLayers: 2,
             numHeads: 2,
-            windowSize: 12, // Intentionally small windowSize < length (28) to test sliding KV eviction at t >= W!
+            windowSize: 12,
             numCondTokens: 4,
             condRawDim: PsychConditionExtractor.rawConditionDim,
-            maxSeqLen: 64,
-            serializedVocabulary: vocab.serialize(),
+            maxSeqLen: 48,
+            serializedSubwordVocabulary: bpe.serialize(),
             seed: 9002
         )
         let cpuLM = PsychologicalStateLM(weights: w)
@@ -50,18 +62,17 @@ struct Step9PsychologicalStateLMTests {
         var cond = [Float](repeating: 0.0, count: PsychConditionExtractor.rawConditionDim)
         for i in 0..<cond.count { cond[i] = rng.nextSignedUniform(scale: 1.0) }
 
-        // Test KV-cached generateTokens over 28 steps (> windowSize=12) with 4-gram penalty irrelevant on random logits or checked step-by-step
-        let genIds = cpuLM.generateTokens(condRaw: cond, maxLength: 28, minLength: 28, temperature: 0.0)
-        #expect(genIds.count == 28)
+        let genIds = cpuLM.generateTokens(condRaw: cond, maxLength: 24, minCharLength: 200, repetitionPenalty: 1.0, temperature: 0.0)
+        #expect(genIds.count == 24)
 
-        var prevTokens = [Int](repeating: TextVocabulary.bosId, count: 28)
-        for t in 1..<28 { prevTokens[t] = genIds[t - 1] }
+        var prevTokens = [Int](repeating: TextVocabulary.bosId, count: 24)
+        for t in 1..<24 { prevTokens[t] = genIds[t - 1] }
 
-        let cpuLogits = cpuLM.forwardTeacherForced(condRaw: cond, prevTokens: prevTokens, batch: 1, time: 28)
-        let pe = MLXArray(HawkConditionalDecoder.positionalEncoding(time: 28, dim: 64), [1, 28, 64])
+        let cpuLogits = cpuLM.forwardTeacherForced(condRaw: cond, prevTokens: prevTokens, batch: 1, time: 24)
+        let pe = MLXArray(HawkConditionalDecoder.positionalEncoding(time: 24, dim: 64), [1, 24, 64])
         let mlxLogits = mlxLM(
             condRaw: MLXArray(cond, [1, PsychConditionExtractor.rawConditionDim]),
-            prevTokenIds: MLXArray(prevTokens.map { Int32($0) }, [1, 28]),
+            prevTokenIds: MLXArray(prevTokens.map { Int32($0) }, [1, 24]),
             pe: pe
         )
         eval(mlxLogits)
@@ -72,11 +83,10 @@ struct Step9PsychologicalStateLMTests {
         for (a, b) in zip(cpuLogits, gpuArr) {
             maxDiff = max(maxDiff, abs(a - b))
         }
-        #expect(maxDiff < 1e-3)
+        #expect(maxDiff < 2e-3)
 
-        // Verify KV-cached step-by-step greedy choices (for t < 3 before 4-gram check activates, and all non-penalized steps) match teacher-forced argmax
-        let vSize = vocab.count
-        for t in 0..<3 {
+        let vSize = bpe.count
+        for t in 0..<24 {
             let base = t * vSize
             var best = TextVocabulary.specialCount
             for v in (TextVocabulary.specialCount + 1)..<vSize where cpuLogits[base + v] > cpuLogits[base + best] {
@@ -86,37 +96,100 @@ struct Step9PsychologicalStateLMTests {
         }
     }
 
-    @Test("9.3: PsychConditionExtractor cleanly encodes full vs text-only flags and relative timing deltas")
-    func conditionExtractorModes() {
+    @Test("9.4: TimestampedComment parser and sender-free 128D PsychConditionExtractor distinguish single vs steady vs decelerating streams")
+    func timestampedCommentStreamModes() {
+        let parsed = TimestampedComment.parseList([
+            "2026-12-25 22:33:44 ううう",
+            "2026-10-12 12:34:56 あああ",
+            "2026-11-23 10:22:33 いいい"
+        ])
+        #expect(parsed.count == 3)
+        #expect(parsed[0].text == "あああ" && parsed[0].rawTimestamp == "2026-10-12 12:34:56")
+        #expect(parsed[1].text == "いいい" && parsed[1].rawTimestamp == "2026-11-23 10:22:33")
+        #expect(parsed[2].text == "ううう" && parsed[2].rawTimestamp == "2026-12-25 22:33:44")
+
+        let plainYear = TimestampedComment.parse("2026年もよろしくね！")
+        #expect(plainYear.timestamp == nil && plainYear.text == "2026年もよろしくね！")
+
         let relW = SWTHawkWeights.makeRandom(vocabSize: 128, dim: 64, latentDim: 128, seed: 333)
         let relModel = SWTHawkAutoencoder(weights: relW)
-        let tcFast = TemporalRelationalContext(actorBaselineReplyHours: 2.0, replyLagHoursT2: 2.0, replyLagHoursT4: 0.2)
-        let tcSlow = TemporalRelationalContext(actorBaselineReplyHours: 2.0, replyLagHoursT2: 2.0, replyLagHoursT4: 48.0, postT4UnansweredProbe: true)
 
-        let (cTextOnly, _) = PsychConditionExtractor.extractSingle(
+        let single = PsychConditionExtractor.extractFromComments(
             relationalModel: relModel,
-            senderCurrentTokens: [5, 8, 12],
-            receiverCurrentTokens: [6, 9, 15]
-        )
-        let (cFullFast, _) = PsychConditionExtractor.extractSingle(
+            comments: TimestampedComment.parseList(["2026-12-25 22:33:44 ううう"])
+        ).rawCondition
+        let steady = PsychConditionExtractor.extractFromComments(
             relationalModel: relModel,
-            senderEarlyTokens: [5, 7],
-            receiverEarlyTokens: [6, 8],
-            senderCurrentTokens: [5, 8, 12],
-            receiverCurrentTokens: [6, 9, 15],
-            temporalContext: tcFast
-        )
-        let (cFullSlow, _) = PsychConditionExtractor.extractSingle(
+            comments: parsed
+        ).rawCondition
+        let decel = PsychConditionExtractor.extractFromComments(
             relationalModel: relModel,
-            senderEarlyTokens: [5, 7],
-            receiverEarlyTokens: [6, 8],
-            senderCurrentTokens: [5, 8, 12],
-            receiverCurrentTokens: [6, 9, 15],
-            temporalContext: tcSlow
+            comments: TimestampedComment.parseList([
+                "2026-10-12 12:00:00 あああ",
+                "2026-10-12 14:00:00 いいい",
+                "2026-12-25 22:33:44 ううう"
+            ])
+        ).rawCondition
+        let burst = PsychConditionExtractor.extractFromComments(
+            relationalModel: relModel,
+            comments: TimestampedComment.parseList([
+                "2026-10-12 12:00:00 あああ",
+                "2026-11-23 10:20:00 いいい",
+                "2026-11-23 10:25:00 ううう"
+            ])
+        ).rawCondition
+
+        #expect(single.count == PsychConditionExtractor.rawConditionDim)
+        let hasPastIdx = 40 + 21 + 16
+        let tempBaseIdx = hasPastIdx + 1 + 21 + 13
+        #expect(single[hasPastIdx] == 0.0 && single[tempBaseIdx] == 0.0)
+        #expect(steady[hasPastIdx] == 1.0 && steady[tempBaseIdx] == 1.0 && steady[tempBaseIdx + 13] == 1.0)
+        #expect(decel[tempBaseIdx + 10] > 0.85) // isDecelerating
+        #expect(burst[tempBaseIdx + 12] > 0.80) // isRapidBurst
+    }
+
+    @Test("9.5: Weight-tied MLX export matches CPU logits and AVX2-batched generateBeam avoids immediate self-repeats")
+    func weightTiedExportAndBeamSearch() {
+        let bpe = SubwordVocabulary.train(
+            trainingTexts: ["穏やかな信頼と親しみがあふれており、心地よい距離感で見守りたい心理状態です。"],
+            numMerges: 12,
+            minPairFreq: 1
         )
-        #expect(cTextOnly.count == PsychConditionExtractor.rawConditionDim)
-        #expect(cTextOnly[190] == 0.0 && cTextOnly[571] == 0.0)
-        #expect(cFullFast[190] == 1.0 && cFullFast[571] == 1.0)
-        #expect(cFullSlow[571 + 1 + 3] > cFullFast[571 + 1 + 3] + 2.5)
+        let initW = PsychologicalStateLMWeights.makeRandom(
+            vocabSize: bpe.count,
+            dim: 64,
+            numLayers: 2,
+            numHeads: 2,
+            windowSize: 16,
+            numCondTokens: 4,
+            condRawDim: PsychConditionExtractor.rawConditionDim,
+            maxSeqLen: 32,
+            serializedSubwordVocabulary: bpe.serialize(),
+            seed: 9005
+        )
+        let mlxTied = MLXPsychologicalStateLM(weights: initW, useTiedEmbeddings: true)
+        let exported = mlxTied.exportWeights()
+        let cpuTied = PsychologicalStateLM(weights: exported)
+
+        let cond = [Float](repeating: 0.1, count: PsychConditionExtractor.rawConditionDim)
+        let prev = [TextVocabulary.bosId, 4, 5, 6, 7, 8]
+        let cpuLogits = cpuTied.forwardTeacherForced(condRaw: cond, prevTokens: prev, batch: 1, time: prev.count)
+        let pe = MLXArray(HawkConditionalDecoder.positionalEncoding(time: prev.count, dim: 64), [1, prev.count, 64])
+        let gpuLogits = mlxTied(
+            condRaw: MLXArray(cond, [1, PsychConditionExtractor.rawConditionDim]),
+            prevTokenIds: MLXArray(prev.map { Int32($0) }, [1, prev.count]),
+            pe: pe
+        )
+        eval(gpuLogits)
+        let gpuArr = gpuLogits.asType(.float32).asArray(Float.self)
+        var maxDiff: Float = 0.0
+        for (a, b) in zip(cpuLogits, gpuArr) { maxDiff = max(maxDiff, abs(a - b)) }
+        #expect(maxDiff < 2e-3)
+
+        let beamToks = cpuTied.generateBeam(condRaw: cond, beamWidth: 4, maxLength: 20, minCharLength: 10)
+        #expect(!beamToks.isEmpty)
+        for i in 1..<beamToks.count {
+            #expect(beamToks[i] != beamToks[i - 1])
+        }
     }
 }

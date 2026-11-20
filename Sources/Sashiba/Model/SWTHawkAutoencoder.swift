@@ -741,11 +741,41 @@ public final class SWTHawkAutoencoder: @unchecked Sendable {
         self.psychologicalLM = PsychologicalStateLM(weights: lmWeights)
     }
 
-    /// Evaluates `v6 / v6_hybrid` relational state and generates a natural inner-psychology description using the attached `PsychologicalStateLM`.
+    /// Evaluates a chronological list of `--text` strings (`"YYYY-MM-DD HH:MM:SS comment"` or plain `"comment"`, `0%` sender text) and generates a natural inner-psychology description.
+    public func inferPsychology(
+        texts: [String],
+        beamWidth: Int = 2,
+        temperature: Float = 0.0
+    ) -> PsychologicalStateResult? {
+        guard let lm = psychologicalLM else { return nil }
+        return lm.describeTexts(
+            relationalModel: self,
+            texts: texts,
+            beamWidth: beamWidth,
+            temperature: temperature
+        )
+    }
+
+    /// Evaluates a chronological `[TimestampedComment]` stream (`0%` sender text) and generates a natural inner-psychology description.
+    public func inferPsychology(
+        comments: [TimestampedComment],
+        beamWidth: Int = 2,
+        temperature: Float = 0.0
+    ) -> PsychologicalStateResult? {
+        guard let lm = psychologicalLM else { return nil }
+        return lm.describeComments(
+            relationalModel: self,
+            comments: comments,
+            beamWidth: beamWidth,
+            temperature: temperature
+        )
+    }
+
+    /// Evaluates relational state and generates a natural inner-psychology description using the attached `PsychologicalStateLM`.
     public func inferRelationalWithPsychology(
         senderEarlyText: String? = nil,
         receiverEarlyText: String? = nil,
-        senderCurrentText: String,
+        senderCurrentText: String = "",
         receiverCurrentText: String,
         temporalContext: TemporalRelationalContext? = nil,
         temperature: Float = 0.0

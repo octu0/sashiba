@@ -3,7 +3,7 @@ import MLX
 import MLXNN
 import MLXOptimizers
 
-/// One Conditioned Griffin + 8-Token Cross-Attention Layer on MLX GPU.
+/// One Conditioned Griffin + Multi-Token Cross-Attention Layer on MLX GPU.
 public final class MLXPsychDecoderLayer: Module, @unchecked Sendable {
     public let dim: Int
     public let numHeads: Int
@@ -56,10 +56,9 @@ public final class MLXPsychDecoderLayer: Module, @unchecked Sendable {
         let hDim = dim / numHeads
         let scale = 1.0 / sqrt(Float(max(1, hDim)))
 
-        // 1 & 2: AdaLN + h0(cGlobal) RG-LRU + Causal Local Self-Attention
         let h0 = matmul(cGlobal, wH0) + bH0
-        let adaG = (matmul(cGlobal, wAdaGamma) + bAdaGamma).expandedDimensions(axis: 1) // [B, 1, D]
-        let adaB = (matmul(cGlobal, wAdaBeta) + bAdaBeta).expandedDimensions(axis: 1)   // [B, 1, D]
+        let adaG = (matmul(cGlobal, wAdaGamma) + bAdaGamma).expandedDimensions(axis: 1)
+        let adaB = (matmul(cGlobal, wAdaBeta) + bAdaBeta).expandedDimensions(axis: 1)
 
         let norm1Raw = mlxLayerNorm(x, gamma: block.norm1Gamma, beta: block.norm1Beta)
         let u1 = (1.0 + adaG) * norm1Raw + adaB
@@ -73,17 +72,15 @@ public final class MLXPsychDecoderLayer: Module, @unchecked Sendable {
         let x1 = x + matmul(gateAct * hRec, block.wOut) + block.bOut
         let x2 = block.localAttn(x1)
 
-        // 3: 8-Token Condition Cross-Attention
         let uCross = mlxLayerNorm(x2, gamma: crossNormGamma, beta: crossNormBeta)
-        let q = (matmul(uCross, wCrossQ) + bCrossQ).reshaped([batch, time, numHeads, hDim]).transposed(0, 2, 1, 3) // [B, H, T, hDim]
-        let kT = (matmul(condMem, wCrossK) + bCrossK).reshaped([batch, mTok, numHeads, hDim]).transposed(0, 2, 3, 1) // [B, H, hDim, M]
-        let v = (matmul(condMem, wCrossV) + bCrossV).reshaped([batch, mTok, numHeads, hDim]).transposed(0, 2, 1, 3)   // [B, H, M, hDim]
+        let q = (matmul(uCross, wCrossQ) + bCrossQ).reshaped([batch, time, numHeads, hDim]).transposed(0, 2, 1, 3)
+        let kT = (matmul(condMem, wCrossK) + bCrossK).reshaped([batch, mTok, numHeads, hDim]).transposed(0, 2, 3, 1)
+        let v = (matmul(condMem, wCrossV) + bCrossV).reshaped([batch, mTok, numHeads, hDim]).transposed(0, 2, 1, 3)
 
         let probs = softmax(matmul(q, kT) * scale, axis: -1)
         let ctx = matmul(probs, v).transposed(0, 2, 1, 3).reshaped([batch, time, dim])
         let x3 = x2 + matmul(ctx, wCrossOut) + bCrossOut
 
-        // 4: Pre-LN SiLU MLP
         let norm2 = mlxLayerNorm(x3, gamma: block.norm2Gamma, beta: block.norm2Beta)
         let mlpAct = mlxSiLU(matmul(norm2, block.wMLPUp) + block.bMLPUp)
         return x3 + matmul(mlpAct, block.wMLPDown) + block.bMLPDown
@@ -156,7 +153,7 @@ public final class MLXPsychDecoderLayer: Module, @unchecked Sendable {
     }
 }
 
-/// MLX GPU Module for `PsychologicalStateLM`.
+/// MLX GPU Module for Subword-Tokenized `PsychologicalStateLM`.
 public final class MLXPsychologicalStateLM: Module, @unchecked Sendable {
     public let vocabSize: Int
     public let dim: Int
@@ -165,7 +162,9 @@ public final class MLXPsychologicalStateLM: Module, @unchecked Sendable {
     public let numCondTokens: Int
     public let condRawDim: Int
     public let maxSeqLen: Int
-    public let serializedVocabulary: String
+    public let serializedSubwordVocabulary: String
+    public var auxiliaryHeads: PsychAuxiliaryHeads
+    public let useTiedEmbeddings: Bool
 
     @ParameterInfo public var wCondIn: MLXArray
     @ParameterInfo public var bCondIn: MLXArray
@@ -185,7 +184,7 @@ public final class MLXPsychologicalStateLM: Module, @unchecked Sendable {
     private var condMeanMLX: MLXArray
     private var condStdMLX: MLXArray
 
-    public init(weights: PsychologicalStateLMWeights) {
+    public init(weights: PsychologicalStateLMWeights, useTiedEmbeddings: Bool = false) {
         let d = weights.dim
         let totalToks = weights.numCondTokens + 1
         self.vocabSize = weights.vocabSize
@@ -195,11 +194,13 @@ public final class MLXPsychologicalStateLM: Module, @unchecked Sendable {
         self.numCondTokens = weights.numCondTokens
         self.condRawDim = weights.condRawDim
         self.maxSeqLen = weights.maxSeqLen
-        self.serializedVocabulary = weights.serializedVocabulary
+        self.serializedSubwordVocabulary = weights.serializedSubwordVocabulary
+        self.auxiliaryHeads = weights.auxiliaryHeads
+        self.useTiedEmbeddings = useTiedEmbeddings
 
-        self._wCondIn.wrappedValue = MLXArray(weights.wCondIn, [weights.condRawDim, 2 * d])
-        self._bCondIn.wrappedValue = MLXArray(weights.bCondIn, [2 * d])
-        self._wCondOut.wrappedValue = MLXArray(weights.wCondOut, [2 * d, totalToks * d])
+        self._wCondIn.wrappedValue = MLXArray(weights.wCondIn, [weights.condRawDim, d])
+        self._bCondIn.wrappedValue = MLXArray(weights.bCondIn, [d])
+        self._wCondOut.wrappedValue = MLXArray(weights.wCondOut, [d, totalToks * d])
         self._bCondOut.wrappedValue = MLXArray(weights.bCondOut, [totalToks * d])
         self._condNormGamma.wrappedValue = MLXArray(weights.condNormGamma, [d])
         self._condNormBeta.wrappedValue = MLXArray(weights.condNormBeta, [d])
@@ -230,15 +231,19 @@ public final class MLXPsychologicalStateLM: Module, @unchecked Sendable {
         condRaw: MLXArray,
         prevTokenIds: MLXArray,
         pe: MLXArray,
-        tokenDropMask: MLXArray? = nil,
+        hiddenDropMask: MLXArray? = nil,
+        condDropMask: MLXArray? = nil,
         condNoise: MLXArray? = nil
     ) -> MLXArray {
         let batch = prevTokenIds.shape[0]
         let totalToks = numCondTokens + 1
 
-        var zNorm = clip((condRaw - condMeanMLX) / condStdMLX, min: -8.0, max: 8.0)
+        var zNorm = clip((condRaw - condMeanMLX) / condStdMLX, min: -6.0, max: 6.0)
         if let noise = condNoise {
             zNorm = zNorm + noise
+        }
+        if let cmask = condDropMask {
+            zNorm = zNorm * cmask
         }
         let hAct = mlxSiLU(matmul(zNorm, wCondIn) + bCondIn)
         let proj = (matmul(hAct, wCondOut) + bCondOut).reshaped([batch, totalToks, dim])
@@ -246,22 +251,31 @@ public final class MLXPsychologicalStateLM: Module, @unchecked Sendable {
         let cGlobal = projNorm[0..., 0, 0...]
         let condMem = projNorm[0..., 1..<totalToks, 0...]
 
-        var tokEmb = tokenEmbedding[prevTokenIds]
-        if let keep = tokenDropMask {
-            tokEmb = tokEmb * keep.expandedDimensions(axis: -1)
-        }
+        let tokEmb = tokenEmbedding[prevTokenIds] * Float(2.5)
         var x = tokEmb + pe
 
         for layer in layers {
             x = layer.forward(x, cGlobal: cGlobal, condMem: condMem)
         }
-        let finalNorm = mlxLayerNorm(x, gamma: finalNormGamma, beta: finalNormBeta)
-        return matmul(finalNorm, wReadout) + bReadout
+        var finalNorm = mlxLayerNorm(x, gamma: finalNormGamma, beta: finalNormBeta)
+        if let hMask = hiddenDropMask {
+            finalNorm = finalNorm * hMask
+        }
+        let readoutW = useTiedEmbeddings ? tokenEmbedding.transposed() : wReadout
+        return matmul(finalNorm, readoutW) + bReadout
     }
 
     public func exportWeights() -> PsychologicalStateLMWeights {
         eval(self)
         func arr(_ a: MLXArray) -> [Float] { a.asType(.float32).asArray(Float.self) }
+        let exportedReadout: [Float]
+        if useTiedEmbeddings {
+            let tMat = contiguous(tokenEmbedding.transposed())
+            eval(tMat)
+            exportedReadout = arr(tMat)
+        } else {
+            exportedReadout = arr(wReadout)
+        }
         return PsychologicalStateLMWeights(
             vocabSize: vocabSize,
             dim: dim,
@@ -270,7 +284,8 @@ public final class MLXPsychologicalStateLM: Module, @unchecked Sendable {
             numCondTokens: numCondTokens,
             condRawDim: condRawDim,
             maxSeqLen: maxSeqLen,
-            serializedVocabulary: serializedVocabulary,
+            serializedSubwordVocabulary: serializedSubwordVocabulary,
+            auxiliaryHeads: auxiliaryHeads,
             condMean: condMeanArr,
             condStd: condStdArr,
             wCondIn: arr(wCondIn),
@@ -283,21 +298,22 @@ public final class MLXPsychologicalStateLM: Module, @unchecked Sendable {
             layers: layers.map { $0.exportWeights() },
             finalNormGamma: arr(finalNormGamma),
             finalNormBeta: arr(finalNormBeta),
-            wReadout: arr(wReadout),
+            wReadout: exportedReadout,
             bReadout: arr(bReadout)
         )
     }
 }
 
-/// MLX GPU Trainer for `MLXPsychologicalStateLM`.
+/// Compiled MLX CUDA/Metal Trainer for `MLXPsychologicalStateLM`.
 public final class MLXPsychologicalStateTrainer: @unchecked Sendable {
     public let model: MLXPsychologicalStateLM
     public let optimizer: ArrayLRAdam
     private var rng: SplitMix64
     private var adamSteps: Int = 0
     private var cachedPE: [Int: MLXArray] = [:]
+    private var compiledSteps: [Int: ([MLXArray]) -> [MLXArray]] = [:]
 
-    public init(model: MLXPsychologicalStateLM, learningRate: Float = 1.5e-3, seed: UInt64 = 2026) {
+    public init(model: MLXPsychologicalStateLM, learningRate: Float = 2.0e-3, seed: UInt64 = 2026) {
         self.model = model
         self.optimizer = ArrayLRAdam(learningRate: learningRate)
         self.rng = SplitMix64(seed: seed)
@@ -319,18 +335,19 @@ public final class MLXPsychologicalStateTrainer: @unchecked Sendable {
         batch: Int,
         time: Int,
         learningRate: Float,
-        wordDropout: Float = 0.12,
-        condNoiseStd: Float = 0.04,
+        hiddenDropout: Float = 0.14,
+        condDropout: Float = 0.04,
+        condNoiseStd: Float = 0.03,
         labelSmoothing: Float = 0.04,
-        weightDecay: Float = 1e-4,
+        weightDecay: Float = 8.0e-3,
         maxGradNorm: Float = 3.0
     ) -> (loss: Float, tokenAccuracy: Float, gradNorm: Float) {
         let bt = batch * time
         let cDim = model.condRawDim
+        let d = model.dim
         var prevFlat = [Int32](repeating: 0, count: bt)
         var targFlat = [Int32](repeating: 0, count: bt)
         var validFlat = [Float](repeating: 0.0, count: bt)
-        var keepFlat = [Float](repeating: 1.0, count: bt)
 
         for b in 0..<batch {
             let base = b * time
@@ -338,17 +355,29 @@ public final class MLXPsychologicalStateTrainer: @unchecked Sendable {
                 let idx = base + t
                 let tok = targetTokensFlat[idx]
                 targFlat[idx] = Int32(tok)
-                validFlat[idx] = (tok != TextVocabulary.padId) ? 1.0 : 0.0
+                validFlat[idx] = (tok != TextVocabulary.padId && tok != TextVocabulary.unkId) ? 1.0 : 0.0
                 if t == 0 {
                     prevFlat[idx] = Int32(TextVocabulary.bosId)
-                    keepFlat[idx] = 1.0
                 } else {
                     let pTok = targetTokensFlat[idx - 1]
                     prevFlat[idx] = Int32(pTok == TextVocabulary.eosId ? TextVocabulary.padId : pTok)
-                    if wordDropout > 0.0 && validFlat[idx] > 0.0 && rng.nextUnitFloat() < wordDropout {
-                        keepFlat[idx] = 0.0
-                    }
                 }
+            }
+        }
+
+        var hDropFlat = [Float](repeating: 1.0, count: batch * d)
+        if hiddenDropout > 0.0 {
+            let hScale = 1.0 / max(0.1, 1.0 - hiddenDropout)
+            for i in 0..<hDropFlat.count {
+                hDropFlat[i] = (rng.nextUnitFloat() < hiddenDropout) ? 0.0 : hScale
+            }
+        }
+
+        var condMaskFlat = [Float](repeating: 1.0, count: batch * cDim)
+        if condDropout > 0.0 {
+            let scale = 1.0 / max(0.1, 1.0 - condDropout)
+            for i in 0..<condMaskFlat.count {
+                condMaskFlat[i] = (rng.nextUnitFloat() < condDropout) ? 0.0 : scale
             }
         }
 
@@ -363,48 +392,71 @@ public final class MLXPsychologicalStateTrainer: @unchecked Sendable {
         let prevArr = MLXArray(prevFlat, [batch, time])
         let targArr = MLXArray(targFlat, [batch, time])
         let validArr = MLXArray(validFlat, [batch, time])
-        let keepArr = MLXArray(keepFlat, [batch, time])
+        let hMaskArr = MLXArray(hDropFlat, [batch, 1, d])
+        let cMaskArr = MLXArray(condMaskFlat, [batch, cDim])
         let noiseArr = MLXArray(noiseFlat, [batch, cDim])
         let pe = positionalEncoding(time: time)
 
         let smooth = labelSmoothing
         let wd = weightDecay
-        let lossFn = { (m: MLXPsychologicalStateLM, arrays: [MLXArray]) -> [MLXArray] in
-            let logits = m(
-                condRaw: arrays[0],
-                prevTokenIds: arrays[1],
-                pe: arrays[6],
-                tokenDropMask: arrays[4],
-                condNoise: arrays[5]
-            )
-            let logp = logSoftmax(logits, axis: -1)
-            let picked = takeAlong(logp, arrays[2].expandedDimensions(axis: -1), axis: -1).squeezed(axis: -1)
-            let uniformNLL = -mean(logp, axis: -1)
-            let tokenLoss = (1.0 - smooth) * (-picked) + smooth * uniformNLL
-            let denom = maximum(sum(arrays[3]), MLXArray(Float(1.0)))
-            let ceLoss = sum(tokenLoss * arrays[3]) / denom
+        let shapeKey = (batch << 16) | time
+        let stepFn: ([MLXArray]) -> [MLXArray]
+        if let existing = compiledSteps[shapeKey] {
+            stepFn = existing
+        } else {
+            let lossFn = { (m: MLXPsychologicalStateLM, arrays: [MLXArray]) -> [MLXArray] in
+                let logits = m(
+                    condRaw: arrays[0],
+                    prevTokenIds: arrays[1],
+                    pe: arrays[7],
+                    hiddenDropMask: arrays[4],
+                    condDropMask: arrays[5],
+                    condNoise: arrays[6]
+                )
+                let logp = logSoftmax(logits, axis: -1)
+                let picked = takeAlong(logp, arrays[2].expandedDimensions(axis: -1), axis: -1).squeezed(axis: -1)
+                let uniformNLL = -mean(logp, axis: -1)
+                let tokenLoss = (1.0 - smooth) * (-picked) + smooth * uniformNLL
+                let denom = maximum(sum(arrays[3]), MLXArray(Float(1.0)))
+                let ceLoss = sum(tokenLoss * arrays[3]) / denom
 
-            let l2Reg = wd * (mean(square(m.wCondIn)) + mean(square(m.wCondOut)) + mean(square(m.wReadout)))
-            let totalLoss = ceLoss + l2Reg
+                var l2Sum = mean(square(m.wCondIn)) + mean(square(m.wCondOut)) + mean(square(m.tokenEmbedding))
+                if !m.useTiedEmbeddings {
+                    l2Sum = l2Sum + mean(square(m.wReadout))
+                }
+                for l in m.layers {
+                    l2Sum = l2Sum + 0.25 * (mean(square(l.block.wMLPUp)) + mean(square(l.block.wMLPDown)) + mean(square(l.wCrossOut)))
+                }
+                let totalLoss = ceLoss + wd * l2Sum
 
-            let preds = argMax(logits, axis: -1)
-            let matches = (preds .== arrays[2]).asType(.float32) * arrays[3]
-            let acc = sum(matches) / denom
-            return [totalLoss, ceLoss, acc]
+                let preds = argMax(logits, axis: -1)
+                let matches = (preds .== arrays[2]).asType(.float32) * arrays[3]
+                let acc = sum(matches) / denom
+                return [totalLoss, ceLoss, acc]
+            }
+            let lg = valueAndGrad(model: model, lossFn)
+            let rawStep = { [unowned self] (arrays: [MLXArray]) -> [MLXArray] in
+                let (vals, grads) = lg(self.model, Array(arrays[0..<8]))
+                let (clipped, norm) = clipGradNorm(gradients: grads, maxNorm: maxGradNorm)
+                let prevLR = self.optimizer.learningRate
+                self.optimizer.learningRate = arrays[8]
+                self.optimizer.update(model: self.model, gradients: clipped)
+                self.optimizer.learningRate = prevLR
+                return [vals[1], vals[2], norm]
+            }
+            let compiled = compile(inputs: [model, optimizer], outputs: [model, optimizer], rawStep)
+            compiledSteps[shapeKey] = compiled
+            stepFn = compiled
         }
-
-        let lg = valueAndGrad(model: model, lossFn)
-        let (vals, grads) = lg(model, [condArr, prevArr, targArr, validArr, keepArr, noiseArr, pe])
-        let (clipped, gNorm) = clipGradNorm(gradients: grads, maxNorm: maxGradNorm)
 
         adamSteps += 1
         let stepF = Float(adamSteps)
         let bcFactor = sqrtf(1.0 - powf(optimizer.betas.1, stepF)) / (1.0 - powf(optimizer.betas.0, stepF))
-        optimizer.learningRate = MLXArray(learningRate * bcFactor)
-        optimizer.update(model: model, gradients: clipped)
-        eval(model, optimizer, vals[1], vals[2], gNorm)
+        let effLR = MLXArray(learningRate * bcFactor)
 
-        return (vals[1].item(Float.self), vals[2].item(Float.self), gNorm.item(Float.self))
+        let out = stepFn([condArr, prevArr, targArr, validArr, hMaskArr, cMaskArr, noiseArr, pe, effLR])
+        eval(model, optimizer, out[0], out[1], out[2])
+        return (out[0].item(Float.self), out[1].item(Float.self), out[2].item(Float.self))
     }
 
     public func evaluateLoss(
@@ -425,7 +477,7 @@ public final class MLXPsychologicalStateTrainer: @unchecked Sendable {
                 let idx = base + t
                 let tok = targetTokensFlat[idx]
                 targFlat[idx] = Int32(tok)
-                validFlat[idx] = (tok != TextVocabulary.padId) ? 1.0 : 0.0
+                validFlat[idx] = (tok != TextVocabulary.padId && tok != TextVocabulary.unkId) ? 1.0 : 0.0
                 if t == 0 {
                     prevFlat[idx] = Int32(TextVocabulary.bosId)
                 } else {

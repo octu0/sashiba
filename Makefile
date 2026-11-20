@@ -13,7 +13,7 @@ export MLX_CCCL_DIR ?= $(HOME)/.local/share/cccl/include
 export MLX_CUDA_INCLUDE_PATHS ?= $(HOME)/.local/share/cudnn-frontend/include:$(HOME)/.local/share/cutlass/include
 export NVCC_PREPEND_FLAGS ?= -allow-unsupported-compiler --extended-lambda
 
-.PHONY: all build test train eval reconstruct verify verify-fast head benchmarks verify-all-fast head-gpu-cv verify-gpu-retrain benchmark clean help
+.PHONY: all build test train eval reconstruct verify verify-fast head benchmarks verify-all-fast head-gpu-cv verify-gpu-retrain benchmark psych-train psych-eval clean help
 
 all: build test
 
@@ -56,6 +56,12 @@ verify-gpu-retrain:
 
 benchmark:
 	$(SWIFT) run -c release benchmark
+
+psych-train:
+	$(SWIFT) run -c release psych_lm train --rel-weights $(WEIGHTS) --psych-weights .tmp/weights_psych_lm.safetensors --epochs 22
+
+psych-eval:
+	$(SWIFT) run -c release psych_lm eval --rel-weights $(WEIGHTS) --psych-weights .tmp/weights_psych_lm.safetensors
 
 clean:
 	$(SWIFT) package clean
